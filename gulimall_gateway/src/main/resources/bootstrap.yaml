@@ -1,0 +1,11 @@
+spring:
+  cloud:
+    nacos:
+      config:
+        server-addr: 127.0.0.1:8848
+        file-extension: yaml # 文件后缀名
+        namespace: aa943bb6-d546-499f-b6b1-132d4f4bd212
+        extension-configs:
+          - data-id: gulimall_gateway.yaml
+            group: DEFAULT_GROUP
+            refresh: true

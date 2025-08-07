@@ -1,7 +1,11 @@
 package com.project.gulimall.product.controller;
 
 import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
+
+import com.project.gulimall.product.entity.CategoryEntity;
+import com.project.gulimall.product.service.CategoryService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -14,24 +18,25 @@ import com.project.common.utils.PageUtils;
 import com.project.common.utils.R;
 
 
-
 /**
  * 品牌分类关联
  */
 @RestController
 @RequestMapping("product/categorybrandrelation")
 public class CategoryBrandRelationController {
+
     @Autowired
     private CategoryBrandRelationService categoryBrandRelationService;
+    @Autowired
+    private CategoryService categoryService;
 
     /**
-     * 列表
+     * 查出所有分类以及子分类，以树形结构组装起来
      */
     @RequestMapping("/list")
     public R list(@RequestParam Map<String, Object> params){
-        PageUtils page = categoryBrandRelationService.queryPage(params);
 
-        return R.ok().put("page", page);
+        return R.ok();
     }
 
 

@@ -1,0 +1,13 @@
+spring:
+  application:
+    name: gulimall-coupon
+
+  cloud:
+    nacos:
+      config:
+        server-addr: 127.0.0.1:8848
+        file-extension: yaml # 文件后缀名
+        namespace: 18a757c8-49da-457a-9235-d12f103d1069 # coupon
+
+
+

@@ -1,0 +1,10 @@
+spring:
+  application:
+    name: gulimall-member
+
+  cloud:
+    nacos:
+      config:
+        server-addr: 127.0.0.1:8848
+        file-extension: yaml # 文件后缀名
+        namespace: c2de547a-33e1-4a7f-8771-cb182c6b632c # member
