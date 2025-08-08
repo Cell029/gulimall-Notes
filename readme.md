@@ -665,9 +665,7 @@ spring:
 ****
 # 三、商品服务
 
-## 1. 基础概念
-
-### 1.1 三级分类
+## 1. 三级分类
 
 gulimall_pms 中有一张商品分类表 pms_category，表结构如下：
 
@@ -747,7 +745,7 @@ public List<CategoryEntity> listWithTree() {
 private List<CategoryEntity> getChildren(CategoryEntity root, List<CategoryEntity> all) {
     List<CategoryEntity> children = all.stream()
             // 二级菜单 categoryEntity
-            .filter(categoryEntity -> categoryEntity.getParentCid() == root.getCatId())
+            .filter(categoryEntity -> Objects.equals(categoryEntity.getParentCid(), root.getCatId()))
             // 找二级菜单的子菜单
             .map(categoryEntity -> {
                 categoryEntity.setChildren(getChildren(categoryEntity, all));
@@ -846,7 +844,325 @@ private List<CategoryEntity> getChildren(CategoryEntity root, List<CategoryEntit
 ```
 
 ****
+## 2. 配置网关
 
+### 2.1 配置路由
+
+启动 renren-fast-vue 前端项目，进入人人快速开发平台后，通过系统管理的菜单管理，创建一个新的一级目录，取名商品系统，在这个目录里面放有关商品的数据，然后再创建一个菜单归属于商品系统，
+叫做分类服务，就在这个页面展示后端获取到的分类数据。在前端页面通过一个树形结构展示分类数据，所以需要在这个页面发送一个查询的请求：
+
+```vue
+getMenus () {
+    this.$http({
+      url: this.$http.adornUrl('/product/category/list/tree'),
+      method: 'get'
+    }).then(({data}) => {
+      console.log('成功获取到菜单数据...', data)
+    })
+}
+```
+
+但是在前端的 index.js 文件中可以看到它发送的请求地址是以前端作为基础的：
+
+```js
+/**
+ * 开发环境
+ */
+;(function () {
+  window.SITE_CONFIG = {};
+
+  // api接口请求地址
+  window.SITE_CONFIG['baseUrl'] = 'http://localhost:8001/renren-fast';
+
+  // cdn地址 = 域名 + 版本号
+  window.SITE_CONFIG['domain']  = './'; // 域名
+  window.SITE_CONFIG['version'] = '';   // 版本号(年月日时分)
+  window.SITE_CONFIG['cdnUrl']  = window.SITE_CONFIG.domain + window.SITE_CONFIG.version;
+})();
+```
+
+而后端查询分类数据的请求路径为：localhost:10000/product/category/list/tree，所以这里需要配置网关路由，让网关来动态的发送请求。
+所以需要在 gulimall_gateway 中配置路由器并引入相关依赖：
+
+```yaml
+spring:
+  application:
+    name: gulimall-gateway
+  cloud:
+    nacos:
+      discovery:
+        server-addr: 127.0.0.1:8848
+    gateway:
+      routes:
+        - id: ...
+          uri: lb://...
+          predicates:
+            - Path=...
+```
+
+```xml
+<dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-starter-gateway</artifactId>
+</dependency>
+```
+
+这里就把前端的发送请求更换成：
+
+```js
+// api接口请求地址
+window.SITE_CONFIG['baseUrl'] = 'http://localhost:88/api'
+```
+
+而需要让网关能够识别到这个发送的请求，就需要配置：
+
+```yaml
+spring:
+  application:
+    name: gulimall-gateway
+  cloud:
+    nacos:
+      discovery:
+        server-addr: 127.0.0.1:8848
+    gateway:
+      routes:
+        - id: admin_route
+          uri: lb://renren-fast # 负载均衡到 renren-fast 服务
+          predicates:
+            - Path=/api/** # 只要发送的请求以 /api 开头则会被 admin_route 拦截
+          filters:
+            - RewritePath=/api/(?<segment>.*),/renren-fast/$\{segment} # 将前端请求的 /api/.. 转换成 /renren-fast/..
+logging:
+  level:
+    org.springframework.cloud.gateway: DEBUG
+```
+
+因为登录的功能在 renren-fast 服务中，所以先写这个，让前端发送的登录请求能够被网关路由到 8080 端口，而前端发送的 url 中是带有 /api/... 的，因为就是靠这个标识一下，
+所以需要重写路径，因为在 renren-fast 的配置文件中添加了：
+
+```yaml
+server:
+  servlet:
+    context-path: /renren-fast
+```
+
+也就是说这个服务中的所有路径都要以 /renren-fast 开头才能正确匹配路径，例如 /renren-fast/captcha.jpg 。路径配置成功后，要想让网关成功负载均衡到对应的服务，
+就需要在 Nacos 中注册 renren-fast，也就是添加服务名和注册发现路径：
+
+```yaml
+spring:
+  application:
+    name: renren-fast
+  cloud:
+    nacos:
+      discovery:
+        server-addr: 127.0.0.1:8848
+```
+
+需要注意的是：因为网关服务是完全基于响应式编程的，所以它不能使用某些 Spring MVC 的依赖或者配置，例如：
+
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-web</artifactId>
+</dependency>
+```
+
+如果使用了可能导致服务启动失败或者无法使用网关中配置的那些路由，例如：在接收到前端发送的请求后，正准备对路由进行转发，
+结果使用的是 SpringMVC 的 DispatcherServlet（Initializing Spring DispatcherServlet 'dispatcherServlet'）。另外，因为用到了负载均衡，所以需要配置相关依赖：
+
+```xml
+<dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-starter-loadbalancer</artifactId>
+</dependency>
+```
+
+****
+### 2.2 CORS
+
+前端的请求可以成功被网关识别并路由后，证明配置成功：
+
+```text
+Mapping [Exchange: GET http://localhost:88/api/sys/config/list?t=1754651883848&page=1&limit=10&paramKey=] to Route{id='admin_route', uri=lb://renren-fast, order=0, predicate=Paths: [/api/**], match trailing slash: true, gatewayFilters=[[[RewritePath /api/(?<segment>.*) = '/renren-fast/${segment}'], order = 1]], metadata={}}
+```
+
+此时刷新页面重新登录，发现登录不了：
+
+```text
+:8001/#/login:1 Access to XMLHttpRequest at 'http://localhost:88/api/sys/login' from origin 'http://localhost:8001' has been blocked by CORS policy: Response to preflight request doesn't pass access control check: No 'Access-Control-Allow-Origin' header is present on the requested resource.
+```
+
+这个报错提示：浏览器拦截了跨域请求，因为服务器没有正确返回 CORS（跨域资源共享）相关的响应头。关于 CORS：
+
+> 浏览器出于安全考虑，默认阻止来自 不同源（协议、域名、端口不同） 的网页对服务器资源的访问，这就是“同源策略”。
+
+例如：
+
+- 前端项目运行在 http://localhost:8001
+- 网关（后端服务）运行在 http://localhost:88
+
+它们端口不同，因此被视为不同源，浏览器会默认禁止这种跨域请求。但是在过去的项目中，因为使用了 nginx 所以没有出现这种问题，nginx 作为一种反向代理服务器，可以通过配置统一处理跨域请求，
+让浏览器认为请求是同源的：
+
+```nginx
+server {
+    listen 80;
+    server_name example.com;  # 前端页面的域名
+    # 前端静态资源
+    location / {
+        root /path/to/frontend;  # 前端文件目录
+    }
+    # 反向代理API请求
+    location /api/ {
+        proxy_pass http://api-server:8080/;  # 转发到真实后端
+    }
+}
+```
+
+而当前的项目并没有使用 nginx，所以必须手动开启全局跨域配置，也就是编写一个配置文件，允许哪些来源、哪些请求头、哪些请求方法可以被放行，在 gulimall_gateway 中编写：
+
+```java
+@Configuration
+public class CorsConfig {
+    @Bean
+    public CorsWebFilter corsWebFilter() {
+        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+        CorsConfiguration corsConfiguration = new CorsConfiguration();
+        // 配置跨域
+        corsConfiguration.addAllowedHeader("*");
+        corsConfiguration.addAllowedMethod("*");
+        corsConfiguration.addAllowedOrigin("http://localhost:8001"); // 允许前端发送的请求
+        corsConfiguration.setAllowCredentials(true); // 允许携带 cookie 跨域
+        source.registerCorsConfiguration("/**", corsConfiguration); // 放行所有路径
+        return new CorsWebFilter(source);
+    }
+}
+```
+
+需要注意的是：并不是所有的非同源请求都会被拦截，跨域请求如果使用了：
+
+- GET、HEAD 或 POST 
+- POST 的 Content-Type 是： 
+- application/x-www-form-urlencoded 
+- multipart/form-data text/plain 
+- 没有自定义请求头（如 Authorization、Token）
+
+这种情况下，浏览器不会先发 OPTIONS 请求，而是直接发目标请求。其余的请求则会先发一个 OPTIONS 请求（称为预检请求 preflight），然后由服务端返回是否允许跨域，
+若允许，浏览器才会真正发起实际请求（比如 POST）。所以在 gulimall_gateway 中配置 CorsConfig 就是用来处理 OPTIONS 请求的。
+
+```text
+Request URL http://localhost:88/api/sys/login
+Request Method OPTIONS
+Status Code 200 OK
+Remote Address [::1]:88
+Referrer Policy strict-origin-when-cross-origin
+```
+
+因为所有的请求都会先经过网关，所以优先在网关配置全局 CORS 处理，不过在原有的 renren-fast 服务中已经有了，所以两个处理会产生冲突：
+
+```text
+:8001/#/login:1 Access to XMLHttpRequest at 'http://localhost:88/api/sys/login' from origin 'http://localhost:8001' has been blocked by CORS policy: The 'Access-Control-Allow-Origin' header contains multiple values 'http://localhost:8001, http://localhost:8001', but only one is allowed.
+```
+
+此时注释掉 renrne-fast 中的全局 CORS 处理即可。
+
+****
+### 2.3 树形展示三级分类数据
+
+因为已经写好了获取分类数据的方法，所以只需要配置一下网关路由，让前端发送的查询请求可以被路由到对应的服务的控制层即可：
+
+```yaml
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: product_route
+          uri: lb://gulimall-product
+          predicates:
+            - Path=/api/product/**
+          filters:
+            - RewritePath=/api/(?<segment>.*),/$\{segment}
+```
+
+需要注意的是：因为 admin_route 监听的路径是 /api/** ，所以上面写的这个路径也会被转发到 renren-fast，因此在配置这种更精细的路径时就需要让它先被监听到，
+也就是写在 admin_route 的上面。因为多个 routes 是按配置文件中出现的顺序依次匹配的，一旦有路由匹配成功，就不会继续向下匹配。
+
+****
+## 3. 删除第三级分类
+
+### 3.1 逻辑删除
+
+1、配置全局的逻辑删除规则，默认是自带的可以不写：
+
+```yaml
+mybatis-plus:
+  global-config:
+    db-config:
+      id-type: auto
+      logic-delete-value: 1
+      logic-not-delete-value: 0
+```
+
+当使用逻辑删除时，数据库并不会真的 DELETE 掉这条数据，而是通过一个字段标记该数据是否有效。例如：
+
+```sql
+-- 执行查询操作时会自动在 SQL 中加上条件 is_deleted = 0，只查未被删除的数据
+SELECT * FROM user WHERE is_deleted = 0;
+```
+
+当调用 MyBatis-Plus 的删除方法时，例如：
+
+```sql
+userService.removeById(1);
+```
+
+它内部就会生成如下 SQL（假设逻辑删除字段为 is_deleted）：
+
+```sql
+UPDATE user SET is_deleted = 1 WHERE id = 1;
+```
+
+2、在表示逻辑删除的字段上添加 @TableLogic
+
+因为默认的是用 1 表示删除，0 表示不删除，这与数据表中设置的相反，所以手动设置 1 为不删除，0 为删除：
+
+```java
+/**
+* 是否显示[0-不显示，1显示]
+*/
+@TableLogic(value = "1", delval = "0")
+private Integer showStatus;
+```
+
+Controller 层：
+
+目前只实现简单的删除功能，后续添加判断是否当前菜单被引用
+
+```java
+/**
+ * 删除
+ * @RequestBody:获取请求体，所以必须发送 POST 请求
+ */
+@RequestMapping("/delete")
+public R delete(@RequestBody Long[] catIds){
+    // 1. 检查当前删除的菜单是否被别的地方引用
+    categoryService.removeMenuByIds(Arrays.asList(catIds));
+    return R.ok();
+}
+```
+
+Service 层：
+
+```java
+@Override
+public void removeMenuByIds(List<Long> list) {
+    // TODO 1. 检擦当前删除的菜单是否被别的地方引用
+    categoryDao.delete(new LambdaQueryWrapper<CategoryEntity>().in(CategoryEntity::getCatId, list));
+}
+```
+
+****
 
 
 

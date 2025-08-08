@@ -1,11 +1,13 @@
 package com.project.gulimall.product.service.impl;
 
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -54,6 +56,13 @@ public class CategoryServiceImpl extends ServiceImpl<CategoryDao, CategoryEntity
         return level1Menu;
     }
 
+    @Override
+    public void removeMenuByIds(List<Long> list) {
+        // TODO 1. 检擦当前删除的菜单是否被别的地方引用
+        categoryDao.delete(new LambdaQueryWrapper<CategoryEntity>().in(CategoryEntity::getCatId, list));
+    }
+
+
     /**
      * 获取子菜单
      * @param root 当前菜单
@@ -62,7 +71,7 @@ public class CategoryServiceImpl extends ServiceImpl<CategoryDao, CategoryEntity
      */
     private List<CategoryEntity> getChildren(CategoryEntity root, List<CategoryEntity> all) {
         List<CategoryEntity> children = all.stream()
-                .filter(categoryEntity -> categoryEntity.getParentCid() == root.getCatId())
+                .filter(categoryEntity -> Objects.equals(categoryEntity.getParentCid(), root.getCatId()))
                 // 找到子菜单
                 .map(categoryEntity -> {
                     categoryEntity.setChildren(getChildren(categoryEntity, all));
