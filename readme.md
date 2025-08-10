@@ -1163,8 +1163,472 @@ public void removeMenuByIds(List<Long> list) {
 ```
 
 ****
+## 4. 新增和修改三级分类
 
+### 4.1 新增
 
+新增操作就是点击前端的一个 Append 按钮后，就应该弹出一个 dialog 对话框，然后在对话框中输入需要新增的数据的信息：
+
+```vue
+<el-button v-if="node.level <= 2" type="text" size="mini" @click="() => append(data)">Append</el-button>
+```
+
+```vue
+<el-dialog
+    :title="title"
+    :visible.sync="dialogVisible"
+    width="30%"
+    :close-on-click-modal="false">
+  <el-form :model="category">
+    <el-form-item label="分类名称">
+      <el-input v-model="category.name" auto-complete="off"></el-input>
+    </el-form-item>
+    <el-form-item label="图标">
+      <el-input v-model="category.icon" auto-complete="off"></el-input>
+    </el-form-item>
+    <el-form-item label="计量单位">
+      <el-input v-model="category.productUnit" auto-complete="off"></el-input>
+    </el-form-item>
+  </el-form>
+  <span slot="footer" class="dialog-footer">
+      <el-button @click="dialogVisible = false">取 消</el-button>
+      <el-button type="primary" @click="submitType">确 定</el-button>
+    </span>
+</el-dialog>
+```
+
+需要注意的是点击 Apend 触发的方法是 append(data) 方法，它实际上是用来重置表单数据（防止下次点击 Append 还是显示上一次添加时提交的数据）和设置分类的等级：
+
+```vue
+// 添加某个分类
+append (data) {
+  console.log('append', data)
+  this.dialogVisible = true
+  this.dialogType = 'add'
+  this.title = '添加分类'
+  this.category.parentCid = data.catId
+  this.category.catLevel = data.catLevel * 1 + 1 // 防止 catLevel 为字符串，转换为 int 再加一
+  // 重置对话框表单的数据
+  this.category.name = ''
+  this.category.catId = null
+  this.category.icon = ''
+  this.category.productUnit = ''
+  this.category.sort = 0
+  this.category.showStatus = 1
+},
+```
+
+真实的发送添加请求是在对话框中点击确定时触发的方法，而修改操作也是使用的这个对话框，所以需要在这个触发的地方进行区分，到底使用的是添加还是修改：
+
+```vue
+// 判断当前打开对话框的是哪个方法
+submitType () {
+  if (this.dialogType === 'add') {
+    this.addCategory()
+  } else if (this.dialogType === 'edit') {
+    this.editCategory()
+  }
+},
+```
+
+关于 addCategory() 方法，就是发送新增请求的地方，因为在对话框中输入的数据已经绑定到 category 中了，所以直接把 category 作为请求参数传递给后端即可：
+
+```vue
+// 添加三级分类
+addCategory () {
+  console.log('提交的三级分类数据', this.category)
+  this.$http({
+    url: this.$http.adornUrl('/product/category/save'),
+    method: 'post',
+    data: this.$http.adornData(this.category, false)
+  }).then(({data}) => {
+    this.$message({
+      message: '菜单保存成功',
+      type: 'success'
+    })
+    this.dialogVisible = false
+    // 添加成功后刷新出新的菜单
+    this.getMenus()
+    // 设置需要默认展开的菜单
+    this.expandedKey = [this.category.parentCid]
+  })
+},
+```
+
+后端的新增操作则是由逆向工程生成的，也就是使用普通的 mybatis-plus 方法：
+
+```java
+@RequestMapping("/save")
+public R save(@RequestBody CategoryEntity category){
+    categoryService.save(category);
+    return R.ok();
+}
+```
+
+****
+### 4.2 修改操作
+
+修改操作同理，也是点击 Edit 按钮后触发 edit (data)，此方法不是真实发送修改请求的，而是获取当前数据库中最新的数据，根据当前分类的 catId 查询数据库，然后把查到的数据回显到对话框中：
+
+```vue
+<el-button type="text" size="mini" @click="() => edit(data)">Edit</el-button>
+```
+
+```vue
+// 修改分类
+edit (data) {
+  console.log('要修改的数据', data)
+  // 打开对话框
+  this.dialogVisible = true
+  this.dialogType = 'edit'
+  this.title = '修改分类'
+  // 发送请求，获取当前分类的最新信息
+  this.$http({
+    url: this.$http.adornUrl(`/product/category/info/${data.catId}`),
+    method: 'get'
+  }).then(({data}) => {
+    console.log('成功获取到要回显的数据：', data.data)
+    // this.category.name = data.data.name
+    // this.category.catId = data.data.catId
+    // this.category.icon = data.data.icon
+    // this.category.productUnit = data.data.productUnit
+    // this.category.parentCid = data.data.parentCid
+    this.category = {
+      ...this.category, // 先用默认值，保证完整
+      ...data.data // 再覆盖接口返回的最新数据
+    }
+  })
+},
+```
+
+对对话框中的数据进行修改后，就会把它们绑定在 category 中，因为当前的新增与修改操作不涉及 sort、catLevel 等字段，所以这些字段不进行赋值操作，也就是传一个空值，
+这样后端修改时便不会修改这些字段：
+
+```vue
+// 具体修改三级分类操作
+editCategory () {
+  const {catId, name, icon, productUnit} = this.category
+  const data = {catId: catId, name: name, icon: icon, productUnit: productUnit}
+  this.$http({
+    url: this.$http.adornUrl('/product/category/update'),
+    method: 'post',
+    data: this.$http.adornData(data, false)
+  }).then(({data}) => {
+    this.$message({
+      message: '菜单修改成功',
+      type: 'success'
+    })
+    this.dialogVisible = false
+    // 删除成功后刷新出新的菜单
+    this.getMenus()
+    // 设置需要默认展开的菜单
+    this.expandedKey = [this.category.parentCid]
+  })
+}
+```
+
+****
+## 5. 拖动效果 
+
+### 5.1 层数判断
+
+在编写拖动方法前，可以看一下这三个数据分别代表什么：
+
+```vue
+// 监听拖放逻辑
+handleNodeDrop (draggingNode, dropNode, dropType, ev) {
+  console.log('拖动节点', draggingNode)
+  console.log('目标节点', dropNode)
+  console.log('拖放类型', dropType)
+  // 这里写后端更新分类父子关系逻辑，比如调用接口更新 parentCid 等
+  // 更新完后刷新菜单树
+  this.getMenus()
+},
+```
+
+拖动节点 allowDrop：
+
+如果是第三级分类，则没有孩子：
+
+```text
+data: Object
+  catId: 1440
+  catLevel: 3
+  children: Array(0)
+```
+
+如果是一二级分类，则有孩子：
+
+```text
+data: Object
+  catId: 22
+  catLevel: 2
+  childre: Array(4)
+    0:
+      catId: 165
+      catLevel: 3
+      children: Array(0)
+```
+
+目标节点 dropNode：
+
+```text
+data: Object
+  catId: 1441
+  catLevel: 3
+  children: Array(0) 
+  icon: "yyy"
+  name: "中中"
+  parentCid: 1433
+  productCount: null
+  productUnit: "秒"
+  showStatus: 1
+  sort: 0
+```
+
+拖放类型 type：
+
+```text
+next
+```
+
+然后编写拖动方法，主要就是判断当前拖动的节点总共有几层，拖进的那个分类有几层，拖进去后是否超过设置的 3 层：
+
+```vue
+// 允许拖动的方法，用来判断哪些层级可以拖进去
+allowDrop (draggingNode, dropNode, type) {
+  // 被拖动的当前节点以及所在的父节点总层数不能大于 3
+  // 1. 判断被拖动的当前节点总层数
+  // 2. 统计当前节点总层数
+  this.maxLevel = draggingNode.data.catLevel  // 初始化成当前节点的层级
+  this.countNodeLevel(draggingNode.data)
+  // 当前正在拖动的节点 + 父节点所在深度不大于 3 即可
+  const deep = this.maxLevel - draggingNode.data.catLevel + 1
+  console.log('当前正在拖动节点的深度：', deep)
+  if (type === 'inner') {
+    return (deep + dropNode.level) <= 3
+  } else {
+    return (deep + dropNode.parent.level) <= 3
+  }
+},
+```
+
+这个方法就是判断当前节点的层数，其实就是看它有几层孩子，根据上面返回的拖动节点，就是判断这个拖动节点有没有 children，如果有就计算它的 children 的 catLevel（结构中有这个，可以直接获取），
+然后递归判断这个拖动节点的孩子是否还有孩子，然后看它的 catLevel，如果有就更新 maxLevel：
+
+```vue
+// 统计当前节点层数
+countNodeLevel (node) {
+    // 找到所有子节点，求出最大深度
+    if (node.children != null && node.children.length > 0) {
+        for (let i = 0; i < node.children.length; i++) {
+            if (node.children[i].catLevel > this.maxLevel) {
+                this.maxLevel = node.children[i].catLevel
+            }
+        this.countNodeLevel(node.children[i])
+        }
+    }
+},
+```
+
+找到拖动节点的嘴小分类层级的 catLevel 后（此时已更新为 maxLevel），用它减去当前拖动节点的 catLevel 然后再加一，例如：
+
+- 此时节点为分类一级，它有二级、三级孩子，则此时的 maxLevel 为 3
+- 而这个节点的 catLevel 为 1
+- maxLevel - catLevel + 1 = 3 - 1 + 1 = 3
+- 代表当前拖动节点的层数为 3
+
+- 若此时节点为分类二级，即只有三级孩子，但此时的 maxLevel 也为 3
+- 二这个节点的 catLevel 为 2
+- maxLevel - catLevel + 1 = 2 - 1 + 1 = 2
+- 代表当前拖动的节点层数为 2
+
+判断完层数后就可以根据当前拖动的节点要拖进哪个地方进行判断：
+
+```vue
+// 如果是拖入某个分类层级，那就要判断当前节点和要拖入的那个节点的层数加起来是否小于 3
+if (type === 'inner') {
+    return (deep + dropNode.level) <= 3
+} else {
+    // 如果是拖到某个分类层级的旁边，即拖进它所属的层级，就需要判断当前节点加上拖入的层级的层数是否小于 3 
+    return (deep + dropNode.parent.level) <= 3
+}
+```
+
+****
+### 5.2 顺序和层级的修改
+
+在拖动节点时，除了需要判断可以拖动到哪，还需要对该节点的顺序和层级的更行，例如将原本是第二层级的拖动到最外层，也就是层级从 2 变成了 1；而排序顺序也要根据拖动到的地方进行修改，
+例如原本手机排第二的，现在把电脑拖动到了手机前面，那么手机的排序就要修改成第三，电脑修改成第二，其他的类推。而此时就需要思考拖动的类型是哪种：
+
+1. 拖动到一个节点内，拖动类型为 inner
+2. 如果是拖动到某个节点的前后，拖动类型为 before 和 after
+
+```vue
+// 监听拖放逻辑
+handleNodeDrop (draggingNode, dropNode, dropType, ev) {
+  console.log('拖动节点', draggingNode)
+  console.log('目标节点', dropNode)
+  console.log('拖放类型', dropType)
+  // 这里写后端更新分类父子关系逻辑，比如调用接口更新 parentCid 等
+  // 1. 获取当前节点最新的父节点 id
+  let pCid = 0
+  let siblings = null
+  if (dropType === 'before' || dropType === 'after') {
+    pCid = dropNode.parent.data.catId === undefined ? 0 : dropNode.parent.data.catId
+    siblings = dropNode.parent.childNodes
+  } else {
+    pCid = dropNode.data.catId
+    siblings = dropNode.childNodes
+  }
+  // 2. 获取当前节点的最新顺序和最新层级
+  for (let i = 0; i < siblings.length; i++) {
+    // 如果遍历的是当前正在拖拽的节点
+    if (siblings[i].data.catId === draggingNode.data.catId) {
+      let catLevel = draggingNode.level
+      if (siblings[i].level !== draggingNode.level) {
+        catLevel = siblings[i].level
+        // 因为当前拖动的节点层级发生了改变，如果它有子节点，那字节点的层级也要改变
+        this.updateChildNodeLevel(siblings[i])
+      }
+      this.updateNodes.push({catId: siblings[i].data.catId, sort: i, parentCid: pCid, catLevel: catLevel})
+    } else {
+      this.updateNodes.push({catId: siblings[i].data.catId, sort: i})
+    }
+  }
+  console.log('updateNodes:', this.updateNodes)
+  // 更新完后刷新菜单树
+  // this.getMenus()
+},
+
+// 修改子节点层级
+updateChildNodeLevel (node) {
+  if (node.childNodes.length > 0) {
+    for (let i = 0; i < node.childNodes.length; i++) {
+      const currentNode = node.childNodes[i].data
+      this.updateNodes.push({catId: currentNode.catId, catLevel: node.childNodes[i].level})
+      this.updateChildNodeLevel(node.childNodes[i])
+    }
+  }
+},
+```
+
+首先要根据操作类型来获取当前拖动的节点放入的地方的父节点是谁，如果是拖动到某个节点前后，那此时的目标节点 dropNode 就是拖动节点的兄弟节点，因为它们是同一级的，
+此时就通过兄弟节点来获取它们此时共同的父节点是谁，所以调用 dropNode.parent.data.catId 来获取，当然也可以直接用 dropNode.data.parentCid 获取。
+
+当拖动类型是直接拖进某个节点内部，称为它的子节点，那就可以直接通过 dropNode.data.catId 获取。不管哪种拖动类型，都需要将当前拖动后的节点所在的层级的所有节点放进 siblings 中，
+即当前节点的所有兄弟节点，方便后续对这个数据进行排序和层级的修改：
+
+```vue
+if (dropType === 'before' || dropType === 'after') {
+    // 当将当前节点拖动到第一层级后，兄弟节点的 parent 就变成数组类型了，所以不能直接通过 .data.catId 获取，所以会变成 undefined 类型，所以要进行判断
+    pCid = dropNode.parent.data.catId === undefined ? 0 : dropNode.parent.data.catId
+    siblings = dropNode.parent.childNodes
+  } else {
+    pCid = dropNode.data.catId
+    siblings = dropNode.childNodes
+  }
+```
+
+然后就是修改顺序和层级。因为上面已经把所有的兄弟节点放到 siblings 中了，所以直接遍历它，当遍历到当前拖动的节点时，就需要从它开始修改排序（实际上从第一个节点就开始修改了，
+只不过修改的值和原值一样），总之不管怎么样，最终都是在拖入后按照顺序遍历的。而关于修改层级，因为其它兄弟节点不涉及拖动操作，所以不用考虑层级的修改，只需要修改拖动的那个节点。
+而拖动的那个节点可能自带孩子，所以也需要修改它的孩子节点的层级。并且，由于拖动了节点，可能存在父节点改变的情况，所以也要把最新获取到的父节点 ID，即 pCid 传递给后端一起更新：
+
+```vue
+// 2. 获取当前节点的最新顺序和最新层级
+for (let i = 0; i < siblings.length; i++) {
+    // 如果遍历的是当前正在拖拽的节点
+    if (siblings[i].data.catId === draggingNode.data.catId) {
+      let catLevel = draggingNode.level // 获取拖拽前的层级
+      if (siblings[i].level !== draggingNode.level) { // 如果当前节点的层级与拖拽时的层级不一致
+        catLevel = siblings[i].level // 将拖拽前的层级更新为拖拽后的
+        // 因为当前拖动的节点层级发生了改变，如果它有子节点，那字节点的层级也要改变
+        this.updateChildNodeLevel(siblings[i])
+      }
+      // 将需要更新的新数据放进 updateNodes 中，后续将这个作为请求参数传递给后端，进行修改
+      // 因为是拖入数据，所以拖动节点的父节点也会改变，这里也需要更新
+      this.updateNodes.push({catId: siblings[i].data.catId, sort: i, parentCid: pCid, catLevel: catLevel})
+    } else {
+      this.updateNodes.push({catId: siblings[i].data.catId, sort: i})
+    }
+}
+```
+
+创建一个更新节点的方法，当当前拖动的节点的层级和目标节点的层级不一致时，也就是 siblings[i].level !== draggingNode.level，就将新的层级赋值给拖拽节点的层级，
+然后处理拖拽节点的孩子的层级，这里也是用到了递归处理，直到孩子的孩子...处理完毕
+
+```vue
+updateChildNodeLevel (node) {
+  // 如果有孩子
+  if (node.childNodes.length > 0) {
+    // 遍历孩子节点
+    for (let i = 0; i < node.childNodes.length; i++) {
+      const currentNode = node.childNodes[i].data
+      this.updateNodes.push({catId: currentNode.catId, catLevel: node.childNodes[i].level})
+      this.updateChildNodeLevel(node.childNodes[i])
+    }
+  }
+},
+```
+
+前端基本拖拽逻辑完成后，就可以天机发送修改请求的后端逻辑了，在监听拖放逻辑的代码中添加发送请求，并且在拖拽前进行清空 updateNodes 的操作，避免一次发送过多数据，
+在 allowDrop (draggingNode, dropNode, type) 方法中添加 this.updateNodes = []。
+
+```vue
+// 监听拖放逻辑
+handleNodeDrop (draggingNode, dropNode, dropType, ev) {
+  ...
+  console.log('updateNodes:', this.updateNodes)
+  // 发送修改请求
+  this.$http({
+    url: this.$http.adornUrl('/product/category/update/sort'),
+    method: 'post',
+    data: this.$http.adornData(this.updateNodes, false)
+  }).then(({data}) => {
+    this.$message({
+      message: '拖拽成功',
+      type: 'success'
+    })
+    // 添加成功后刷新出新的菜单
+    this.getMenus()
+    // 设置需要默认展开的菜单
+    this.expandedKey = [pCid]
+  })
+},
+```
+
+Controller 层：
+
+这里需要注意的是，前端的请求参数的接收是用一个 CategoryEntity 类型的 List 接收的，因为前端在将数据添加进数组 updateNodes 时是这样的：
+
+```vue
+this.updateNodes.push({catId: siblings[i].data.catId, sort: i, parentCid: pCid, catLevel: catLevel})
+```
+
+这种数组对象在前端会被整合成 Json：
+
+```json
+[
+  { catId: 100, sort: 0, parentCid: 0, catLevel: 1 },
+  { catId: 101, sort: 1, parentCid: 0, catLevel: 1 },
+  ...
+]
+```
+
+所以这种类型在后端用使用集合类型接收是比较好的，不过不建议用数组类型，因为 Spring Boot 会自动把 JSON 数组转换成 List<实体类>，如果使用数组接收还得进行一次类型转换。
+
+```java
+/**
+ * 批量修改
+ */
+@RequestMapping("/update/sort")
+public R updateSort(@RequestBody List<CategoryEntity> categories){
+    categoryService.updateBatchById(categories);
+    return R.ok();
+}
+```
+
+****
 
 
 
