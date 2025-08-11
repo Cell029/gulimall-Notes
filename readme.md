@@ -1629,6 +1629,770 @@ public R updateSort(@RequestBody List<CategoryEntity> categories){
 ```
 
 ****
+# 四、品牌管理
+
+## 1. 品牌信息添加显示状态按钮
+
+在逆向生成的 brand.vue 代码处，在显示状态的地方添加一个开关，用来代替原本显示状态的 0 和 1，它也用来直接修改该条数据库记录的状态，即修改 0 和 1，所以绑定的方法需要发送一条请求，
+让后端对该条数据进行修改：
+
+```vue
+<el-table-column
+    prop="showStatus"
+    header-align="center"
+    align="center"
+    label="显示状态">
+  <template slot-scope="scope">
+    <el-switch
+        v-model="scope.row.showStatus"
+        active-color="#13ce66"
+        :active-value="1"
+        inactive-color="#ff4949"
+        :inactive-value="0"
+        @change="updateBrandStatus(scope.row)"
+    >
+    </el-switch>
+  </template>
+</el-table-column>
+```
+
+而按钮绑定的数据是 scope，所以它可以获取整行的数据，也就是当前开关所属的那个品牌的所有数据（即整个 el-table），所以可以获取到 brandId 和 showStatus（显示状态绑定的值定义为 showStatus），
+然后让关绑定 0，开绑定 1 即可。
+
+```vue
+// 更新品牌状态
+updateBrandStatus (data) {
+    console.log('品牌最新信息：', data)
+    let {brandId, showStatus} = data
+    // 发送请求修改状态
+    this.$http({
+      url: this.$http.adornUrl('/product/brand/update'),
+      method: 'post',
+      data: this.$http.adornData({brandId, showStatus}, false)
+    }).then(({data}) => {
+      this.$message({
+        type: 'success',
+        message: '状态更新成功'
+      })
+    })
+},
+```
+
+而后端也是利用逆向工程生成的代码使用 mybatis-plus 修改数据库数据：
+
+```java
+/**
+ * 修改
+ */
+@RequestMapping("/update")
+public R update(@RequestBody BrandEntity brand){
+    brandService.updateById(brand);
+    return R.ok();
+}
+```
+
+****
+## 2. 文件存储
+
+### 2.1 OSS 的使用
+
+> 关于阿里云的详细使用可以参考 Takeout-Project 笔记，那里如何使用原生账号上传文件。这里记录一下如何使用子账号上传，用 RAM 子账号可以按最小权限授权、定期轮换 AccessKey、
+必要时用 STS 发放临时凭证，可以避免把主账号（root）AccessKey 放到开发工具里，降低风险。
+
+在阿里云控制台：
+
+1. 登录阿里云控制台 -> 访问控制 (RAM) -> 用户 -> 创建用户（选择 Programmatic access / 允许编程访问）
+2. 在用户详情页 -> 认证管理 -> 创建 AccessKey，把 AccessKey ID / AccessKey Secret 保存好（只在创建时能看到一次）
+3. 给子账号授权，一般授予操控某个 OSS 即可
+
+使用：
+
+1、引入依赖
+
+```xml
+<dependency>
+    <groupId>com.alibaba.cloud</groupId>
+    <artifactId>spring-cloud-starter-alicloud-oss</artifactId>
+    <version>2.2.0.RELEASE</version>
+</dependency>
+```
+
+2、在 application 文件中添加相关配置
+
+```yaml
+spring:
+  cloud:
+    alicloud:
+      access-key: ...
+      secret-key: ...
+      oss:
+        endpoint: oss-cn-beijing.aliyuncs.com
+    util:
+      enabled: false
+```
+
+3、注入 OSSClient 并使用
+
+```java
+@Autowired
+private OSSClient ossClient;
+
+@Test
+void testUpload() throws FileNotFoundException {
+    InputStream inputStream = new FileInputStream("F:\\pictures\\100.jpg");
+    ossClient.putObject("cell-gmall", "100.jpg", inputStream);
+    ossClient.shutdown();
+    System.out.println("上传成功！");
+}
+```
+
+然而在实际的使用中却频繁出现错误，首先是一个报错，虽然不影响最终的程序执行，但可能后续会对 JSON 相关的操作造成影响：
+
+```text
+Found multiple occurrences of org.json.JSONObject on the class path:
+
+	jar:file:/E:/maven/repository/org/json/json/20170516/json-20170516.jar!/org/json/JSONObject.class
+	jar:file:/E:/maven/repository/com/vaadin/external/google/android-json/0.0.20131108.vaadin1/android-json-0.0.20131108.vaadin1.jar!/org/json/JSONObject.class
+
+You may wish to exclude one of them to ensure predictable runtime behavior
+```
+
+这个报错的字面意思就是有 2 个地方的 json 依赖发生冲突，需要排除一个，这通常是 Spring 框架和 Vaadin 框架的版本问题造成的，所以一般只保留自己添加的哪个 json 依赖，
+所以选择排除 android-json 依赖，但直接在 pom 文件中搜是搜不到的，它一般是包含在某些依赖中的，而这个就是由 spring-boot-starter-test 引入的，所以在这个依赖中排除即可：
+
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-test</artifactId>
+    <scope>test</scope>
+    <exclusions>
+        <exclusion>
+            <groupId>com.vaadin.external.google</groupId>
+            <artifactId>android-json</artifactId>
+        </exclusion>
+    </exclusions>
+</dependency>
+```
+
+还有一个报错就是，明明 pom 文件中引入了 spring cloud 和 alibaba cloud 的依赖管理，但是却无法引入：
+
+```xml
+<dependency>
+    <groupId>com.alibaba.cloud</groupId>
+    <artifactId>spring-cloud-starter-alicloud-oss</artifactId>
+</dependency>
+```
+
+```xml
+Unresolved dependency: 'com.alibaba.cloud:spring-cloud-starter-alicloud-oss:jar:unknown'
+```
+
+这应该也是依赖版本的冲突，只能让这个依赖带上版本号后纳入依赖管理，再引入：
+
+```xml
+<dependencyManagement>
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.cloud</groupId>
+            <artifactId>spring-cloud-dependencies</artifactId>
+            <version>2021.0.5</version>
+            <type>pom</type>
+            <scope>import</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.alibaba.cloud</groupId>
+            <artifactId>spring-cloud-alibaba-dependencies</artifactId>
+            <version>2021.0.5.0</version>
+            <type>pom</type>
+            <scope>import</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.alibaba.cloud</groupId>
+            <artifactId>spring-cloud-starter-alicloud-oss</artifactId>
+            <version>2.2.0.RELEASE</version>
+        </dependency>
+    </dependencies>
+</dependencyManagement>
+```
+
+虽然这可以解决依赖引入的问题，但是又出现问题：
+
+```text
+***************************
+APPLICATION FAILED TO START
+***************************
+
+Description:
+
+Parameter 0 of method inetIPv6Utils in com.alibaba.cloud.nacos.util.UtilIPv6AutoConfiguration required a single bean, but 2 were found:
+	- spring.cloud.inetutils-org.springframework.cloud.commons.util.InetUtilsProperties: defined in null
+	- inetUtilsProperties: defined by method 'inetUtilsProperties' in class path resource [org/springframework/cloud/commons/util/UtilAutoConfiguration.class]
+Action:
+
+Consider marking one of the beans as @Primary, updating the consumer to accept multiple beans, or using @Qualifier to identify the bean that should be consumed
+```
+
+经过搜索，发现在配置文件中添加：
+
+```yaml
+    util:
+      enabled: false
+```
+
+可以解决 product 服务启动的问题，也可以通过 test 成功上传图片到 OSS，但是此时除了　product 以外的所有服务全部启动报错，报错内容就是上面的，这个报错的大概意思就是：
+Spring 容器里同时存在了两个 InetUtilsProperties 类型的 Bean，一个是 spring.cloud.inetutils-org.springframework.cloud.commons.util.InetUtilsProperties，
+另一个是 inetUtilsProperties（由 UtilAutoConfiguration 中的方法创建），但是 UtilIPv6AutoConfiguration 需要注入唯一的 InetUtilsProperties，所以就报错了。
+而在 gulimall_product 的 application 中添加了 spring.cloud.util.enabled=false，它就可以关闭 spring-cloud-commons 中的 Util 相关自动配置（UtilAutoConfiguration），
+也就不会创建 inetUtilsProperties 这个 Bean，所以可以选择在其它服务的 application 中都添加 spring.cloud.util.enabled=false。
+
+虽然直接使用 spring.cloud.util.enabled=false 可以解决上面的报错，但是启动后又出现了新的报错：
+
+```text
+Caused by: java.lang.ClassNotFoundException: com.aliyun.oss.ClientBuilderConfiguration
+```
+
+又或者：
+
+```text
+java.lang.IllegalArgumentException: Oss endpoint can't be empty.
+```
+
+一个是因为缺失依赖而导致的项目启动失败，一个是因为配置缺失导致无法创建 OSS Client，但是其它服务明明没有用到相关的东西，只是引入了 common 依赖，所以应该是添加进 common 的依赖和其它服务产生了版本的冲突，
+所以直接把添加进 common 的 oss 相关依赖放进 gulimall_product 中，避免和其它项目产生冲突。
+
+所以最终关于依赖的导入就是直接导入 gulimall_product 服务：
+
+```xml
+<dependency>
+    <groupId>com.alibaba.cloud</groupId>
+    <artifactId>spring-cloud-starter-alicloud-oss</artifactId>
+    <version>2.2.0.RELEASE</version>
+</dependency>
+```
+
+****
+### 2.2 获取服务端签名
+
+上面的使用方法是通过微服务将文件上传，这样就太麻烦了，每次上传文件都要经过一次服务器，应该直接让浏览器将文件提交给 OSS 存储，只通过服务器拿到签名数据以保证安全和可靠性。
+所以这里新建一个服务，用来集成第三方的 OSS 服务。
+
+编写一个 controller 用来接收前端发送来的请求，然后将相关的签名返回给前端，前端带着签名等信息直接把文件 POST 到 OSS 服务器：
+
+```java
+@RestController
+public class OssController {
+    @Autowired
+    OSS ossClient;
+    @Value("${spring.cloud.alicloud.oss.endpoint}")
+    String endpoint;
+    @Value("${spring.cloud.alicloud.oss.bucket}")
+    String bucket;
+    @Value("${spring.cloud.alicloud.access-key}")
+    String accessId;
+    @Value("${spring.cloud.alicloud.secret-key}")
+    String accessKey;
+
+    @GetMapping("/oss/policy")
+    public Map<String, String> policy() {
+        // host的格式为 bucketname.endpoint
+        String host = "https://" + bucket + "." + endpoint;
+        // 上传目录（可按日期分目录）
+        String dir = new SimpleDateFormat("yyyy-MM-dd").format(new Date()) + "/";
+        OSS ossClient = new OSSClientBuilder().build(endpoint, accessId, accessKey);
+        Map<String, String> respMap = null;
+        try {
+            long expireTime = 30; // 签名有效期（秒）
+            long expireEndTime = System.currentTimeMillis() + expireTime * 1000;
+            Date expiration = new Date(expireEndTime);
+            // 允许的最大文件大小，这里 10 MB
+            long maxSize = 10 * 1024 * 1024;
+            PolicyConditions policyConds = new PolicyConditions();
+            policyConds.addConditionItem(PolicyConditions.COND_CONTENT_LENGTH_RANGE, 0, maxSize);
+            policyConds.addConditionItem(MatchMode.StartWith, PolicyConditions.COND_KEY, dir);
+
+            String postPolicy = ossClient.generatePostPolicy(expiration, policyConds);
+            byte[] binaryData = postPolicy.getBytes(StandardCharsets.UTF_8);
+            String encodedPolicy = BinaryUtil.toBase64String(binaryData);
+            String postSignature = ossClient.calculatePostSignature(postPolicy);
+
+            respMap = new LinkedHashMap<>();
+            respMap.put("accessid", accessId);
+            respMap.put("policy", encodedPolicy);
+            respMap.put("signature", postSignature);
+            respMap.put("dir", dir);
+            respMap.put("host", host);
+            respMap.put("expire", String.valueOf(expireEndTime / 1000));
+        } catch (Exception e) {
+            System.out.println(e.getMessage());
+        } finally {
+            ossClient.shutdown();
+        }
+        return respMap;
+    }
+}
+```
+
+因为是一个新的服务，所以网关也要进行相关的配置：
+
+```yaml
+spring:
+  cloud:
+    gateway:
+      routes:
+        
+        - id: third_party_route
+          uri: lb://gulimall-third-party
+          predicates:
+            - Path=/api/thirdparty/**
+          filters:
+            - RewritePath=/api/thirdparty/(?<segment>.*),/$\{segment}
+```
+
+访问 http://localhost:88/api/thirdparty/oss/policy ：
+
+```json
+{
+    "accessid": "LTAI5tPE3AMHW1ewpzPH3emY",
+    "policy": "eyJleHBpcmF0aW9uIjoiMjAyNS0wOC0xMVQxMjozMzo1OS44NjdaIiwiY29uZGl0aW9ucyI6W1siY29udGVudC1sZW5ndGgtcmFuZ2UiLDAsMTA0ODU3NjBdLFsic3RhcnRzLXdpdGgiLCIka2V5IiwiMjAyNS0wOC0xMS8iXV19",
+    "signature": "Mm7t5Csymg5z5d+t8k3m7V0yhko=",
+    "dir": "2025-08-11/",
+    "host": "https://cell-gmall.oss-cn-beijing.aliyuncs.com",
+    "expire": "1754915639"
+}
+```
+
+****
+### 2.3 前端使用签名
+
+前端会发送一个请求，向后端获取签名，然后把获取到的数据赋值给 dataObj，将来把这个 dataObj 上传给 OSS：
+
+```vue
+<el-upload
+    action="http://cell-gmall.oss-cn-beijing.aliyuncs.com" <!--一定要注意格式:bucket.endpoint-->
+    :data="dataObj"
+    list-type="picture"
+    :multiple="false" :show-file-list="showFileList"
+    :file-list="fileList"
+    :before-upload="beforeUpload"
+    :on-remove="handleRemove"
+    :on-success="handleUploadSuccess"
+    :on-preview="handlePreview">
+  <el-button size="small" type="primary">点击上传</el-button>
+  <div slot="tip" class="el-upload__tip">只能上传jpg/png文件，且不超过10MB</div>
+</el-upload>
+```
+
+```js
+export function policy () {
+  return new Promise((resolve, reject) => {
+    http({
+      url: http.adornUrl('/thirdparty/oss/policy'),
+      method: 'get',
+      params: http.adornParams({})
+    }).then(({data}) => {
+      resolve(data)
+    })
+  })
+}
+```
+
+```vue
+beforeUpload(file) {
+  return new Promise((resolve, reject) => {
+    policy().then(response => {
+      this.dataObj.policy = response.data.policy;
+      this.dataObj.signature = response.data.signature;
+      this.dataObj.ossaccessKeyId = response.data.accessid;
+      this.dataObj.key = response.data.dir + getUUID() + '_${filename}';
+      this.dataObj.dir = response.data.dir;
+      this.dataObj.host = response.data.host;
+      resolve(true);
+    }).catch(err => {
+      reject(false);
+    });
+  });
+}
+```
+
+点击上床文件进行测试,却发现浏览器报错了:
+
+```text
+Access to XMLHttpRequest at 'http://cell-gmall.oss-cn-shanghai.aliyuncs.com/' from origin 'http://localhost:8001' has been blocked by CORS policy: Response to preflight request doesn't pass access control check: No 'Access-Control-Allow-Origin' header is present on the requested resource.
+```
+
+这又是一个跨域拦截,既然是从某个浏览器向另一个地方发送请求,那就存在跨域问题,解决办法就是在 OSS 中配置允许跨域:
+
+
+```text
+创建跨域规则
+
+* 来源
+┌──────────────────────────────────────────────┐
+│ *                                            │
+└──────────────────────────────────────────────┘
+来源可以设置多个，每行一个，每行最多能有一个通配符 *
+
+* 允许 Methods   [ ] GET   [x] POST   [ ] PUT   [ ] DELETE   [ ] HEAD  
+
+允许 Headers
+┌──────────────────────────────────────────────┐
+│ *                                            │
+└──────────────────────────────────────────────┘
+允许 Headers 可以设置多个，每行一个，每行最多能有一个通配符 *
+
+暴露 Headers
+┌──────────────────────────────────────────────┐
+│                                              │
+└──────────────────────────────────────────────┘
+暴露 Headers 可以设置多个，每行一个，不允许出现通配符 *
+
+缓存时间（秒）  [ 3600 ]
+```
+
+****
+## 3. 数据校验
+
+### 3.1 前端表单校验
+
+前端的表单校验就是在用表单填写数据时会对填写的内容进行一次检查，看看是否复合定义的规则，避免提交错误的数据给后端，造成不必要的麻烦。前端表单校验的写法较为统一：
+
+```vue
+dataRule: {
+      name: [
+        { required: true, message: '品牌名不能为空', trigger: 'blur' }
+      ],
+      logo: [
+        { required: true, message: '品牌logo地址不能为空', trigger: 'blur' }
+      ],
+      descript: [
+        { required: true, message: '介绍不能为空', trigger: 'blur' }
+      ],
+      showStatus: [
+        { required: true, message: '显示状态[0-不显示；1-显示]不能为空', trigger: 'blur' }
+      ],
+      firstLetter: [
+        { validator: (rule, value, callback) => {
+          if (value === '') {
+            callback(new Error('首字母必须填写'))
+          } else if (!/^[a-zA-Z]$/.test(value)) {
+            callback(new Error('首字母必须是26个字母之中的一个'))
+          } else {
+            // 成功则不传错误信息
+            callback()
+          }
+          }, trigger: 'blur' }
+      ],
+      sort: [
+        { validator: (rule, value, callback) => {
+            if (value === '') {
+              callback(new Error('排序字段必须填写'))
+            } else if (!Number.isInteger(value) || value < 0) {
+              callback(new Error('排序字段必须是不小于0的整数'))
+            } else {
+              // 成功则不传错误信息
+              callback()
+            }
+          }, trigger: 'blur' }
+      ]
+    }
+  }
+},
+```
+
+```vue
+this.$refs['dataForm'].validate((valid) => {
+  if (valid) {
+    // 校验通过，执行提交逻辑
+  } else {
+    // 校验失败，阻止提交
+  }
+})
+```
+
+****
+### 3.2 JSR303 校验
+
+虽然在前端提交表单时进行过一次校验了，但是那只局限于使用表单，如果是通过 postman 等软件发送请求，则可以直接跳过前端的校验，所以需要在后端也添加一层校验作为保障。
+而常用的一种校验方式就是 JSR 303 校验，它是 Java 规范请求 303 号，它规范了一个通用的、标准化的 Bean 校验 API。它定义了一组注解和接口，用来声明和执行对 Java 对象属性的校验规则。
+常用注解：
+
+| 注解                | 说明                       | 备注               |
+| ----------------- | ------------------------ | ---------------- |
+| `@NotNull`        | 不能为空，null 会校验失败          | 只校验 null，不校验空字符串 |
+| `@NotBlank`       | 字符串不能为空，且不能全为空格          | 适用于 String       |
+| `@NotEmpty`       | 字符串、集合、数组不能为空（不为null且非空） | 适用于集合和字符串        |
+| `@Size(min, max)` | 字符串、集合长度范围               |                  |
+| `@Min`            | 数值最小值限制                  |                  |
+| `@Max`            | 数值最大值限制                  |                  |
+| `@Pattern`        | 正则表达式校验                  |                  |
+| `@Email`          | 邮箱格式校验                   |                  |
+| `@Past`           | 日期必须是过去时间                |                  |
+| `@Future`         | 日期必须是将来时间                |                  |
+
+相关依赖：
+
+```xml
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-validation</artifactId>
+</dependency>
+
+```
+
+例如在品牌实体中添加这些注解：
+
+```java
+@Data
+@TableName("pms_brand")
+public class BrandEntity implements Serializable {
+	private static final long serialVersionUID = 1L;
+	/**
+	 * 品牌id
+	 */
+	@TableId
+	private Long brandId;
+	/**
+	 * 品牌名
+	 */
+	@NotBlank(message = "品牌名必须提交")
+	private String name;
+	/**
+	 * 品牌logo地址
+	 */
+	@NotEmpty
+	@URL(message = "logo 必须是一个合法的 url 地址")
+	private String logo;
+	/**
+	 * 介绍
+	 */
+	private String descript;
+	/**
+	 * 显示状态[0-不显示；1-显示]
+	 */
+	private Integer showStatus;
+	/**
+	 * 检索首字母
+	 */
+	@NotEmpty
+	@Pattern(regexp = "/^[a-zA-Z]$/", message = "品牌首字母必须是26个字母之一")
+	private String firstLetter;
+	/**
+	 * 排序
+	 */
+	@NotNull
+	@Min(value = 0, message = "排序字段不能小于0")
+	private Integer sort;
+}
+```
+
+然后在控制器方法参数上加 @Valid:
+
+```java
+@RequestMapping("/save")
+public R save(@Valid @RequestBody BrandEntity brand, BindingResult bindingResult){
+    if(bindingResult.hasErrors()){
+        Map<String, String> map = new HashMap<>();
+        // 获取校验的错误结果
+        bindingResult.getFieldErrors().forEach(fieldError -> {
+            // 获取到错误提示
+            String message = fieldError.getDefaultMessage();
+            // 获取错误的字段
+            String field = fieldError.getField();
+            map.put(field, message);
+        });
+        return R.error(400, "提交的数据不合法").put("data", map);
+    } else {
+        brandService.save(brand);
+        return R.ok();
+    }
+}
+```
+
+- @Valid 
+  - 标记需要对 brand 对象进行 JSR 303 校验。这个注解会触发 Spring MVC 自动调用底层 Validator（如 Hibernate Validator）对 brand 进行校验。
+
+- BindingResult bindingResult 
+  - 用于接收校验的结果，必须紧跟在 @Valid 参数之后。
+  - 里面包含了校验失败时的错误信息列表，如果没有错误则为空
+
+通过 apiFox 发送一个请求：
+
+```json
+{"name":"","logo":"sfa","sort":"","firstLetter": "asf"}
+```
+
+收到返回结果：
+
+```json
+{
+  "msg": "提交的数据不合法",
+  "code": 400,
+  "data": {
+    "name": "品牌名必须提交",
+    "logo": "logo 必须是一个合法的 url 地址",
+    "sort": "不能为null",
+    "firstLetter": "品牌首字母必须是26个字母之一"
+  }
+}
+```
+
+****
+### 3.3 统一处理异常
+
+因为后续可能处理很多异常类型，如果每个 Controller 里都写 BindingResult 的判断，就会造成代码重复，逻辑分散，违背了 Controller 层的设计，所以需要统一异常处理，
+统一处理 BindingResult 的判断。
+
+例如，编写一个 ExceptionControllerAdvice 类，专门处理本服务的异常，因为 Controller 层中使用了 @Valid，可以触发对目标参数的校验，如果出现异常就会在 Controller 层抛出：
+
+```java
+@Slf4j
+@RestControllerAdvice(basePackages = "com.project.gulimall.product.controller")
+public class ExceptionControllerAdvice {
+    @ExceptionHandler(value = Exception.class)
+    public R handleValidException(Exception e){
+        log.error("数据校验出现问题：{}，异常类型为：{}", e.getMessage(), e.getClass());
+        return R.error();
+    }
+}
+```
+
+- @RestControllerAdvice 相当于 @ControllerAdvice + @ResponseBody
+- @ControllerAdvice：全局异常通知，所有控制器异常都能捕获
+- @ExceptionHandler(ExceptionType.class)：指定捕获的异常类型
+- 当 Controller 或 Spring 内部抛出异常时，匹配对应异常处理方法执行
+
+先简单捕获一下刚刚写的 save() 方法抛出的异常：
+
+```text
+异常类型为：class org.springframework.web.bind.MethodArgumentNotValidException
+```
+
+可以看到捕获的异常是 MethodArgumentNotValidException，那么就可以直接精准捕获，然后对触发该类型异常的 BindingResult 进行判断：
+
+```java
+@ExceptionHandler(value = MethodArgumentNotValidException.class)
+public R handleValidException(MethodArgumentNotValidException e){
+    log.error("数据校验出现问题：{}，异常类型为：{}", e.getMessage(), e.getClass());
+    BindingResult bindingResult = e.getBindingResult();
+    Map<String, String> map = new HashMap<>();
+    bindingResult.getFieldErrors().forEach(fieldError -> {
+        map.put(fieldError.getField(), fieldError.getDefaultMessage());
+    });
+    return R.error(400, "数据校验出现问题").put("data", map);
+}
+```
+
+当然触发的异常类型不止这一种，所以可以编写一个更广范围的异常捕获：
+
+```java
+// 无论是程序抛出的异常，还是程序错误，都可以被捕获
+@ExceptionHandler(value = Throwable.class)
+public R handleException(Throwable throwable){
+    log.error("数据校验出现问题：{}，异常类型为：{}", throwable.getMessage(), throwable.getClass());
+    return R.error();
+}
+```
+
+不过目前的错误状态码返回的都是 400，这是不符合规范的，状态码应该准确的显示当前发生的错误是什么，所以应该定义一个枚举类型，用来管理不通状态码对应的错误信息，
+将来可能会发生各种错误，到时候添加进去即可：
+
+```java
+/***
+ * 错误码和错误信息定义类
+ * 1. 错误码定义规则为5为数字
+ * 2. 前两位表示业务场景，最后三位表示错误码。例如：100001。10:通用 001:系统未知异常
+ * 3. 维护错误码后需要维护错误描述，将他们定义为枚举形式
+ * 错误码列表：
+ *  10: 通用
+ *      001：参数格式校验
+ *  11: 商品
+ *  12: 订单
+ *  13: 购物车
+ *  14: 物流
+ */
+public enum BizCodeEnum {
+    UNKNOW_EXEPTION(10000,"系统未知异常"),
+
+    VALID_EXCEPTION( 10001,"参数格式校验失败");
+
+    private int code;
+    private String msg;
+
+    BizCodeEnum(int code, String msg) {
+        this.code = code;
+        this.msg = msg;
+    }
+
+    public int getCode() {
+        return code;
+    }
+
+    public String getMsg() {
+        return msg;
+    }
+}
+```
+
+修改上面对应的捕获异常的代码：
+
+```java
+@ExceptionHandler(value = MethodArgumentNotValidException.class)
+public R handleValidException(MethodArgumentNotValidException e){
+    ...
+    return R.error(BizCodeEnum.VALID_EXCEPTION.getCode(), BizCodeEnum.VALID_EXCEPTION.getMsg()).put("data", map);
+}
+```
+
+```java
+@ExceptionHandler(value = Throwable.class)
+public R handleException(Throwable throwable){
+    ...   
+    return R.error(BizCodeEnum.UNKNOW_EXEPTION.getCode(), BizCodeEnum.UNKNOW_EXEPTION.getMsg());
+}
+```
+
+注释掉 Controller 层写的 BindingResult，直接正常返回数据，异常会由上面的统一捕获（但 @Valid 不能注释掉）：
+
+```java
+@RequestMapping("/save")
+public R save(@Valid @RequestBody BrandEntity brand/*, BindingResult bindingResult*/){
+    /*if(bindingResult.hasErrors()){
+        Map<String, String> map = new HashMap<>();
+        // 获取校验的错误结果
+        bindingResult.getFieldErrors().forEach(fieldError -> {
+            // 获取到错误提示
+            String message = fieldError.getDefaultMessage();
+            // 获取错误的字段
+            String field = fieldError.getField();
+            map.put(field, message);
+        });
+        return R.error(400, "提交的数据不合法").put("data", map);
+    } else {
+        brandService.save(brand);
+        return R.ok();
+    }*/
+
+    brandService.save(brand);
+    return R.ok();
+}
+```
+
+模拟错误请求返回结果：
+
+```text
+{
+    "msg": "参数格式校验失败",
+    "code": 10001,
+    "data": {
+        "name": "品牌名必须提交",
+        "logo": "logo 必须是一个合法的 url 地址",
+        "sort": "不能为null",
+        "firstLetter": "品牌首字母必须是26个字母之一"
+    }
+}
+```
+
+****
 
 
 

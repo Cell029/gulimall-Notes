@@ -1,8 +1,12 @@
 package com.project.gulimall.product.controller;
 
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.Map;
+
+import com.baomidou.mybatisplus.core.toolkit.BeanUtils;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.validation.BindingResult;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -13,6 +17,7 @@ import com.project.gulimall.product.service.BrandService;
 import com.project.common.utils.PageUtils;
 import com.project.common.utils.R;
 
+import javax.validation.Valid;
 
 
 /**
@@ -23,6 +28,7 @@ import com.project.common.utils.R;
 public class BrandController {
     @Autowired
     private BrandService brandService;
+
 
     /**
      * 列表
@@ -49,9 +55,24 @@ public class BrandController {
      * 保存
      */
     @RequestMapping("/save")
-    public R save(@RequestBody BrandEntity brand){
-		brandService.save(brand);
+    public R save(@Valid @RequestBody BrandEntity brand/*, BindingResult bindingResult*/){
+        /*if(bindingResult.hasErrors()){
+            Map<String, String> map = new HashMap<>();
+            // 获取校验的错误结果
+            bindingResult.getFieldErrors().forEach(fieldError -> {
+                // 获取到错误提示
+                String message = fieldError.getDefaultMessage();
+                // 获取错误的字段
+                String field = fieldError.getField();
+                map.put(field, message);
+            });
+            return R.error(400, "提交的数据不合法").put("data", map);
+        } else {
+            brandService.save(brand);
+            return R.ok();
+        }*/
 
+        brandService.save(brand);
         return R.ok();
     }
 
@@ -61,7 +82,6 @@ public class BrandController {
     @RequestMapping("/update")
     public R update(@RequestBody BrandEntity brand){
 		brandService.updateById(brand);
-
         return R.ok();
     }
 
