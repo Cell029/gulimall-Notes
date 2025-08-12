@@ -1,13 +1,12 @@
 package com.project.gulimall.product.service.impl;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.project.gulimall.product.service.CategoryBrandRelationService;
+import org.apache.commons.lang.StringUtils;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
-import java.util.Comparator;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
+import java.util.*;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -26,6 +25,8 @@ public class CategoryServiceImpl extends ServiceImpl<CategoryDao, CategoryEntity
 
     @Autowired
     private CategoryDao categoryDao; // 等价于 baseMapper
+    @Autowired
+    private CategoryBrandRelationService categoryBrandRelationService;
 
     @Override
     public PageUtils queryPage(Map<String, Object> params) {
@@ -62,6 +63,39 @@ public class CategoryServiceImpl extends ServiceImpl<CategoryDao, CategoryEntity
         categoryDao.delete(new LambdaQueryWrapper<CategoryEntity>().in(CategoryEntity::getCatId, list));
     }
 
+    @Override
+    public Long[] findCatelogPath(Long catelogId) {
+        List<Long> paths = new ArrayList<>();
+        // 如果有父分类，就向上找
+        // 因为添加进 path 的 id 是从最小层级开始的，所以 path 中的 id 排序为 三级 -> 二级 -> 一级
+        // 所以进行一下反转操作
+        Collections.reverse(findParentPath(catelogId, paths));
+        return paths.toArray(new Long[0]);
+    }
+
+    /**
+     * 级联更新所有关联的数据
+     * @param category
+     */
+    @Override
+    public void updateCascade(CategoryEntity category) {
+        this.updateById(category);
+        if (!StringUtils.isEmpty(category.getName())) {
+            categoryBrandRelationService.updateCategory(category.getCatId(), category.getName());
+        }
+    }
+
+
+    private List<Long> findParentPath(Long catelogId, List<Long> paths) {
+        // 收集当前节点 id
+        paths.add(catelogId);
+        // 根据 catelogId 查出当前分类的信息
+        CategoryEntity category = this.getById(catelogId);
+        if (category.getParentCid() != 0) {
+            findParentPath(category.getParentCid(), paths);
+        }
+        return paths;
+    }
 
     /**
      * 获取子菜单

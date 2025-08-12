@@ -5,6 +5,8 @@ import com.aliyun.oss.OSSClient;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.project.gulimall.product.entity.BrandEntity;
 import com.project.gulimall.product.service.BrandService;
+import com.project.gulimall.product.service.CategoryService;
+import lombok.extern.slf4j.Slf4j;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -12,8 +14,11 @@ import org.springframework.boot.test.context.SpringBootTest;
 import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.InputStream;
+import java.lang.reflect.Array;
+import java.util.Arrays;
 import java.util.List;
 
+@Slf4j
 @SpringBootTest
 class GulimallProductApplicationTests {
 
@@ -21,6 +26,8 @@ class GulimallProductApplicationTests {
 	private BrandService brandService;
 	@Autowired
 	private OSSClient ossClient;
+	@Autowired
+	private CategoryService categoryService;
 
 	@Test
 	void contextLoads() {
@@ -49,6 +56,12 @@ class GulimallProductApplicationTests {
 		ossClient.putObject("cell-gmall", "101.jpg", inputStream);
 		ossClient.shutdown();
 		System.out.println("上传成功！");
+	}
+
+	@Test
+	void testFindParentPath() {
+		Long[] catelogPath = categoryService.findCatelogPath(251L);
+		log.info("完整路径：{}", Arrays.asList(catelogPath));
 	}
 
 }

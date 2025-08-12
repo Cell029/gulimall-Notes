@@ -2174,7 +2174,7 @@ public class BrandEntity implements Serializable {
 	 * 检索首字母
 	 */
 	@NotEmpty
-	@Pattern(regexp = "/^[a-zA-Z]$/", message = "品牌首字母必须是26个字母之一")
+	@Pattern(regexp = "^[a-zA-Z]$", message = "品牌首字母必须是26个字母之一")
 	private String firstLetter;
 	/**
 	 * 排序
@@ -2393,6 +2393,631 @@ public R save(@Valid @RequestBody BrandEntity brand/*, BindingResult bindingResu
 ```
 
 ****
+### 3.4 分组校验
+
+在实际开发中，同一个实体类可能会在多个场景中使用，但不同场景对字段的校验规则往往不同。例如：
+
+- 新增用户时：id 字段由数据库自动生成，不需要传递，因此不需要校验 id 是否存在；但 username 和 password 必须非空
+- 修改用户时：id 是必须的（用于定位要修改的用户），因此需要校验 id 非空；同时 username 和 password 仍需非空
+- 重置密码时：id 是必须的（用于定位要修改的用户），但只需要验证新密码即可
+
+如果没有分组校验，就需要为新增、修改、重置分别创建实体类，但是它们使用的字段都是一样的，只是校验规则不同，这就会导致代码冗余。而分组校验允许在同一个实体类中，
+为不同场景定义不同的校验规则，避免冗余。
+
+分组的本质是创建一个标记接口（无任何方法的接口），用于标识一组校验规则。例如：AddGroup（新增场景的分组）、UpdateGroup（修改场景的分组）。
+而 JSR303 的所有约束注解（如 @NotNull、@Min 等）都有一个 groups 属性，用于指定该注解属于哪个或哪些分组。在触发校验时（如 Controller 层接收参数时），
+通过指定分组，只执行该分组下的校验规则。而之前使用的 @Valid 注解就要替换成 @Validated，因为这个新注解可以指定需要执行的分组，即可只校验该分组下的规则。具体使用：
+
+```java
+@NotNull(message = "修改必须指定品牌 id", groups = {UpdateGroup.class})
+@Null(message = "新增不能指定品牌 id", groups = {AddGroup.class})
+@TableId
+private Long brandId;
+/**
+ * 品牌名
+ */
+@NotBlank(message = "品牌名必须提交", groups = {AddGroup.class, UpdateGroup.class})
+private String name;
+/**
+ * 品牌logo地址
+ */
+@NotEmpty(groups = {AddGroup.class})
+@URL(message = "logo 必须是一个合法的 url 地址", groups = {AddGroup.class, UpdateGroup.class})
+private String logo;
+/**
+ * 介绍
+ */
+private String descript;
+/**
+ * 显示状态[0-不显示；1-显示]
+ */
+private Integer showStatus;
+/**
+ * 检索首字母
+ */
+@NotEmpty(groups = {AddGroup.class})
+@Pattern(regexp = "^[a-zA-Z]$", message = "品牌首字母必须是26个字母之一", groups = {AddGroup.class, UpdateGroup.class})
+private String firstLetter;
+/**
+ * 排序
+ */
+@NotNull(groups = {AddGroup.class})
+@Min(value = 0, message = "排序字段不能小于0", groups = {AddGroup.class, UpdateGroup.class})
+private Integer sort;
+```
+
+- 调用 update 方法时，会校验 UpdateGroup 分组的规则：brandId 非空、name 非空、logo 的 URL 必须复合规范（但可以为空）、首字母必须符合规范（但可以为空）、排序字段必须复合规范（但可以为空）
+- 调用 save 方法时，会检验 AddGroup 分组的规则：brandId 必须为空、name 非空、logo 的 URL 必须复合规范且非空、首字母必须符合规范且非空、排序字段必须复合规范且非空
+
+```java
+@RequestMapping("/update")
+public R update(@Validated({UpdateGroup.class}) @RequestBody BrandEntity brand){
+  ...
+}
+```
+
+```java
+@RequestMapping("/save")
+public R save(@Validated({AddGroup.class}) @RequestBody BrandEntity brand){
+  ...
+}
+```
+
+当然如果某个分组包含另一个分组的所有校验规则，就可以通过接口继承实现，例如：定义一个 AllGroup 分组，继承 AddGroup 和 UpdateGroup，
+则校验 AllGroup 时会执行这两个分组的所有规则。而如果 @Validated 没有指定分组的话，它的效果就等同于 @Valid，只能校验那些也没有使用分组的注解。
+如果需要同时使用别的分组和默认分组，就需要显示包含 Default.class（@Validated({AddGroup.class, Default.class})）。
+
+****
+### 3.5 自定义校验注解
+
+一个完整的自定义校验注解需要包含 3 个部分：
+
+- 自定义注解类：定义注解的基本信息（如名称、适用目标、属性等）
+- 校验器（Validator）：实现具体的校验逻辑（实现 ConstraintValidator 接口）
+- 默认错误信息：指定校验失败时的默认提示信息（通常通过资源文件配置）
+
+以 @NotNull 为模板参考，一个校验注解需要哪些东西：
+
+```java
+@Target({ElementType.METHOD, ElementType.FIELD, ElementType.ANNOTATION_TYPE, ElementType.CONSTRUCTOR, ElementType.PARAMETER, ElementType.TYPE_USE})
+@Retention(RetentionPolicy.RUNTIME)
+@Repeatable(List.class)
+@Documented
+@Constraint(validatedBy = {})
+public @interface NotNull {
+    String message() default "{javax.validation.constraints.NotNull.message}";
+
+    Class<?>[] groups() default {};
+
+    Class<? extends Payload>[] payload() default {};
+
+    @Target({ElementType.METHOD, ElementType.FIELD, ElementType.ANNOTATION_TYPE, ElementType.CONSTRUCTOR, ElementType.PARAMETER, ElementType.TYPE_USE})
+    @Retention(RetentionPolicy.RUNTIME)
+    @Documented
+    public @interface List {
+        NotNull[] value();
+    }
+}
+```
+
+- @Target：限制这个注解可以用在什么地方
+- @Retention：指定注解的生命周期
+- @Documented：让该注解出现在 Javadoc 中
+- @Repeatable：可以在 List 上重复使用
+- @Constraint：标识这是一个 Bean Validation 约束注解，并指定它的校验器类。但这里是一个空数组，因为有些注解是由 Bean Validation 的默认实现直接提供校验逻辑（内置约束），
+所以不需要自己指定校验器，但是自定义注解必须写自己的校验器类，否则框架不知道用什么逻辑来验证
+- message()：定义校验失败时的默认提示信息，这个里面写的已经定义好的默认提示信息，例如：javax.validation.constraints.NotNull.message = must not be null。
+这里的 {} 是 占位符语法，意思是不要直接把里面的字符串当成错误信息，而是把它当成一个资源 key，去国际化资源文件中查找对应的文本。
+自定义注解时推荐写成类似 {注解的包名.message}，这样方便统一管理提示语。但是因为自定义的 message 是不在国际化资源文件中的，如果不自定义默认的错误信息，就会直接输出 key 本身。 
+所以一般会在配置文件里定义。
+- groups()：分组校验支持，指定该约束属于哪些校验组。
+- payload()：承载元信息，不参与校验逻辑，但 JSR 303 规范要求所有约束注解必须有这个属性，否则不算规范实现，所以直接复制即可。
+
+综上，根据 JSR303 规范，message()、groups()、payload() 是必须要有的，因为校验框架是通过反射查找这些方法的。如果漏了，Hibernate Validator 这样的实现类会直接抛异常。
+现在对 showStatus 字段进行自定义一个注解，用来限制输入的内容只能为 0 或 1：
+
+```java
+/**
+ * 显示状态[0-不显示；1-显示]
+ */
+private Integer showStatus;
+```
+
+自定义一个 @ValueList 注解：
+
+```java
+@Documented
+@Constraint(validatedBy = { ListValueConstraintValidator.class })
+@Target({ METHOD, FIELD, ANNOTATION_TYPE, CONSTRUCTOR, PARAMETER, TYPE_USE })
+@Retention(RUNTIME)
+public @interface ListValue {
+
+    String message() default "{com.project.common.valid.ListValue.message}";
+
+    Class<?>[] groups() default {};
+
+    Class<? extends Payload>[] payload() default {};
+
+    int[] values() default { };
+}
+```
+
+关于提示的默认错误信息，JSR 303 规范规定，默认会去类路径下查找 ValidationMessages.properties 这个文件，并把它作为默认的国际化资源文件。所以可以在 resources 目录下创建，
+然后自定以需要返回的默认错误信息：
+
+```properties
+com.project.common.valid.ListValue.message=必须提交指定的值
+```
+
+除了上面的三个必须包含的内容，这里还自定义了一个 int 类型的 values 数组，它是自定义注解里的属性，在使用这个注解时可以通过 values 传值，所以需要解读传入的值是否满足当前想定义的条件，
+就需要在校验器的数组中自定义一个校验器，它用来自定义校验规则：
+
+引入依赖：
+
+```xml
+<!--validation-->
+<dependency>
+    <groupId>javax.validation</groupId>
+    <artifactId>validation-api</artifactId>
+</dependency>
+```
+
+通过实现 ConstraintValidator 的方式完成自定义校验器，实现它里面的两个方法：
+
+- initialize() 方法会在校验前执行一次，用来读取注解里的 values
+- isValid() 方法才是真正判断字段是否合法的地方
+
+```java
+public class ListValueConstraintValidator implements ConstraintValidator<ListValue, Integer> {
+    private Set<Integer> set = new HashSet<>();
+    @Override
+    public void initialize(ListValue constraintAnnotation) {
+        int[] values = constraintAnnotation.values(); // 从注解上拿到 values 的值
+        for (int i : values) {
+            set.add(i);
+        }
+    }
+  // 需要校验的值
+    @Override
+    public boolean isValid(Integer value, ConstraintValidatorContext constraintValidatorContext) {
+      return value != null && set.contains(value);
+    }
+}
+```
+
+当在 showStatus 字段上这样定义时:
+
+```java
+@ListValue(values = { 0, 1 })
+private Integer showStatus;
+```
+
+initialize 方法就会读取 @ListValue(values = {0, 1}) 注解参数，然后把它们存进一个 Set<Integer>。当 Controller 拿到传入的 showStatus 的值时，
+就会用 set.contains(value) 检查值是否在 {0, 1} 里，然后根据结果选择是否拦截。
+
+****
+## 4. 属性分组
+
+### 4.1 SPU 与 SKU
+
+- SPU（Standard / Stock / Standard Product Unit）：
+
+表示标准化产品单元，它描述一类产品的不变属性与业务概念，例如：品牌、型号、描述、分类、基础图文等。例如：iPhone 14 128GB（蓝色）的产品型号抽象成 SPU（有时 SPU 会不包括颜色/容量这些可变规格，依实现而定）。
+
+- SKU（Stock Keeping Unit）：
+
+表示“最小库存单元/售卖单元”。可直接买到、需要独立管理库存与条码的具体商品。通常由 SPU + 一组规格（规格值）唯一确定。例如：T恤（SPU: Basic Tee） + 颜色: 红 + 尺码: M -> 一个 SKU。
+
+主要区别：
+
+- 身份与作用：SPU 用于组织、展示和搜索；SKU 用于下单、库存、价格、配送
+- 数据关注点：SPU 关注商品描述、类目、品牌、长文本；SKU 关注价格、库存、条码、重量、尺寸、货位
+- 变更频率：SPU 属性相对稳定；SKU 价格/库存变动频繁
+- 业务场景：
+  - 列表页 / 搜索通常返回 SPU（同时展示该 SPU 所有 SKU 的最小/最大价格与可选的颜色/尺码集合） 
+  - 详情页（用户点颜色/尺码）切换到某个 SKU 展示具体库存/价格/物流信息 
+  - 下单、出入库、结算都基于 SKU
+
+例如：
+
+- 服装：SPU = “品牌 X 基础款短袖”，SKU = (“红色”, “M”)、(“蓝色”, “L”) 等 
+- 手机：SPU = “Phone Model A”，SKU = (“128GB”, “黑色”), (“256GB”, “白色”)
+- 书籍：有时一本书本身就是 SKU（没有变体），SPU 与 SKU 可一一对应
+
+****
+### 4.2 获取分类属性分组
+
+现在在前端新增了一个页面，左侧展示三级分类，右侧展示某个分类属性的分组信息，在点击到某个第三级分类的时候，右侧就会查询下面的表，展示信息。因为每个第三级分类都代表了一个品类，
+例如手机，它就包含各种分组信息，例如处理器、重量、尺寸等：
+
+| 名称          | 类型    | 长度 | 小数点 | 不是 null | 虚拟 | 键 | 注释     |
+| ------------- | ------- | ---- | ------ |---------| ---- |---| -------- |
+| attr_group_id | bigint  |      |        | √       |      | √ | 分组 id  |
+| attr_group_name | char | 20   |        |         |      |   | 组名     |
+| sort          | int     |      |        |         |      |   | 排序     |
+| descript      | varchar | 255  |        |         |      |   | 描述     |
+| icon          | varchar | 255  |        |         |      |   | 组图标   |
+| catalog_id    | bigint  |      |        |         |      |   | 所属分类 id | 
+
+由前端发送分页查询，发送的参数格式如下：
+
+```json
+{
+  "page": 1, // 当前页码
+  "limit": 10, // 每页记录条数
+  "sidx": "id", // 排序字段
+  "order": "asc/desc", // 排序方式
+  "key": "华为" // 检索关键字
+}
+```
+
+```vue
+getDataList () {
+  this.dataListLoading = true
+  this.$http({
+    url: this.$http.adornUrl(`/product/attrgroup/list/${this.catId}`),
+    method: 'get',
+    params: this.$http.adornParams({
+      'page': this.pageIndex,
+      'limit': this.pageSize,
+      'key': this.dataForm.key
+    })
+  }).then(({data}) => {
+    if (data && data.code === 0) {
+      this.dataList = data.page.list
+      this.totalPage = data.page.totalCount
+    } else {
+      this.dataList = []
+      this.totalPage = 0
+    }
+    this.dataListLoading = false
+  })
+},
+```
+
+所以后端可以使用一个 Map 来接收：
+
+```java
+@RequestMapping("/list/{catelogId}")
+public R list(@RequestParam Map<String, Object> params, @PathVariable Long catelogId) {
+    PageUtils page = attrGroupService.queryPage(params, catelogId);
+    return R.ok().put("page", page);
+}
+```
+
+Service 层：
+
+```java
+@Override
+public PageUtils queryPage(Map<String, Object> params) {
+    IPage<AttrGroupEntity> page = this.page(
+            new Query<AttrGroupEntity>().getPage(params),
+            new QueryWrapper<AttrGroupEntity>()
+    );
+    return new PageUtils(page);
+}
+```
+
+this.page(...) 是 MyBatis-Plus 框架封装的分页查询方法：
+
+```java
+IPage<T> page(IPage<T> page, Wrapper<T> queryWrapper);
+```
+
+它根据传入的分页对象和查询条件，查询数据库对应表并返回分页结果。返回类型 IPage<AttrGroupEntity> 是 MyBatis-Plus 的分页结果接口，包含：
+
+- 当前页数据列表 
+- 总记录数 
+- 总页数 
+- 前页码 
+- 每页大小等信息
+
+而传入 page() 方法的两个参数：
+
+1、new Query<AttrGroupEntity>().getPage(params)： 
+
+- Query<T> 是由逆向工程生成的一个工具类，它负责从 params 里解析分页参数，然后把这些参数构造成 IPage 对象：
+
+```java
+/**
+ * 查询参数
+ */
+public class Query<T> {
+  public IPage<T> getPage(Map<String, Object> params) {
+    return this.getPage(params, null, false);
+  }
+  public IPage<T> getPage(Map<String, Object> params, String defaultOrderField, boolean isAsc) {
+    // 分页参数
+    long curPage = 1;
+    long limit = 10;
+    if(params.get(Constant.PAGE) != null){
+      curPage = Long.parseLong((String)params.get(Constant.PAGE));
+    }
+    if(params.get(Constant.LIMIT) != null){
+      limit = Long.parseLong((String)params.get(Constant.LIMIT));
+    }
+    // 分页对象
+    Page<T> page = new Page<>(curPage, limit);
+    // 分页参数
+    params.put(Constant.PAGE, page);
+    // 排序字段
+    // 防止SQL注入（因为sidx、order是通过拼接SQL实现排序的，会有SQL注入风险）
+    String orderField = SQLFilter.sqlInject((String)params.get(Constant.ORDER_FIELD));
+    String order = (String)params.get(Constant.ORDER);
+    // 前端字段排序
+    if(StringUtils.isNotEmpty(orderField) && StringUtils.isNotEmpty(order)){
+      if(Constant.ASC.equalsIgnoreCase(order)) {
+        return  page.addOrder(OrderItem.asc(orderField));
+      }else {
+        return page.addOrder(OrderItem.desc(orderField));
+      }
+    }
+    // 没有排序字段，则不排序
+    if(StringUtils.isBlank(defaultOrderField)){
+      return page;
+    }
+    // 默认排序
+    if(isAsc) {
+      page.addOrder(OrderItem.asc(defaultOrderField));
+    }else {
+      page.addOrder(OrderItem.desc(defaultOrderField));
+    }
+    return page;
+  }
+}
+```
+
+2、new QueryWrapper<AttrGroupEntity>()：
+
+- 这是 MyBatis-Plus 的条件构造器，空构造意味着没有任何 WHERE 限制条件，即搜索所有（无 WHERE 条件）
+- 所以 Mybati-Plus 的分页为：this.page(IPage<T>, Wrapper<T>)
+
+通过传递分类 id 查询的方法如下：
+
+```java
+@Override
+public PageUtils queryPage(Map<String, Object> params, Long catelogId) {
+    // 如果没有传入分类 id，则查询所有（即上面的方法）
+    if (catelogId == 0) {
+        return this.queryPage(params); 
+    } else {
+        String key = (String) params.get("key");
+        // select * from pms_attr_group where catelog_id = ? and (attr_group_id = key or attr_group_name like %key%)
+        QueryWrapper<AttrGroupEntity> wrapper = new QueryWrapper<AttrGroupEntity>().eq("catelog_id", catelogId);
+        if (!StringUtils.isNullOrEmpty(key)) {
+            wrapper.and((obj) -> {
+                obj.eq("attr_group_id", key).or().like("attr_group_name", key);
+            });
+        }
+        IPage<AttrGroupEntity> page = this.page(
+                new Query<AttrGroupEntity>().getPage(params),
+                wrapper
+        );
+        return new PageUtils(page);
+    }
+}
+```
+
+因为前端传入的请求参数除了分类 id，还有可能传入某些关键字（例如分组 id、分组名称），所以需要把这些关键字作为查询数据库的条件，但硬性前提条件一定是分类 id，
+即前端点击的第三级分类的 id。同样，使用 Mybatis-Plus 的分页查询时需要传入封装成 IPage 类型的请求参数和查询条件。
+
+既然使用到了 Mybatis-Plus 自带的分页查询，那就也要配置一下它的分页插件，
+
+```java
+@Configuration
+@MapperScan("com.project.gulimall.product.dao")
+public class MyBatisPlusConfig {
+  @Bean
+  public MybatisPlusInterceptor mybatisPlusInterceptor() {
+    MybatisPlusInterceptor interceptor = new MybatisPlusInterceptor();
+    PaginationInnerInterceptor pagination = new PaginationInnerInterceptor(DbType.MYSQL);
+    pagination.setOverflow(false); // 溢出页的处理：true/false，true 表示请求溢出页时返回第一页数据；false 表示返回空数据
+    pagination.setMaxLimit(500L); // 单页最大条数（-1 不限制）
+    interceptor.addInnerInterceptor(pagination);
+    return interceptor;
+  }
+}
+```
+
+****
+### 4.3 回显三级分类 id 关系
+
+在前端点击修改按钮时，需要将对话框中需要显示的相关数据全部展示出来，而修改属性分组信息功能中，有一个修改所属分类的选项，也就是可以选择当前分组属于哪个具体的三级分类，
+既然要让它显示类似 "家用电器/大家电/空调" 的这种效果，就需要获取到这一组分类对应的 id，这一组对应的 id 就是 [3/37/251]。
+
+Controller 层：
+
+因为前端点击修改按钮时是通过传递当前行的分组 id，即 attr_group_id（不是三级分类的 catId），所以需要通过它获取它所属的三级分类是哪个，而由于上面定义的规则，
+存储的三级分类 id 是最小级，所以只能通过它去获取当前最消极三级分类的父类是哪些，然后封装进一个数组，作为 AttrGroupEntity 的字段，一起返回给前端：
+
+```java
+@RequestMapping("/info/{attrGroupId}")
+public R info(@PathVariable("attrGroupId") Long attrGroupId){
+    AttrGroupEntity attrGroup = attrGroupService.getById(attrGroupId);
+    Long catelogId = attrGroup.getCatelogId();
+    Long[] path = categoryService.findCatelogPath(catelogId);
+    attrGroup.setCatelogPath(path);
+    return R.ok().put("attrGroup", attrGroup);
+}
+```
+
+Service 层：
+
+因为需要查询三级分类的父类 id，所以就需要用到 CategoryService 中的方法。查找父类的 id 也挺方便的，因为 CategoryEntity 有个 parentCid 字段，
+所以可以直接通过 get 方法判断它是否有父类，既然能这样获取到父类 id，那就直接通过递归获取到所有的父类，不过由于递归的特性，最终得到的 id 数组是逆序的，即子在父前，
+所以需要反转一下顺序，不然前端展示的数据就是倒过来的：
+
+```java
+@Override
+public Long[] findCatelogPath(Long catelogId) {
+    List<Long> paths = new ArrayList<>();
+    // 如果有父分类，就向上找
+    // 因为添加进 path 的 id 是从最小层级开始的，所以 path 中的 id 排序为 三级 -> 二级 -> 一级
+    // 所以进行一下反转操作
+    Collections.reverse(findParentPath(catelogId, paths));
+    return paths.toArray(new Long[0]);
+}
+
+private List<Long> findParentPath(Long catelogId, List<Long> paths) {
+    // 收集当前节点 id
+    paths.add(catelogId);
+    // 根据 catelogId 查出当前分类的信息
+    CategoryEntity category = this.getById(catelogId);
+    if (category.getParentCid() != 0) {
+      findParentPath(category.getParentCid(), paths);
+    }
+    return paths;
+}
+```
+
+****
+### 4.4 品牌关联分类与级联更新
+
+#### 4.4.1 品牌关联分类
+
+品牌分类关联功能是用来选择该品牌是属于哪个或哪几个分类的，当前端选择好分类后，将 catelogPath[] 数组的最后一个元素，即最小级分类（上面有记录怎么获取）的 id 和品牌 id 发送给后端：
+
+```vue
+<el-button type="text" size="small" @click="updateCatelogHandle(scope.row.brandId)">关联分类</el-button>
+
+addCatelogSelect() {
+  this.popCatelogSelectVisible = false;
+  this.$http({
+    url: this.$http.adornUrl("/product/categorybrandrelation/save"),
+    method: "post",
+    data: this.$http.adornData({
+    brandId: this.brandId,
+    catelogId: this.catelogPath[this.catelogPath.length - 1]
+    }, false)
+  }).then(({data}) => {
+  this.getCateRelation();
+  });
+},
+
+updateCatelogHandle(brandId) {
+  this.cateRelationDialogVisible = true;
+  this.brandId = brandId;
+  this.getCateRelation();
+},
+
+getCateRelation() {
+  this.$http({
+    url: this.$http.adornUrl("/product/categorybrandrelation/catelog/list"),
+    method: "get",
+    params: this.$http.adornParams({
+    brandId: this.brandId
+    })
+  }).then(({data}) => {
+  this.cateRelationTableData = data.data;
+  });
+},
+```
+
+新增分类关联：
+
+Controller 层：
+
+```java
+@RequestMapping("/save")
+public R save(@RequestBody CategoryBrandRelationEntity categoryBrandRelation){
+    categoryBrandRelationService.saveDetail(categoryBrandRelation);
+    return R.ok();
+}
+```
+
+Service 层：
+
+虽然品牌名称和分类名称都有对应的表，可以直接通过夺标联查获取，但是考虑到后期数据较多，可能导致频繁的进行多表联查，对数据库造成压力，所以直接在分类关联表中添加品牌名和分类名字段，
+然后在这里通过传入的品牌 id 和分类 id 查询对应的名称即可。
+
+```java
+@Override
+public void saveDetail(CategoryBrandRelationEntity categoryBrandRelation) {
+    Long brandId = categoryBrandRelation.getBrandId();
+    Long catelogId = categoryBrandRelation.getCatelogId();
+    // 查询品牌名称
+    BrandEntity brandEntity = brandDao.selectById(brandId);
+    CategoryEntity category = categoryDao.selectById(catelogId);
+    categoryBrandRelation.setBrandName(brandEntity.getName());
+    categoryBrandRelation.setCatelogName(category.getName());
+    this.save(categoryBrandRelation);
+}
+```
+
+展示已添加的分类关联信息：
+
+Controller 层：
+
+```java
+@RequestMapping(value = "/catelog/list", method = RequestMethod.GET)
+public R catelogList(@RequestParam Long brandId){
+    List<CategoryBrandRelationEntity> data = categoryBrandRelationService.list(
+            new QueryWrapper<CategoryBrandRelationEntity>().eq("brand_id", brandId)
+    );
+    return R.ok().put("data", data);
+}
+```
+
+****
+#### 4.4.2 级联更新
+
+上面有提及品牌关联分类表中使用了品牌名和分类名这两个字段，所以它们是两个单独的字段，当品牌表和分类表中对数据进行更新，由于它们没有和品牌关联分类表关联，所以这两个字段不会被同时更新，
+这就需要在品牌表和分类表进行更新的同时，对品牌关联分类表的这两字段一起更新。
+
+Controller 层：
+
+这里将原来的 updateById() 修改为手动编写的方法 updateCascade()。
+
+```java
+@RequestMapping("/update")
+public R update(@RequestBody CategoryEntity category){
+    categoryService.updateCascade(category);
+    return R.ok();
+}
+```
+
+Service 层：
+
+不管如何，既然是调用了更新分类表的控制器方法，那肯定要对分类表进行更新，所以先调用 updateById() 方法简单更新分类表，然后就是判断传入的 CategoryEntity 是否包含名称字段，
+当然前端的表单验证是不允许名称为空的，但是为了保证代码的健壮性，还是添加了是否为空的判断。然后就是调用 categoryBrandRelationService#updateCategory() 方法，
+对品牌关联分类表的分类名称进行同步的更新：
+
+```java
+@Override
+public void updateCascade(CategoryEntity category) {
+    this.updateById(category);
+    if (!StringUtils.isEmpty(category.getName())) {
+        categoryBrandRelationService.updateCategory(category.getCatId(), category.getName());
+    }
+}
+```
+
+品牌名称的同步修改同理：
+
+```java
+@RequestMapping("/update")
+public R update(@Validated({UpdateGroup.class}) @RequestBody BrandEntity brand){
+    brandService.updateDetail(brand);
+    return R.ok();
+}
+
+@Override
+public void updateDetail(BrandEntity brand) {
+    // 保证冗余字段的数据一致
+    this.updateById(brand);
+    if (!StringUtils.isEmpty(brand.getName())) {
+      // 同步更新其它关联表中的数据
+      categoryBrandRelationService.updateBrand(brand.getBrandId(), brand.getName());
+      // TODO 更新其它关联
+    }
+}
+```
+
+****
+
+
+
+
 
 
 
