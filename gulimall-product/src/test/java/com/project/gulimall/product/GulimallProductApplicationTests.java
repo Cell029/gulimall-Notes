@@ -3,7 +3,7 @@ package com.project.gulimall.product;
 
 import com.aliyun.oss.OSSClient;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
-import com.project.gulimall.product.entity.BrandEntity;
+import com.project.gulimall.product.domain.entity.BrandEntity;
 import com.project.gulimall.product.service.BrandService;
 import com.project.gulimall.product.service.CategoryService;
 import lombok.extern.slf4j.Slf4j;
@@ -14,7 +14,6 @@ import org.springframework.boot.test.context.SpringBootTest;
 import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.InputStream;
-import java.lang.reflect.Array;
 import java.util.Arrays;
 import java.util.List;
 

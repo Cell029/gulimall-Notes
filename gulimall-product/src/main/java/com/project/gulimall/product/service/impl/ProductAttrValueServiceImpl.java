@@ -9,7 +9,7 @@ import com.project.common.utils.PageUtils;
 import com.project.common.utils.Query;
 
 import com.project.gulimall.product.dao.ProductAttrValueDao;
-import com.project.gulimall.product.entity.ProductAttrValueEntity;
+import com.project.gulimall.product.domain.entity.ProductAttrValueEntity;
 import com.project.gulimall.product.service.ProductAttrValueService;
 
 

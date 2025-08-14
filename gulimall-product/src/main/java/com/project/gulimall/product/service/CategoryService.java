@@ -2,11 +2,8 @@ package com.project.gulimall.product.service;
 
 import com.baomidou.mybatisplus.extension.service.IService;
 import com.project.common.utils.PageUtils;
-import com.project.gulimall.product.entity.CategoryEntity;
+import com.project.gulimall.product.domain.entity.CategoryEntity;
 
-import javax.validation.constraints.NotBlank;
-import javax.validation.constraints.NotNull;
-import javax.validation.constraints.Null;
 import java.util.List;
 import java.util.Map;
 

@@ -1,27 +1,22 @@
 package com.project.gulimall.product.controller;
 
 import java.util.Arrays;
-import java.util.HashMap;
 import java.util.Map;
 
-import com.baomidou.mybatisplus.core.toolkit.BeanUtils;
 import com.project.common.valid.AddGroup;
 import com.project.common.valid.UpdateGroup;
 import com.project.common.valid.UpdateStatusGroup;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.validation.BindingResult;
 import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
-import com.project.gulimall.product.entity.BrandEntity;
+import com.project.gulimall.product.domain.entity.BrandEntity;
 import com.project.gulimall.product.service.BrandService;
 import com.project.common.utils.PageUtils;
 import com.project.common.utils.R;
-
-import javax.validation.Valid;
 
 
 /**

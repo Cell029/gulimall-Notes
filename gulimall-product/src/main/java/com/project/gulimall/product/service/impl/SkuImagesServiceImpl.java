@@ -9,7 +9,7 @@ import com.project.common.utils.PageUtils;
 import com.project.common.utils.Query;
 
 import com.project.gulimall.product.dao.SkuImagesDao;
-import com.project.gulimall.product.entity.SkuImagesEntity;
+import com.project.gulimall.product.domain.entity.SkuImagesEntity;
 import com.project.gulimall.product.service.SkuImagesService;
 
 

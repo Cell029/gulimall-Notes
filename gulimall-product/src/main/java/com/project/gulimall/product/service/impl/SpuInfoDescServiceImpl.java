@@ -9,7 +9,7 @@ import com.project.common.utils.PageUtils;
 import com.project.common.utils.Query;
 
 import com.project.gulimall.product.dao.SpuInfoDescDao;
-import com.project.gulimall.product.entity.SpuInfoDescEntity;
+import com.project.gulimall.product.domain.entity.SpuInfoDescEntity;
 import com.project.gulimall.product.service.SpuInfoDescService;
 
 

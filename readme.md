@@ -2777,24 +2777,24 @@ public class Query<T> {
 ```java
 @Override
 public PageUtils queryPage(Map<String, Object> params, Long catelogId) {
-    // 如果没有传入分类 id，则查询所有（即上面的方法）
-    if (catelogId == 0) {
-        return this.queryPage(params); 
-    } else {
-        String key = (String) params.get("key");
-        // select * from pms_attr_group where catelog_id = ? and (attr_group_id = key or attr_group_name like %key%)
-        QueryWrapper<AttrGroupEntity> wrapper = new QueryWrapper<AttrGroupEntity>().eq("catelog_id", catelogId);
-        if (!StringUtils.isNullOrEmpty(key)) {
-            wrapper.and((obj) -> {
-                obj.eq("attr_group_id", key).or().like("attr_group_name", key);
-            });
-        }
-        IPage<AttrGroupEntity> page = this.page(
-                new Query<AttrGroupEntity>().getPage(params),
-                wrapper
-        );
-        return new PageUtils(page);
-    }
+  String key = (String) params.get("key");
+  // select * from pms_attr_group where catelog_id = ? and (attr_group_id = key or attr_group_name like %key%)
+  QueryWrapper<AttrGroupEntity> wrapper = new QueryWrapper<AttrGroupEntity>();
+  if (!StringUtils.isNullOrEmpty(key)) {
+    wrapper.and((obj) -> {
+      obj.eq("attr_group_id", key).or().like("attr_group_name", key);
+    });
+  }
+  if (catelogId == 0) {
+    return this.queryPage(params);
+  } else {
+    wrapper.eq("catelog_id", catelogId);
+    IPage<AttrGroupEntity> page = this.page(
+            new Query<AttrGroupEntity>().getPage(params),
+            wrapper
+    );
+    return new PageUtils(page);
+  }
 }
 ```
 
@@ -3014,8 +3014,586 @@ public void updateDetail(BrandEntity brand) {
 ```
 
 ****
+## 5. 规格参数属性
 
+### 5.1 规格参数新增功能
 
+在属性分组里面有个关联功能，它用来关联当前属性分组的关联关系，例如属性分组里有一个主芯片，那么它的关联关系中就可以有 CPU 品牌、CPU 型号等。而规格参数就是用来充当这份关联关系的，
+在规格参数中，就需要先录入一些属性，才能让属性分组的关联功能生效。前端发送的表单数据如下：
+
+```json
+{
+  attrGroupId: 7, // 属性的分组 id
+  attrName: "CPU 型号", // 属性名
+  attrType: 1, // 属性类型[0-销售属性，1-基本属性，2-既是销售属性又是基本属性]
+  catelogId: 225, // 所属分类
+  enable: 1, // 启用状态[0 - 禁用，1 - 启用]
+  ico: "xl", // 属性图标
+  searchType: 1, // 是否需要检索[0-不需要，1-需要]
+  showDesc: 1, // 快速展示【是否展示在介绍上；0-否 1-是】
+  t: 1755153318219, 
+  valueSelect: "晓龙 888", // 可选值列表[用逗号分隔]
+  valueType: 1 // 值类型[0-为单个值，1-可以选择多个值]
+}
+```
+
+因为在添加这些规格参数的时候需要和属性分组关联起来，所以除了要将当前规格参数存入对应的 pms_attr 表中，还需要与 pms_attr_group 属性分组表产生关联，也就是新建一张表，
+pms_attr_attrgroup_relation，它用来记录规格参数的 id 和属性分组的 id：
+
+Controller 层：
+
+```java
+@RequestMapping("/save")
+  public R save(@RequestBody AttrVo attr){
+      attrService.saveAttr(attr);
+      return R.ok();
+  }
+```
+
+Service 层：
+
+因为规格参数的表中没有属性分组 id 这个字段，所以需要用到 VO 视图对象，接收页面传递来的数据并风转成对象返回给前端页面。
+
+```java
+@Transactional
+@Override
+public void saveAttr(AttrVo attr) {
+    AttrEntity attrEntity = new AttrEntity();
+    BeanUtils.copyProperties(attr, attrEntity);
+    // 保存基本数据
+    this.save(attrEntity);
+    // 保存关联关系
+    if (attr.getAttrType() == ProductConstant.AttrEnum.ATTR_TYPE_BASE.getCode() && attr.getAttrGroupId() != null) {
+      AttrAttrgroupRelationEntity attrAttrgroupRelationEntity = new AttrAttrgroupRelationEntity();
+      attrAttrgroupRelationEntity.setAttrGroupId(attr.getAttrGroupId());
+      attrAttrgroupRelationEntity.setAttrId(attrEntity.getAttrId());
+      attrAttrgroupRelationDao.insert(attrAttrgroupRelationEntity);
+    }
+}
+```
+
+****
+### 5.2 查询规格参数列表功能
+
+Controller 层：
+
+同样的，该查询也分为单个查询和模糊查询，就看前端发送的请求中是否携带分类 id。
+
+```java
+@GetMapping("/base/list/{catelogId}")
+public R baseAttrList(@RequestParam Map<String, Object> params, @PathVariable("catelogId") Long catelogId) {
+    PageUtils page = attrService.queryBaseAttrPage(params, catelogId);
+    return R.ok().put("page", page);
+}
+```
+
+Service 层：
+
+所以在进行查询操作前要先判断传入的分类 id 是否为 0，不为 0 则需要添加上分类 id 作为查询条件，为 0 则为查询所有分类的数据，此时仅需模糊判断参数 id 和参数名即可。
+
+```java
+@Override
+public PageUtils queryBaseAttrPage(Map<String, Object> params, Long catelogId) {
+    QueryWrapper<AttrEntity> queryWrapper = new QueryWrapper<>();
+    // 当 catelogId 为 0 代表没有点击某个具体的三级分类，即查询所有三级分类下的数据
+    if (catelogId != 0) {
+        queryWrapper.eq("catelog_id", catelogId);
+    }
+    String key = (String) params.get("key");
+    if (!StringUtils.isEmpty(key)) {
+        queryWrapper.and((wrapper) -> {
+            wrapper.eq("attr_id", key).or().like("attr_name", key);
+        });
+    }
+    IPage<AttrEntity> page = this.page(
+            new Query<AttrEntity>().getPage(params),
+            queryWrapper
+    );
+    ...
+}
+```
+
+当然前端的展示除了规格参数的所有信息外，还额外添加了所属分类名和所属分组名的字段，所以除了查询 pms_attr 表，还需要利用到关联表中的分类 id 和分组 id 去查询它们对应的名称。
+因此在获取到规格参数列表时，需要一一对应的利用规格参数的 id 查询关联表。
+
+```java
+List<AttrEntity> records = page.getRecords();
+List<AttrResVo> attrResVoList = records.stream().map(attrEntity -> {
+    AttrResVo attrResVo = new AttrResVo();
+    BeanUtils.copyProperties(attrEntity, attrResVo);
+    // 获取三级分类和分组的名字
+    AttrAttrgroupRelationEntity attrAttrgroupRelationEntity = attrAttrgroupRelationDao.selectOne(
+            new QueryWrapper<AttrAttrgroupRelationEntity>().eq("attr_id", attrEntity.getAttrId())
+    );
+    if (attrAttrgroupRelationEntity != null && attrAttrgroupRelationEntity.getAttrGroupId() != null) {
+        AttrGroupEntity attrGroupEntity = attrGroupDao.selectById(attrAttrgroupRelationEntity.getAttrGroupId());
+        if (attrGroupEntity != null) {
+            attrResVo.setGroupName(attrGroupEntity.getAttrGroupName());
+            CategoryEntity categoryEntity = categoryService.getById(attrGroupEntity.getCatelogId());
+            if (categoryEntity != null) {
+                attrResVo.setCatelogName(categoryEntity.getName());
+            }
+        }
+    }
+    return attrResVo;
+}).collect(Collectors.toList());
+PageUtils pageUtils = new PageUtils(page);
+pageUtils.setList(attrResVoList);
+return pageUtils;
+```
+
+先从查询到的列表中依次处理每个实体类，通过规格参数的 id 获取到关联表中对应的实体，再从实体中获取分类 id 和分组 id。最后封装进 AttrResVo 对象中，该对象继承  AttrVo，
+仅在父类的基础上添加了分类名和分组名字段：
+
+```java
+@Data
+public class AttrResVo extends AttrVo {
+    /**
+     * 所属三级分类名
+     */
+    private String catelogName;
+
+    /**
+     * 所属属性分组名
+     */
+    private String groupName;
+}
+```
+
+最后先通过 IPage 对象创建好自定义的分页对象，获取基本的分页骨架，最后把里面包含的 AttrEntity 列表替换成 AttrResVo 列表：
+
+```java
+PageUtils pageUtils = new PageUtils(page);
+pageUtils.setList(attrResVoList);
+```
+
+```java
+private int totalCount;
+private int pageSize;
+private int totalPage;
+private int currPage;
+private List<?> list;
+
+public PageUtils(IPage<?> page) {
+    this.list = page.getRecords();
+    this.totalCount = (int)page.getTotal();
+    this.pageSize = (int)page.getSize();
+    this.currPage = (int)page.getCurrent();
+    this.totalPage = (int)page.getPages();
+}
+```
+
+****
+### 5.3 规格参数修改功能
+
+因为修改某条数据需要先看到原始的数据，所以会发送一条查询请求，而规格参数的展示表单中需要包含完整的分类路径，所以原始的 AttrEntity 也不够用，此时可用直接在 AttrResVo 中添加，
+这样并不会影响上面的列表展示，因为不存在赋值的情况，前端就算获取到了也不会展示出来。响应的数据应该为：
+
+```json
+{
+  "msg": "success",
+  "code":0,
+  "attr": {
+    "attrId": 4,
+    "attrName": "aad",
+    "searchType": 1,
+    "valueType": 1,
+    "icon": "qq",
+    "valueSelect": "v; q;w"
+    "attrType": 1,
+    "enable": 1,
+    "showDesc": 1,
+    "attrGroupId": 1, // 分组 id
+    "catelogId": 225, // 分类 id
+    "catelogPath": [2, 34, 225]// 分类完整路径
+  }
+}
+```
+
+查询：
+
+Controller 层：
+
+```java
+@RequestMapping("/info/{attrId}")
+public R info(@PathVariable("attrId") Long attrId){
+    AttrResVo attrResVo = attrService.getAttrInfo(attrId);
+    return R.ok().put("attr", attrResVo);
+}
+```
+
+Service 层：
+
+```java
+@Override
+public AttrResVo getAttrInfo(Long attrId) {
+    AttrEntity attrEntity = this.getById(attrId);
+    AttrResVo attrResVo = new AttrResVo();
+    BeanUtils.copyProperties(attrEntity, attrResVo);
+    AttrAttrgroupRelationEntity attrAttrgroupRelationEntity = attrAttrgroupRelationDao.selectOne(
+            new QueryWrapper<AttrAttrgroupRelationEntity>().eq("attr_id", attrEntity.getAttrId())
+    );
+    if (attrAttrgroupRelationEntity != null) {
+        // 设置分组信息
+        attrResVo.setAttrGroupId(attrAttrgroupRelationEntity.getAttrGroupId());
+        AttrGroupEntity attrGroupEntity = attrGroupDao.selectById(attrAttrgroupRelationEntity.getAttrGroupId());
+        if (attrGroupEntity != null) {
+            attrResVo.setGroupName(attrEntity.getAttrGroupName());
+        }
+    }
+    // 设置分类信息
+    Long catelogId = attrEntity.getCatelogId();
+    // findCatelogPath 方法在 CatelogService 中定义过，可用直接使用
+    Long[] catelogPath = categoryService.findCatelogPath(catelogId);
+    attrResVo.setCatelogPath(catelogPath);
+    CategoryEntity categoryEntity = categoryDao.selectById(catelogId);
+    if (categoryEntity != null) {
+        attrResVo.setCatelogName(categoryEntity.getName());
+    }
+    return attrResVo;
+}
+```
+
+修改：
+
+Controller 层：
+
+```java
+@RequestMapping("/update")
+public R update(@RequestBody AttrVo attrVo){
+    attrService.updateAttr(attrVo);
+    return R.ok();
+}
+```
+
+Service 层：
+
+```java
+@Override
+public void updateAttr(AttrVo attrVo) {
+    AttrEntity attrEntity = new AttrEntity();
+    BeanUtils.copyProperties(attrVo, attrEntity);
+    this.updateById(attrEntity);
+    // 修改关联的分组
+    AttrAttrgroupRelationEntity attrAttrgroupRelationEntity = new AttrAttrgroupRelationEntity();
+    attrAttrgroupRelationEntity.setAttrGroupId(attrVo.getAttrGroupId());
+    attrAttrgroupRelationEntity.setAttrId(attrVo.getAttrId());
+    attrAttrgroupRelationDao.update(
+            attrAttrgroupRelationEntity,
+            new QueryWrapper<AttrAttrgroupRelationEntity>().eq("attr_id", attrVo.getAttrId())
+    );
+}
+```
+
+当前的代码逻辑只有在规格参数的所有数据都完整时才能生效，因为规格参数表中没有分组 id 这个字段，所以修改没有分组的规格参数时，会因为在关联表中找不到对应的规格参数 id 而导致修改失败，
+因此需要判断数据是否完整，不完整则需要将代码逻辑修改为新增。
+
+****
+### 5.4 销售属性
+
+在规格参数中有一个 attr_type 字段，它用来区分当前的规格参数属于销售类型（0）还是基本参数类型（1)，在前端查询销售属性的规格参数时，会在请求路径中携带 sale，
+而基于前面的查询基本属性的代码，可以动态的修改后端接收的路径：
+
+```java
+@GetMapping("/{attrType}/list/{catelogId}")
+public R baseAttrList(@RequestParam Map<String, Object> params,
+                      @PathVariable("catelogId") Long catelogId,
+                      @PathVariable("attrType") String attrType) {
+    PageUtils page = attrService.queryBaseAttrPage(params, catelogId, attrType);
+    return R.ok().put("page", page);
+}
+```
+
+需要注意的是，销售属性的展示列表没有分组信息，所以在查询、新增和修改操作的时候，需要对当前的规格参数类型进行判断，避免浪费资源：
+
+```java
+@Override
+public PageUtils queryBaseAttrPage(Map<String, Object> params, Long catelogId, String attrType) {
+    QueryWrapper<AttrEntity> queryWrapper = new QueryWrapper<AttrEntity>()
+            // 在查询前先对类型进行判断
+            .eq("attr_type", "base".equalsIgnoreCase(attrType) ? ProductConstant.AttrEnum.ATTR_TYPE_BASE.getCode() : ProductConstant.AttrEnum.ATTR_TYPE_SALE.getCode());
+    ...
+}
+```
+
+```java
+@Override
+public AttrResVo getAttrInfo(Long attrId) {
+    ...
+    if (attrEntity.getAttrType() == ProductConstant.AttrEnum.ATTR_TYPE_BASE.getCode()) {
+        if (attrAttrgroupRelationEntity != null) {
+            // 设置分组信息
+            attrResVo.setAttrGroupId(attrAttrgroupRelationEntity.getAttrGroupId());
+            AttrGroupEntity attrGroupEntity = attrGroupDao.selectById(attrAttrgroupRelationEntity.getAttrGroupId());
+            if (attrGroupEntity != null) {
+                attrResVo.setGroupName(attrGroupEntity.getAttrGroupName());
+            }
+        }
+    }
+    // 设置分类信息
+    ...
+    return attrResVo;
+}
+```
+
+```java
+@Override
+public void updateAttr(AttrVo attrVo) {
+    ...
+    if (attrEntity.getAttrType() == ProductConstant.AttrEnum.ATTR_TYPE_BASE.getCode()) {
+        // 修改关联的分组
+        AttrAttrgroupRelationEntity attrAttrgroupRelationEntity = new AttrAttrgroupRelationEntity();
+        attrAttrgroupRelationEntity.setAttrGroupId(attrVo.getAttrGroupId());
+        attrAttrgroupRelationEntity.setAttrId(attrVo.getAttrId());
+        if (count > 0) {
+            attrAttrgroupRelationDao.update(
+                    attrAttrgroupRelationEntity,
+                    new UpdateWrapper<AttrAttrgroupRelationEntity>().eq("attr_id", attrVo.getAttrId())
+            );
+        } else {
+            attrAttrgroupRelationDao.insert(attrAttrgroupRelationEntity);
+        }
+    }
+}
+```
+
+****
+### 5.5 分组与规格参数的关联功能
+
+查询分组关联：
+
+Controller 层：
+
+```java
+@GetMapping("/{attrgroupId}/attr/relation")
+public R attrRelation(@PathVariable("attrgroupId") Long attrgroupId) {
+    List<AttrEntity> attrEntityList = attrService.getRelationAttr(attrgroupId);
+    return R.ok().put("data", attrEntityList);
+}
+```
+
+Service 层：
+
+因为点击关联按钮时可以获取到当前行的信息，即可以获取到分组的 id，通过该 id 查询关联表即可获取到规格参数的 id。不过有些分组还未关联到数据，通过 selectList 查询会获取到空集合，
+所以需要对该集合进行判断，如果为空就返回空值，而不是直接把该集合作为参数传递给 listByIds。
+
+```java
+@Override
+public List<AttrEntity> getRelationAttr(Long attrgroupId) {
+    List<AttrAttrgroupRelationEntity> attrAttrgroupRelationEntities =
+            attrAttrgroupRelationDao.selectList(
+                    new QueryWrapper<AttrAttrgroupRelationEntity>().eq("attr_group_id", attrgroupId)
+            );
+    List<Long> attrIds = attrAttrgroupRelationEntities.stream()
+            .map(AttrAttrgroupRelationEntity::getAttrId)
+            .collect(Collectors.toList());
+    if (attrIds.isEmpty()) {
+        return Collections.emptyList(); // 返回空列表，避免 SQL 报错
+    }
+    return this.listByIds(attrIds);
+}
+```
+
+删除分组中的关联信息：
+
+Controller 层：
+
+因为前端设置了批量删除，所以可能传递的是多条数据，而传递的数据格式如下：
+
+```json
+[{"attrId": 1, "attrGroupId": 3}]
+```
+
+所以接收参数时需要定义一个数组对象接收，而最终删除的是关联表中的数据，所以进行的操作是在 AttrService 层。
+
+```java
+@Data
+public class AttrGroupRelationVo {
+    private Long attrId;
+    private Long attrGroupId;
+}
+```
+
+Controller 层：
+
+```java
+@PostMapping("/attr/relation/delete")
+public R deleteRelation(@RequestBody AttrGroupRelationVo[] vos){
+    attrService.deleteRelation(vos);
+    return R.ok();
+}
+```
+
+Service 层：
+
+```java
+@Override
+public void deleteRelation(AttrGroupRelationVo[] vos) {
+    // delete from pms_attr_attrgroup_relation where (attr_id = ? and attr_group_id = ?) or (attr_id ...)
+    /*List<AttrAttrgroupRelationEntity> entities = Arrays.asList(vos).stream().map(item -> {
+        AttrAttrgroupRelationEntity attrAttrgroupRelationEntity = new AttrAttrgroupRelationEntity();
+        BeanUtils.copyProperties(item, attrAttrgroupRelationEntity);
+        return attrAttrgroupRelationEntity;
+    }).collect(Collectors.toList());
+    attrAttrgroupRelationDao.deleteBatchRelation(entities);*/
+    attrAttrgroupRelationDao.deleteBatchRelation(Arrays.asList(vos));
+}
+```
+
+Mapper 层：
+
+```sql
+<delete id="deleteBatchRelation">
+  DELETE FROM pms_attr_attrgroup_relation
+  WHERE (attr_id, attr_group_id) IN
+    <foreach collection="list" item="item" open="(" separator="),(" close=")">
+      #{item.attrId}, #{item.attrGroupId}
+    </foreach>
+</delete>
+```
+
+****
+### 5.6 查询分组未关联的规格参数
+
+在属性分组页面中会展示各种属性，每种属性有对应的三级分类，这些属性也可以与规格参数进行相关联，但这些关联必须满足两点：
+
+- 点击关联按钮的当前分组只能关联自己所属的分类里面的所有规格参数
+- 点击关联按钮的当前分组不能关联任何已经被本分类下任意分组（包括当前分组）引用的属性
+
+Controller 层：
+
+```java
+@GetMapping("/{attrgroupId}/noattr/relation")
+public R attrNoRelation(@RequestParam Map<String, Object> params, @PathVariable("attrgroupId") Long attrgroupId) {
+    PageUtils page = attrService.getNoRelationAttr(params, attrgroupId);
+    return R.ok().put("page", page);
+}
+```
+
+Service 层：
+
+```java
+@Override
+public PageUtils getNoRelationAttr(Map<String, Object> params, Long attrgroupId) {
+    // 1. 当前分组只能关联自己所属的分类里面的所有属性
+    AttrGroupEntity attrGroupEntity = attrGroupDao.selectById(attrgroupId);
+    Long catelogId = attrGroupEntity.getCatelogId();
+    // 查出当前分类下的所有分组
+    List<AttrGroupEntity> group = attrGroupDao.selectList(new QueryWrapper<AttrGroupEntity>()
+            .eq("catelog_id", catelogId));
+    // 获取所有的分组 id
+    List<Long> attrGroupIds = group.stream().map(AttrGroupEntity::getAttrGroupId).collect(Collectors.toList());
+    // 通过分组 id 从关联表中获取所有关联信息
+    List<AttrAttrgroupRelationEntity> attrAttrgroupRelationEntities = new ArrayList<>();
+    if (!attrGroupIds.isEmpty()) {
+      attrAttrgroupRelationEntities = attrAttrgroupRelationDao
+              .selectList(new QueryWrapper<AttrAttrgroupRelationEntity>().in("attr_group_id", attrGroupIds));
+    }
+    // 从关联表中获取所有规格参数 id
+    List<Long> attrIds = attrAttrgroupRelationEntities.stream().map(AttrAttrgroupRelationEntity::getAttrId).collect(Collectors.toList());
+    // 构造条件 where catelog_id = ? and attr_type = base
+    QueryWrapper<AttrEntity> queryWrapper = new QueryWrapper<AttrEntity>()
+            .eq("catelog_id", catelogId)
+            .eq("attr_type", ProductConstant.AttrEnum.ATTR_TYPE_BASE.getCode());
+    if (!attrIds.isEmpty()) {
+      // 2. 当前分组只能关联别的分组没有引用的属性，所以查出的数据不能在关联表中存在
+      queryWrapper.notIn("attr_id", attrIds);
+    }
+    String key = (String) params.get("key");
+    if (!StringUtils.isEmpty(key)) {
+      queryWrapper.and(wrapper -> {
+        wrapper.eq("attr_id", key).or().like("attr_name", key);
+      });
+    }
+    IPage<AttrEntity> page = this.page(new Query<AttrEntity>().getPage(params),
+            queryWrapper
+    );
+    return new PageUtils(page);
+}
+```
+
+既然关联的所有规格参数必须和本分组所在同一个三级分类，那就需要查询当前分组的三级分类是哪个，这可以通过分组 id 查询到。查到了该分类，就需要查看该分类下创建了多少个分组，
+因为某个分组关联了规格参数的话，就会在关联表中添加数据，那就可以去关联表中找找有多少分组 id 是符合该分类下的分组的。查到了这些分组后，就需要排除与这些分组关联的规格参数 id，
+也就是要用到 notIn(...)。不能引入的规格参数的条件都满足了，就只需要再根据分类 id 查询规格参数表即可。需要注意的是：当前操作的分组已经引入过的规格参数也会排除在外，
+因为查询该分类下的所有分组 id 时就已经包括了自己，所以查出的需要排除的规格参数的 id 也包含其中。最后把所有的条件封装成 QueryWrapper 后传递给 PageUtils 并返回给前端。
+
+****
+### 5.7 确认新增关联关系
+
+在点击新增按钮时需要弹出可以新增的规格参数，也就是上面的功能。然后选择它们并进行添加，也就是在关联表中新增对应的 attr_id 与 attr_group_id。
+
+Controller 层：
+
+```java
+@PostMapping("/attr/relation")
+public R attrRelation(@RequestBody List<AttrGroupRelationVo> vos) {
+    attrAttrgroupRelationService.saveBatch(vos);
+    return R.ok();
+}
+```
+
+Service 层：
+
+```java
+@Override
+public void saveBatch(List<AttrGroupRelationVo> vos) {
+    List<AttrAttrgroupRelationEntity> entities = vos.stream().map(item -> {
+        AttrAttrgroupRelationEntity attrAttrgroupRelationEntity = new AttrAttrgroupRelationEntity();
+        BeanUtils.copyProperties(item, attrAttrgroupRelationEntity);
+        return attrAttrgroupRelationEntity;
+    }).collect(Collectors.toList());
+    this.saveBatch(entities);
+}
+```
+
+****
+## 6. 发布商品
+
+### 6.1 获取分类关联的品牌
+
+在前端发布商品页面，在增填商品的时候是先选择具体的分类，然后再根据该分类下展示的一些品牌来进行选择，所以在选择分类的时候就会发送一个查找该分类的品牌的请求。
+
+Controller 层：
+
+前端发送分类 id 给后端，在查询到所有属于该分类的品牌实体后，将需要展示的品牌信息封装进 VO（实际需要的只是 brandName，brandId 便于后续的交互使用）。
+
+```java
+@GetMapping("/brands/list")
+public R relationBrandList(@RequestParam(value = "catId", required = true) Long catId){
+    List<BrandEntity> brandEntities = categoryBrandRelationService.getBrandsById(catId);
+    List<BrandVo> BrandVos = brandEntities.stream().map(brandEntity -> {
+        BrandVo brandVo = new BrandVo();
+        brandVo.setBrandId(brandEntity.getBrandId());
+        brandVo.setBrandName(brandEntity.getName());
+        return brandVo;
+    }).collect(Collectors.toList());
+    return R.ok().put("data", BrandVos);
+}
+```
+
+Service 层：
+
+分类和品牌有一个中间表 pms_category_brand_relation，它存储分类和品牌的 id 与 name，所以可以通过它来获取该分类下的所有品牌 id，然后查询品牌表获取品牌实体类集合，
+其实这里通过中间表即可获取该功能需要展示的内容，但为了后续可以方便其它功能调用该接口，所以进行了进一步的封装。但需要注意的是，可能由于关联表的数据更新不及时，
+前期需要对查到的数据进行非空处理，如果是空数据则过滤掉。
+
+```java
+@Override
+public List<BrandEntity> getBrandsById(Long catId) {
+    List<CategoryBrandRelationEntity> categoryBrandRelationEntityList =
+            categoryBrandRelationDao.selectList(new QueryWrapper<CategoryBrandRelationEntity>().eq("catelog_id", catId));
+    List<BrandEntity> brandEntityList =
+            categoryBrandRelationEntityList.stream().map(categoryBrandRelationEntity -> {
+                        Long brandId = categoryBrandRelationEntity.getBrandId();
+                        return brandDao.selectById(brandId);
+                    })
+                    .filter(Objects::nonNull) // 过滤掉 null 对象
+                    .collect(Collectors.toList());
+    return brandEntityList;
+}
+```
+
+****
 
 
 

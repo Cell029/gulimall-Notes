@@ -8,7 +8,6 @@ import org.springframework.stereotype.Service;
 
 import java.util.*;
 import java.util.stream.Collectors;
-import java.util.stream.Stream;
 
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.baomidou.mybatisplus.core.metadata.IPage;
@@ -16,7 +15,7 @@ import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.project.common.utils.PageUtils;
 import com.project.common.utils.Query;
 import com.project.gulimall.product.dao.CategoryDao;
-import com.project.gulimall.product.entity.CategoryEntity;
+import com.project.gulimall.product.domain.entity.CategoryEntity;
 import com.project.gulimall.product.service.CategoryService;
 
 

@@ -2,7 +2,6 @@ package com.project.gulimall.product.service.impl;
 
 import com.alibaba.cloud.commons.lang.StringUtils;
 import com.project.gulimall.product.service.CategoryBrandRelationService;
-import com.project.gulimall.product.service.CategoryService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import java.util.Map;
@@ -13,7 +12,7 @@ import com.project.common.utils.PageUtils;
 import com.project.common.utils.Query;
 
 import com.project.gulimall.product.dao.BrandDao;
-import com.project.gulimall.product.entity.BrandEntity;
+import com.project.gulimall.product.domain.entity.BrandEntity;
 import com.project.gulimall.product.service.BrandService;
 
 

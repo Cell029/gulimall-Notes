@@ -1,4 +1,4 @@
-package com.project.gulimall.product.entity;
+package com.project.gulimall.product.domain.entity;
 
 import com.baomidou.mybatisplus.annotation.TableField;
 import com.baomidou.mybatisplus.annotation.TableId;
