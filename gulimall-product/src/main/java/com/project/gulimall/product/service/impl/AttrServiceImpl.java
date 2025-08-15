@@ -188,7 +188,6 @@ public class AttrServiceImpl extends ServiceImpl<AttrDao, AttrEntity> implements
         List<Long> attrIds = attrAttrgroupRelationEntities.stream()
                 .map(AttrAttrgroupRelationEntity::getAttrId)
                 .collect(Collectors.toList());
-
         if (attrIds.isEmpty()) {
             return Collections.emptyList(); // 返回空列表，避免 SQL 报错
         }

@@ -3594,7 +3594,815 @@ public List<BrandEntity> getBrandsById(Long catId) {
 ```
 
 ****
+### 6.2 获取分类下所有分组以及属性
 
+在选择完分类和该分类下对应的品牌后，填写完基本信息，点击 "下一步：设置基本参数" 按钮，进入对该品牌的规格参数的填写。在上一步获取到了分类信息，可以通过分类 id 获取到该分类下的分组信息，
+获取到分组信息后又可以获取到分组信息关联的规格参数的所有信息，而规格参数中设置了每个参数的可选值等信息，由管理员自行选择即可，主要的就是这两层的获取过程。
+
+因为发送该请求的页面需要获取到所有分组和每个分组的规格参数信息，一个分组对应该分类的一个信息框架，该分组的规格参数则是更细致的信息，所以需要封装成一个新的对象来返回数据。
+该对象封装了分组的信息和规格参数信息列表：
+
+```java
+@Data
+public class AttrGroupWithAttrsVo {
+    /**
+     * 分组id
+     */
+    private Long attrGroupId;
+    /**
+     * 组名
+     */
+    private String attrGroupName;
+    /**
+     * 排序
+     */
+    private Integer sort;
+    /**
+     * 描述
+     */
+    private String descript;
+    /**
+     * 组图标
+     */
+    private String icon;
+    /**
+     * 所属分类id
+     */
+    private Long catelogId;
+
+    /**
+     * 封装规格参数 attr 表的所有信息
+     */
+    private List<AttrEntity> attrs;
+}
+```
+
+Controller 层：
+
+```java
+/**
+ * 获取分类下所有分组以及属性
+ */
+@GetMapping("/{catelogId}/withattr")
+public R getAttrGroupWithAttrs(@PathVariable("catelogId") Long catelogId) {
+    // 查出当前分类下的所有属性分组
+    // 查出每个属性分组的规格参数属性
+    List<AttrGroupWithAttrsVo> vos = attrGroupService.getAttrGroupWithAttrsByCatelogId(catelogId);
+    return R.ok().put("data", vos);
+}
+```
+
+Service 层：
+
+```java
+@Override
+public List<AttrGroupWithAttrsVo> getAttrGroupWithAttrsByCatelogId(Long catelogId) {
+    // 1. 查询分组信息
+    List<AttrGroupEntity> attrGroupEntities = this.list(new QueryWrapper<AttrGroupEntity>().eq("catelog_id", catelogId));
+    // 2. 查询每个分组的所有属性
+    List<AttrGroupWithAttrsVo> AttrGroupWithAttrsVoList = attrGroupEntities.stream().map(attrGroupEntity -> {
+        AttrGroupWithAttrsVo attrsVo = new AttrGroupWithAttrsVo();
+        BeanUtils.copyProperties(attrGroupEntity, attrsVo);
+        // 根据分组 id 查找关联的所有规格参数基本信息（AttrService 层封装的方法）
+        List<AttrEntity> attrEntities = attrService.getRelationAttr(attrsVo.getAttrGroupId());
+        attrsVo.setAttrs(attrEntities);
+        return attrsVo;
+    }).collect(Collectors.toList());
+    return AttrGroupWithAttrsVoList;
+}
+```
+
+****
+### 6.3 管理员新增商品
+
+#### 6.3.1 流程
+
+新增商品的整体流程为：
+
+1、填写商品的基本信息
+
+```scss
+┌──────────────────────────────────────────┐
+│ 商品名称 [ 华为______________________ ]    │
+│ 商品描述 [ 华为______________________ ]    │
+│ 选择分类 [ 手机/手机通讯/手机   ▼ ]          │
+│ 选择品牌 [ 华为               ▼ ]          │
+│ 商品重量(Kg) [-] 0.000 [+]                │
+│ 设置信息：金币 [...] 成长值 [...]           │
+│----------------------------------------- │
+│ 商品介绍 *                                │
+│ [预览图1][预览图2][ + ]                    │
+│------------------------------------------│
+│ 商品图集 *                                │
+│ [图1] [图2] [图3] [ + ]                   │
+│------------------------------------------│
+│ [ 下一步：设置基本参数 ]                    │
+└──────────────────────────────────────────┘
+```
+
+在该页面填写一些基本的信息后，进入下一步，主要是从这里获取对应的分类下的分组和分组的关联规格参数属性。
+
+2、填写规格参数
+
+```text
+┌── 基本信息\主芯片 ──────────────────────┐
+│ 入网型号         ...     □ 快速展示     │
+│ 上市年份         ...     □ 快速展示     │
+│ 颜色             ...    □ 快速展示      │
+│ 机身颜色         ...     ☑ 快速展示     │
+│ 机身长度 (mm)    ...     □ 快速展示     │
+│ 机身材质工艺      ...     □ 快速展示     │
+│ 上市年份         ...     □ 快速展示     │
+│                   ──                 │
+│ □ 上一步   ☐ 下一步：设置销售属性        │
+└──────────────────────────────────────┘
+```
+
+因为选择了分类，所以可以获取到该分类下的分组，而每个分组又有对应的规格参数，这些信息最后都会展示在页面。
+
+3、填写销售属性
+
+┌─────────────────────────────────────────────────────────────┐
+│ 选择销售属性                                                  │
+│-------------------------------------------------------------│
+│ 入网型号   [ ] A2217  [ ] C3J  [ ] 以官网信息为准  [+自定义]     │
+│ 颜色      [ ] 黑色    [ ] 白色  [ ] 蓝色            [+自定义]   │
+│ 内存      [ ] 4GB     [ ] 6GB   [ ] 8GB   [ ] 12GB  [+自定义] │
+└─────────────────────────────────────────────────────────────┘
+
+这个步骤和上面的类似，因为规格参数分为基本属性和销售属性，第二步填写的就是基本属性。基本属性一般是下滑商品页面后看到的关于该型号商品的总体信息，
+而销售属性则是选择商品时的一些独有属性，例如手机的内存、颜色等信息。
+
+4、设置 sku 信息
+
+通过上面三步的信息完善，这一步会通过笛卡尔积生成多个商品信息，例如：
+
+- 华为 A2217 黑色 4GB
+- 华为 A2217 白色 4GB
+- 华为 A2217 黑色 8GB
+- 华为 A2217 白色 4GB
+- ...
+
+然后需要对每个具体的商品设置图集和默认展示的图片、折扣、满减、会员优惠、会员积分等。
+
+****
+#### 6.3.2 保存 spu 信息
+
+这里需要保存的 spu 大概有：商品名称、描述、分类、品牌、重量、金币、成长值、商品介绍、商品图集，这些信息都是对整个商品类别统一的描述，不区分规格，所以它们属于 SPU。
+无论这个手机是黑色还是白色，这些基本信息在 SPU 层面上都是相同的。所以填写的规格参数（基本属性）就是需要保存的 spu 基本信息。
+
+Controller 层：
+
+```java
+@RequestMapping("/save")
+public R save(@RequestBody SpuSaveVo vo){
+    spuInfoService.saveSpuInfo(vo);
+    return R.ok();
+}
+```
+
+因为一个 spu 信息包含很多东西，所以需要额外创建一个对象来接收、封装它们，例如上面提到的商品的名称、描述、分类...但为了前端展示，这里把 spu 对应的 sku 作为列表嵌套在 spu 对象里，
+方便一次性渲染。但需要注意的是：spu 不包含 sku 本身，它只描述商品大类的共性信息，sku 通过 spu 的 id 关联到 spu。所以这里只调用了这一个接口。
+
+```java
+@Data
+public class SpuSaveVo {
+    private String spuName;
+    private String spuDescription;
+    private Long catalogId;
+    private Long brandId;
+    private BigDecimal weight;
+    private int publishStatus;
+    private List<String> decript;
+    private List<String> images;
+    private Bounds bounds;
+    private List<BaseAttrs> baseAttrs;
+    private List<Skus> skus;
+}
+```
+
+Service 层：
+
+1、保存 spu 的基本信息，表 pms_spu_info
+
+因为接收的 SpuSaveVo 是扩展后的对象，所以先要保存一下基本的 SpuInfoEntity 实体
+
+```java
+// 1. 保存 spu 的基本信息，表 pms_spu_info
+SpuInfoEntity spuInfoEntity = new SpuInfoEntity();
+BeanUtils.copyProperties(vo, spuInfoEntity);
+this.saveBaseSpuInfo(spuInfoEntity);
+```
+
+```java
+/**
+ * 保存 spu 的基本信息，表 pms_spu_info
+ */
+@Override
+public void saveBaseSpuInfo(SpuInfoEntity spuInfoEntity) {
+    spuInfoDao.insert(spuInfoEntity);
+}
+```
+
+不过 SpuInfoEntity 的 createTime 和 updateTime 是 SpuSaveVo 没包含的，所以需要手动赋值：
+
+```java
+@Data
+@TableName("pms_spu_info")
+public class SpuInfoEntity implements Serializable {
+	private static final long serialVersionUID = 1L;
+	/**
+	 * 商品id
+	 */
+	@TableId
+	private Long id;
+	/**
+	 * 商品名称
+	 */
+	private String spuName;
+	/**
+	 * 商品描述
+	 */
+	private String spuDescription;
+	/**
+	 * 所属分类id
+	 */
+	private Long catalogId;
+	/**
+	 * 品牌id
+	 */
+	private Long brandId;
+	/**
+	 * 
+	 */
+	private BigDecimal weight;
+	/**
+	 * 上架状态[0 - 新建，1 - 上架，2-下架]
+	 */
+	private Integer publishStatus;
+
+	@TableField(fill = FieldFill.INSERT)
+	private Date createTime;
+
+	@TableField(fill = FieldFill.INSERT_UPDATE)
+	private Date updateTime;
+}
+```
+
+而 MyBatis-Plus 提供了一种自动填充功能，通过实现 MetaObjectHandler 接口，用来指定插入和更新时如何填充值：
+
+```java
+@Component
+public class MyMetaObjectHandler implements MetaObjectHandler {
+    
+    // 插入时自动填充
+    @Override
+    public void insertFill(MetaObject metaObject) {
+        // 填充创建时间和更新时间
+        this.strictInsertFill(metaObject, "createTime", LocalDateTime.class, LocalDateTime.now());
+        this.strictInsertFill(metaObject, "updateTime", LocalDateTime.class, LocalDateTime.now());
+    }
+
+    // 更新时自动填充
+    @Override
+    public void updateFill(MetaObject metaObject) {
+        // 只更新更新时间
+        this.strictUpdateFill(metaObject, "updateTime", LocalDateTime.class, LocalDateTime.now());
+    }
+}
+```
+
+然后在指定的字段上添加 @TableField(fill = FieldFill.INSERT)（插入时生效）/@TableField(fill = FieldFill.INSERT_UPDATE)（插入和更新时生效）即可。
+
+2、保存 spu 的描述图片集合，表 pms_spu_info_desc
+
+在前端填写基本信息时有要求上传一些描述图片集合，这个就是一些图片集合，里面是一些总体的描述，因为它是另一张表，所以需要通过 spuId 进行关联。
+因为可能上传不止一张描述图片，所以需要将这多条 url 拼接成字符串然后再存入表中。
+
+```java
+// 2. 保存 spu 的描述图片集合，表 pms_spu_info_desc
+List<String> decriptList = vo.getDecript();
+SpuInfoDescEntity spuInfoDescEntity = new SpuInfoDescEntity();
+spuInfoDescEntity.setSpuId(spuInfoEntity.getId());
+// 拼接 decriptList 集合中的商品介绍的图片的 url，用 “，” 隔开
+spuInfoDescEntity.setDecript(String.join(",", decriptList));
+// 将数据存入表 pms_spu_info_desc
+spuInfoDescService.saveSpuInfoDesc(spuInfoDescEntity);
+```
+
+SpuInfoDescService：
+
+```java
+@Override
+public void saveSpuInfoDesc(SpuInfoDescEntity spuInfoDescEntity) {
+    spuInfoDescDao.insert(spuInfoDescEntity);
+}
+```
+
+3、保存 spu 的图片集，表 pms_spu_images
+
+同样的，关于该商品的一些图片也需要通过 spuId 进行关联，所以需要传入 spuId。
+
+```java
+List<String> images = vo.getImages();
+// 传入 spu 的 id 和图片集
+spuImagesService.saveImages(spuInfoEntity.getId(), images);
+```
+
+SpuImagesService：
+
+当图片不为空时，则把它添加进表 pms_spu_images。
+
+```java
+@Transactional
+@Override
+public void saveImages(Long id, List<String> images) {
+    if (images.isEmpty()) {
+
+    } else {
+        List<SpuImagesEntity> SpuImagesEntities = images.stream().map(img -> {
+            SpuImagesEntity spuImagesEntity = new SpuImagesEntity();
+            spuImagesEntity.setSpuId(id);
+            spuImagesEntity.setImgUrl(img);
+            return spuImagesEntity;
+        }).collect(Collectors.toList());
+        this.saveBatch(SpuImagesEntities);
+    }
+}
+```
+
+4、保存 spu 的规格参数，表 pms_product_attr_value
+
+表 pms_product_attr_value 是用来关联商品和规格参数的，所以需要先获取到规格参数的 attrId，然后去查找对应的规格参数的相信信息，把获取到的 AttrName、AttrValue、ShowDesc
+存入 ProductAttrValueEntity 实体，将它们关联起来。
+
+```java
+List<BaseAttrs> baseAttrs = vo.getBaseAttrs();
+List<ProductAttrValueEntity> ProductAttrValueEntities = baseAttrs.stream().map(baseAtr -> {
+    ProductAttrValueEntity productAttrValueEntity = new ProductAttrValueEntity();
+    productAttrValueEntity.setAttrId(baseAtr.getAttrId());
+    AttrEntity attrEntity = attrService.getById(baseAtr.getAttrId());
+    productAttrValueEntity.setAttrName(attrEntity.getAttrName());
+    productAttrValueEntity.setAttrValue(baseAtr.getAttrValues());
+    productAttrValueEntity.setQuickShow(baseAtr.getShowDesc());
+    productAttrValueEntity.setSpuId(spuInfoEntity.getId());
+    return productAttrValueEntity;
+}).collect(Collectors.toList());
+productAttrValueService.saveProductAttr(ProductAttrValueEntities);
+```
+
+ProductAttrValueService：
+
+```java
+@Transactional
+@Override
+public void saveProductAttr(List<ProductAttrValueEntity> productAttrValueEntities) {
+    this.saveBatch(productAttrValueEntities);
+}
+```
+
+****
+#### 6.3.3 保存 sku 基本信息
+
+上面有记录，前端存储 sku 的基本信息时是把它作为 spu 的一个列表字段存储的，这是方便前后端的数据传递，所以可以直接从 SpuSaveVo 中获取 sku 的信息集合。因为共用一个接口，
+所以这里只记录 Service 层。
+
+```java
+// 6. 保存当前 spu 对应的所有 sku 信息
+List<Skus> skusList = vo.getSkus();
+if (skusList != null && !skusList.isEmpty()) {
+    skusList.forEach(skus -> {
+        String defaultImg = "";
+        for (Images image : skus.getImages()) {
+            if (image.getDefaultImg() == 1) {
+                defaultImg = image.getImgUrl();
+            }
+        }
+        /**
+         * 只有这四个字段一样
+         * private String skuName;
+         * private BigDecimal price;
+         * private String skuTitle;
+         * private String skuSubtitle;
+         */
+        // 6.1 保存 sku 的基本信息，表 pms_sku_info
+        SkuInfoEntity skuInfoEntity = new SkuInfoEntity();
+        BeanUtils.copyProperties(skus, skuInfoEntity);
+        skuInfoEntity.setBrandId(spuInfoEntity.getBrandId());
+        skuInfoEntity.setCatalogId(spuInfoEntity.getCatalogId());
+        skuInfoEntity.setSaleCount(0L);
+        skuInfoEntity.setSpuId(spuInfoEntity.getId());
+        skuInfoEntity.setSkuDefaultImg(defaultImg);
+        skuInfoService.saveSkuInfo(skuInfoEntity);
+
+        // 6.2 保存 sku 的图片信息，表 pms_sku_images
+        Long skuId = skuInfoEntity.getSkuId();
+        List<SkuImagesEntity> skuImagesEntities = skus.getImages().stream().map(img -> {
+            SkuImagesEntity skuImagesEntity = new SkuImagesEntity();
+            skuImagesEntity.setSkuId(skuId);
+            skuImagesEntity.setImgUrl(img.getImgUrl());
+            skuImagesEntity.setDefaultImg(img.getDefaultImg());
+            return skuImagesEntity;
+        }).collect(Collectors.toList());
+        skuImagesService.saveBatch(skuImagesEntities);
+
+        // 6.3 保存 sku 的销售规格参数信息，表 pms_sku_sale_attr_value
+        List<Attr> attrList = skus.getAttr();
+        List<SkuSaleAttrValueEntity> skuSaleAttrValueEntities = attrList.stream().map(attr -> {
+            SkuSaleAttrValueEntity skuSaleAttrValueEntity = new SkuSaleAttrValueEntity();
+            BeanUtils.copyProperties(attr, skuSaleAttrValueEntity);
+            skuSaleAttrValueEntity.setSkuId(skuId);
+            return skuSaleAttrValueEntity;
+        }).collect(Collectors.toList());
+        skuSaleAttrValueService.saveBatch(skuSaleAttrValueEntities);
+
+        // 6.4 保存 sku 的优惠、满减等信息，表 gulimall_sms -> sms_sku_ladder、sms_sku_full_reduction、sms_member_price、sms_spu_bounds
+
+    });
+}
+```
+
+1、保存 sku 的基本信息，表 pms_sku_info
+
+因为会获取到的很多条 sku 数据，所以需要依次遍历集合中的每条数据，也就是用到 forEach(...)，然后就是保存 sku 的基本信息到表 pms_sku_info，并给前端未赋值的字段进行手动赋值。
+
+```java
+// 6.1 保存 sku 的基本信息，表 pms_sku_info
+SkuInfoEntity skuInfoEntity = new SkuInfoEntity();
+BeanUtils.copyProperties(skus, skuInfoEntity);
+skuInfoEntity.setBrandId(spuInfoEntity.getBrandId());
+skuInfoEntity.setCatalogId(spuInfoEntity.getCatalogId());
+skuInfoEntity.setSaleCount(0L);
+skuInfoEntity.setSpuId(spuInfoEntity.getId());
+skuInfoEntity.setSkuDefaultImg(defaultImg);
+skuInfoService.saveSkuInfo(skuInfoEntity);
+```
+
+这里对 sku 中的图片集合遍历，找出默认图片的 url，然后赋值给 SkuInfoEntity。
+
+```java
+String defaultImg = "";
+for (Images image : skus.getImages()) {
+    if (image.getDefaultImg() == 1) {
+        defaultImg = image.getImgUrl();
+    }
+}
+```
+
+SkuInfoService：
+
+```java
+@Override
+public void saveSkuInfo(SkuInfoEntity skuInfoEntity) {
+    this.save(skuInfoEntity);
+}
+```
+
+2、保存 sku 的图片信息，表 pms_sku_images
+
+sku 的图片信息也是使用的另一张表，所以要用 skuId 进行关联，然后从获取到的图片集合中依次处理每张图片的信息，并存入表 pms_sku_images。
+
+```java
+// 6.2 保存 sku 的图片信息，表 pms_sku_images
+Long skuId = skuInfoEntity.getSkuId();
+List<SkuImagesEntity> skuImagesEntities = skus.getImages().stream().map(img -> {
+    SkuImagesEntity skuImagesEntity = new SkuImagesEntity();
+    skuImagesEntity.setSkuId(skuId);
+    skuImagesEntity.setImgUrl(img.getImgUrl());
+    skuImagesEntity.setDefaultImg(img.getDefaultImg());
+    return skuImagesEntity;
+}).collect(Collectors.toList());
+skuImagesService.saveBatch(skuImagesEntities);
+```
+
+3、保存 sku 的销售规格参数信息，表 pms_sku_sale_attr_value
+
+```java
+// 6.3 保存 sku 的销售规格参数信息，表 pms_sku_sale_attr_value
+List<Attr> attrList = skus.getAttr();
+List<SkuSaleAttrValueEntity> skuSaleAttrValueEntities = attrList.stream().map(attr -> {
+    SkuSaleAttrValueEntity skuSaleAttrValueEntity = new SkuSaleAttrValueEntity();
+    BeanUtils.copyProperties(attr, skuSaleAttrValueEntity);
+    skuSaleAttrValueEntity.setSkuId(skuId);
+    return skuSaleAttrValueEntity;
+}).collect(Collectors.toList());
+skuSaleAttrValueService.saveBatch(skuSaleAttrValueEntities);
+```
+
+****
+#### 6.3.4 调用远程服务保存优惠等信息
+
+##### 1. 使用 Feign 完成远程调用
+
+因为保存 spu 积分信息和 sku 的一些优惠信息需要调用到别的服务中的 Service 或 Dao 层，而当前程序使用的是微服务框架，所以不能直接调用，需要用到 OpenFeign，
+具体使用可以参考 SpringCloud-Notes。
+
+在 gulimall_product 服务下新建 Feign 接口，它们用来处理远程调用，需要注意的是，需要把对应的服务注册进 Nacos 并且支持 Feign，
+在启动类上也要标注扫描 Feign（@EnableFeignClients(basePackages = "com.project.gulimall.product.feign")）。通常也会创建一个 XxxTo 类，
+专门用来进行服务之间的数据传递，例如这里需要保存 spu 积分的信息：
+
+```java
+@Data
+public class SpuBoundsTo {
+    private Long spuId;
+    private BigDecimal buyBounds;
+    private BigDecimal growBounds;
+}
+```
+
+sku 优惠等信息：
+
+```java
+@Data
+public class SkuReductionTo {
+    private Long skuId;
+    private int fullCount;
+    private BigDecimal discount;
+    private int countStatus;
+    private BigDecimal fullPrice;
+    private BigDecimal reducePrice;
+    private int priceStatus;
+    private List<MemberPrice> memberPrice;
+}
+
+@Data
+public class MemberPrice {
+    private Long id;
+    private String name;
+    private BigDecimal price;
+}
+```
+
+在一般情况下，建议 Feign 接口的参数和对应的 Controller 一致，但也可以不是同一个类，不过必须能够被 Spring MVC / Jackson 序列化和反序列化。
+也就是说只要传递给 Controller 的对象的字段可以被它需要接收的对象字段兼容，那就不会出问题。
+
+```java
+@FeignClient("gulimall-coupon")
+public interface CouponFeignService {
+
+    @PostMapping("/coupon/spubounds/save")
+    R saveSpuBounds(@RequestBody SpuBoundsTo spuBoundsTo);
+
+    @PostMapping("/coupon/skufullreduction/saveinfo")
+    R saveSkuReduction(@RequestBody SkuReductionTo skuReductionTo);
+
+}
+```
+
+例如 SpuBoundsTo 中的所有字段 SpuBoundsEntity 都有且一一对应，那就可以正常传递。
+
+```java
+@RequestMapping("/update")
+public R update(@RequestBody SpuBoundsEntity spuBounds){
+    spuBoundsService.updateById(spuBounds);
+    return R.ok();
+}
+
+@PostMapping("/saveinfo")
+public R saveInfo(@RequestBody SkuReductionTo skuReductionTo){
+  skuFullReductionService.saveSkuReduction(skuReductionTo);
+  return R.ok();
+}
+```
+
+****
+##### 2. 保存 spu 积分信息
+
+Service 层：
+
+```java
+// 5. 保存 spu 的积分信息，表 gulimall_sms -> sms_spu_bounds
+Bounds bounds = vo.getBounds();
+SpuBoundsTo spuBoundsTo = new SpuBoundsTo();
+BeanUtils.copyProperties(bounds, spuBoundsTo);
+spuBoundsTo.setSpuId(spuInfoEntity.getId());
+
+R r = couponFeignService.saveSpuBounds(spuBoundsTo);
+if (r.getCode() != 0) {
+    log.error("远程保存 spu 级分信息失败！");
+}
+```
+
+因为 Bounds 只有购买获得的积分和成长积分字段，要想关联到具体的 spu，就需要传入 spuId，所以封装了一个 SpuBoundsTo 类。
+
+```java
+@Data
+public class Bounds {
+    private BigDecimal buyBounds;
+    private BigDecimal growBounds;
+}
+```
+
+然后通过 Feign 接口调用远程接口即可。
+
+****
+##### 2. 保存 sku 优惠信息
+
+目前在前端页面设置的优惠包含：
+
+- 商品满件数打折
+- 商品满金额打折
+- 会员独属优惠价
+
+为了方便调试，就直接把这些数据全部封装进 SkuReductionTo 类中，它里面包含了每个商品对应设置的优惠力度，不过存在多个会员的情况，需要根据它们的等级设置不同的会员价，
+所以会员价的信息会封装成集合。不管如何，最终都是靠 skuId 进行关联。
+
+```java
+// 6.4 保存 sku 的优惠、满减等信息，表 gulimall_sms -> sms_sku_ladder、sms_sku_full_reduction、sms_member_price
+SkuReductionTo skuReductionTo = new SkuReductionTo();
+BeanUtils.copyProperties(skus, skuReductionTo);
+skuReductionTo.setSkuId(skuId);
+// 有满几件打折或者满减优惠时才远程调用
+if (skuReductionTo.getFullCount() > 0 || skuReductionTo.getFullPrice().compareTo(new BigDecimal("0")) > 0) {
+    R r1 = couponFeignService.saveSkuReduction(skuReductionTo);
+    if (r1.getCode() != 0) {
+        log.error("远程保存 sku 优惠信息失败！");
+    }
+}
+```
+
+1、保存商品满件数打折
+
+通过前端传递的 SpuSaveVo 中的 Skus 集合中的信息封装进 SkuReductionTo，然后从该对象中取出满件数打折的信息封装进 SkuLadderEntity 并存入表中。
+不过存在未设置优惠的情况，所以需要对其进行判断（商品打折满足的件数需要大于 0）再进行存表操作。
+
+```java
+// 1. 满几件优惠多少，sms_sku_ladder
+SkuLadderEntity skuLadderEntity = new SkuLadderEntity();
+skuLadderEntity.setSkuId(skuReductionTo.getSkuId());
+skuLadderEntity.setFullCount(skuReductionTo.getFullCount());
+skuLadderEntity.setDiscount(skuReductionTo.getDiscount());
+skuLadderEntity.setAddOther(skuReductionTo.getCountStatus());
+if (skuReductionTo.getFullCount() > 0) {
+    skuLadderService.save(skuLadderEntity);
+}
+```
+
+2、商品满金额打折
+
+满减折扣同理，也要对满足金额进行判断再进行村表操作，不过这里用的字段类型是 BigDecimal，所以判断大小时要用 compareTo，最终结果大于 0 表示位正数。
+
+```java
+// 2. 保存满减打折，sms_sku_full_reduction
+SkuFullReductionEntity skuFullReductionEntity = new SkuFullReductionEntity();
+BeanUtils.copyProperties(skuReductionTo, skuFullReductionEntity);
+if (skuReductionTo.getFullPrice().compareTo(new BigDecimal("0")) > 0) {
+    this.save(skuFullReductionEntity);
+}
+```
+
+3、保存会员独属优惠价
+
+从会员价集合中获取数据，然后依次封装进 MemberPriceEntity 实体，需要注意的是，要对会员价是否为空格进行判断，避免存入空数据进表。
+
+```java
+// 3. 保存会员价，sms_member_price
+List<MemberPrice> memberPriceList = skuReductionTo.getMemberPrice();
+if (memberPriceList != null && !memberPriceList.isEmpty()) {
+    List<MemberPriceEntity> memberPriceEntities = memberPriceList.stream().map(memberPrice -> {
+                MemberPriceEntity memberPriceEntity = new MemberPriceEntity();
+                memberPriceEntity.setSkuId(skuReductionTo.getSkuId());
+                memberPriceEntity.setMemberLevelId(memberPrice.getId());
+                memberPriceEntity.setMemberLevelName(memberPrice.getName());
+                memberPriceEntity.setMemberPrice(memberPrice.getPrice());
+                memberPriceEntity.setAddOther(1);
+                return memberPriceEntity;
+            })
+            .filter(memberPrice -> {
+                return memberPrice.getMemberPrice().compareTo(new BigDecimal("0")) >= 0;
+            })
+            .collect(Collectors.toList());
+    if(!memberPriceEntities.isEmpty()){
+        memberPriceService.saveBatch(memberPriceEntities);
+    }
+}
+```
+
+****
+
+新增商品整体代码：
+
+```java
+@Transactional
+@Override
+public void saveSpuInfo(SpuSaveVo vo) {
+    // 1. 保存 spu 的基本信息，表 pms_spu_info
+    SpuInfoEntity spuInfoEntity = new SpuInfoEntity();
+    BeanUtils.copyProperties(vo, spuInfoEntity);
+    this.saveBaseSpuInfo(spuInfoEntity);
+
+    // 2. 保存 spu 的描述图片集合，表 pms_spu_info_desc
+    List<String> decriptList = vo.getDecript();
+    SpuInfoDescEntity spuInfoDescEntity = new SpuInfoDescEntity();
+    spuInfoDescEntity.setSpuId(spuInfoEntity.getId());
+    // 拼接 decriptList 集合中的商品介绍的图片的 url，用 “，” 隔开
+    spuInfoDescEntity.setDecript(String.join(",", decriptList));
+    // 将数据存入表 pms_spu_info_desc
+    spuInfoDescService.saveSpuInfoDesc(spuInfoDescEntity);
+
+    // 3. 保存 spu 的图片集，表 pms_spu_images
+    List<String> images = vo.getImages();
+    // 传入 spu 的 id 和图片集
+    spuImagesService.saveImages(spuInfoEntity.getId(), images);
+
+    // 4. 保存 spu 的规格参数，表 pms_product_attr_value
+    List<BaseAttrs> baseAttrs = vo.getBaseAttrs();
+    List<ProductAttrValueEntity> ProductAttrValueEntities = baseAttrs.stream().map(baseAtr -> {
+        ProductAttrValueEntity productAttrValueEntity = new ProductAttrValueEntity();
+        productAttrValueEntity.setAttrId(baseAtr.getAttrId());
+        AttrEntity attrEntity = attrService.getById(baseAtr.getAttrId());
+        productAttrValueEntity.setAttrName(attrEntity.getAttrName());
+        productAttrValueEntity.setAttrValue(baseAtr.getAttrValues());
+        productAttrValueEntity.setQuickShow(baseAtr.getShowDesc());
+        productAttrValueEntity.setSpuId(spuInfoEntity.getId());
+        return productAttrValueEntity;
+    }).collect(Collectors.toList());
+    productAttrValueService.saveProductAttr(ProductAttrValueEntities);
+
+    // 5. 保存 spu 的积分信息，表 gulimall_sms -> sms_spu_bounds
+    Bounds bounds = vo.getBounds();
+    SpuBoundsTo spuBoundsTo = new SpuBoundsTo();
+    BeanUtils.copyProperties(bounds, spuBoundsTo);
+    spuBoundsTo.setSpuId(spuInfoEntity.getId());
+
+    R r = couponFeignService.saveSpuBounds(spuBoundsTo);
+    if (r.getCode() != 0) {
+        log.error("远程保存 spu 级分信息失败！");
+    }
+
+    // 6. 保存当前 spu 对应的所有 sku 信息
+    List<Skus> skusList = vo.getSkus();
+    if (skusList != null && !skusList.isEmpty()) {
+        skusList.forEach(skus -> {
+            String defaultImg = "";
+            for (Images image : skus.getImages()) {
+                if (image.getDefaultImg() == 1) {
+                    defaultImg = image.getImgUrl();
+                }
+            }
+            /**
+             * 只有这四个字段一样
+             * private String skuName;
+             * private BigDecimal price;
+             * private String skuTitle;
+             * private String skuSubtitle;
+             */
+            // 6.1 保存 sku 的基本信息，表 pms_sku_info
+            SkuInfoEntity skuInfoEntity = new SkuInfoEntity();
+            BeanUtils.copyProperties(skus, skuInfoEntity);
+            skuInfoEntity.setBrandId(spuInfoEntity.getBrandId());
+            skuInfoEntity.setCatalogId(spuInfoEntity.getCatalogId());
+            skuInfoEntity.setSaleCount(0L);
+            skuInfoEntity.setSpuId(spuInfoEntity.getId());
+            skuInfoEntity.setSkuDefaultImg(defaultImg);
+            skuInfoService.saveSkuInfo(skuInfoEntity);
+
+            // 6.2 保存 sku 的图片信息，表 pms_sku_images
+            Long skuId = skuInfoEntity.getSkuId();
+            List<SkuImagesEntity> skuImagesEntities = skus.getImages().stream().map(img -> {
+                        SkuImagesEntity skuImagesEntity = new SkuImagesEntity();
+                        skuImagesEntity.setSkuId(skuId);
+                        skuImagesEntity.setImgUrl(img.getImgUrl());
+                        skuImagesEntity.setDefaultImg(img.getDefaultImg());
+                        return skuImagesEntity;
+                    })
+                    .filter(img -> {
+                        // 返回 true 就是需要，返回 false 就是不需要，也就不会保存进数据库
+                        return !StringUtils.isEmpty(img.getImgUrl());
+                    })
+                    .collect(Collectors.toList());
+            skuImagesService.saveBatch(skuImagesEntities);
+
+            // 6.3 保存 sku 的销售规格参数信息，表 pms_sku_sale_attr_value
+            List<Attr> attrList = skus.getAttr();
+            List<SkuSaleAttrValueEntity> skuSaleAttrValueEntities = attrList.stream().map(attr -> {
+                SkuSaleAttrValueEntity skuSaleAttrValueEntity = new SkuSaleAttrValueEntity();
+                BeanUtils.copyProperties(attr, skuSaleAttrValueEntity);
+                skuSaleAttrValueEntity.setSkuId(skuId);
+                return skuSaleAttrValueEntity;
+            }).collect(Collectors.toList());
+            skuSaleAttrValueService.saveBatch(skuSaleAttrValueEntities);
+
+            // 6.4 保存 sku 的优惠、满减等信息，表 gulimall_sms -> sms_sku_ladder、sms_sku_full_reduction、sms_member_price
+            SkuReductionTo skuReductionTo = new SkuReductionTo();
+            BeanUtils.copyProperties(skus, skuReductionTo);
+            skuReductionTo.setSkuId(skuId);
+            // 有满几件打折或者满减优惠时才远程调用
+            if (skuReductionTo.getFullCount() > 0 || skuReductionTo.getFullPrice().compareTo(new BigDecimal("0")) > 0) {
+                R r1 = couponFeignService.saveSkuReduction(skuReductionTo);
+                if (r1.getCode() != 0) {
+                    log.error("远程保存 sku 优惠信息失败！");
+                }
+            }
+        });
+    }
+
+}
+```
+
+因为前端允许某些值为空，所以在后端进行表操作的时候一定要对数据是否为空进行判断，否则表与表之间的关联可能发生错误。
+
+****
 
 
 

@@ -6,6 +6,7 @@ import java.util.Map;
 
 import com.project.gulimall.product.domain.entity.AttrEntity;
 import com.project.gulimall.product.domain.vo.AttrGroupRelationVo;
+import com.project.gulimall.product.domain.vo.AttrGroupWithAttrsVo;
 import com.project.gulimall.product.service.AttrAttrgroupRelationService;
 import com.project.gulimall.product.service.AttrService;
 import com.project.gulimall.product.service.CategoryService;
@@ -73,6 +74,18 @@ public class AttrGroupController {
         attrGroup.setCatelogPath(path);
         return R.ok().put("attrGroup", attrGroup);
     }
+
+    /**
+     * 获取分类下所有分组以及属性
+     */
+    @GetMapping("/{catelogId}/withattr")
+    public R getAttrGroupWithAttrs(@PathVariable("catelogId") Long catelogId) {
+        // 查出当前分类下的所有属性分组
+        // 查出每个属性分组的规格参数属性
+        List<AttrGroupWithAttrsVo> vos = attrGroupService.getAttrGroupWithAttrsByCatelogId(catelogId);
+        return R.ok().put("data", vos);
+    }
+
 
     /**
      * 保存

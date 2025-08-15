@@ -1,5 +1,6 @@
 package com.project.gulimall.product.service.impl;
 
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import java.util.Map;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
@@ -16,6 +17,9 @@ import com.project.gulimall.product.service.SpuInfoDescService;
 @Service("spuInfoDescService")
 public class SpuInfoDescServiceImpl extends ServiceImpl<SpuInfoDescDao, SpuInfoDescEntity> implements SpuInfoDescService {
 
+    @Autowired
+    private SpuInfoDescDao spuInfoDescDao;
+
     @Override
     public PageUtils queryPage(Map<String, Object> params) {
         IPage<SpuInfoDescEntity> page = this.page(
@@ -24,6 +28,11 @@ public class SpuInfoDescServiceImpl extends ServiceImpl<SpuInfoDescDao, SpuInfoD
         );
 
         return new PageUtils(page);
+    }
+
+    @Override
+    public void saveSpuInfoDesc(SpuInfoDescEntity spuInfoDescEntity) {
+        spuInfoDescDao.insert(spuInfoDescEntity);
     }
 
 }
