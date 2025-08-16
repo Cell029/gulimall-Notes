@@ -9,7 +9,7 @@ import com.project.common.utils.PageUtils;
 import com.project.common.utils.Query;
 
 import com.project.gulimall.ware.dao.WareOrderTaskDetailDao;
-import com.project.gulimall.ware.entity.WareOrderTaskDetailEntity;
+import com.project.gulimall.ware.domain.entity.WareOrderTaskDetailEntity;
 import com.project.gulimall.ware.service.WareOrderTaskDetailService;
 
 

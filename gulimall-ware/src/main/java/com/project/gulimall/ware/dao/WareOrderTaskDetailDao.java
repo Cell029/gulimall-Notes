@@ -1,6 +1,6 @@
 package com.project.gulimall.ware.dao;
 
-import com.project.gulimall.ware.entity.WareOrderTaskDetailEntity;
+import com.project.gulimall.ware.domain.entity.WareOrderTaskDetailEntity;
 import com.baomidou.mybatisplus.core.mapper.BaseMapper;
 import org.apache.ibatis.annotations.Mapper;
 

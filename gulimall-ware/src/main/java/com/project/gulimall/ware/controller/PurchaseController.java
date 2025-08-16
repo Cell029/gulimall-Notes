@@ -1,19 +1,17 @@
 package com.project.gulimall.ware.controller;
 
 import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
+
+import com.project.gulimall.ware.domain.vo.MergeVo;
+import com.project.gulimall.ware.domain.vo.PurchaseDoneVo;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.web.bind.annotation.PathVariable;
-import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RequestParam;
-import org.springframework.web.bind.annotation.RestController;
-import com.project.gulimall.ware.entity.PurchaseEntity;
+import org.springframework.web.bind.annotation.*;
+import com.project.gulimall.ware.domain.entity.PurchaseEntity;
 import com.project.gulimall.ware.service.PurchaseService;
 import com.project.common.utils.PageUtils;
 import com.project.common.utils.R;
-
-
 
 /**
  * 采购信息
@@ -35,6 +33,25 @@ public class PurchaseController {
         return R.ok().put("page", page);
     }
 
+    /**
+     * 查询未领取的采购单
+     */
+    @RequestMapping("/unreceive/list")
+    // @RequiresPermissions("ware:purchase:list")
+    public R unreceiveList(@RequestParam Map<String, Object> params){
+        PageUtils page = purchaseService.queryPageUnreceive(params);
+
+        return R.ok().put("page", page);
+    }
+
+    /**
+     * 合并采购单
+     */
+    @PostMapping("/merge")
+    public R merge(@RequestBody MergeVo mergeVo){
+        purchaseService.mergePurchase(mergeVo);
+        return R.ok();
+    }
 
     /**
      * 信息
@@ -66,6 +83,24 @@ public class PurchaseController {
     public R update(@RequestBody PurchaseEntity purchase){
 		purchaseService.updateById(purchase);
 
+        return R.ok();
+    }
+
+    /**
+     * 领取采购单
+     */
+    @PostMapping("/received")
+    public R received(@RequestBody List<Long> purchaseIds){
+        purchaseService.received(purchaseIds);
+        return R.ok();
+    }
+
+    /**
+     * 完成采购
+     */
+    @PostMapping("/done")
+    public R done(@RequestBody PurchaseDoneVo purchaseDoneVo){
+        purchaseService.done(purchaseDoneVo);
         return R.ok();
     }
 

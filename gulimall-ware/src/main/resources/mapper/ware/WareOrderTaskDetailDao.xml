@@ -4,7 +4,7 @@
 <mapper namespace="com.project.gulimall.ware.dao.WareOrderTaskDetailDao">
 
 	<!-- 可根据自己的需求，是否要使用 -->
-    <resultMap type="com.project.gulimall.ware.entity.WareOrderTaskDetailEntity" id="wareOrderTaskDetailMap">
+    <resultMap type="com.project.gulimall.ware.domain.entity.WareOrderTaskDetailEntity" id="wareOrderTaskDetailMap">
         <result property="id" column="id"/>
         <result property="skuId" column="sku_id"/>
         <result property="skuName" column="sku_name"/>

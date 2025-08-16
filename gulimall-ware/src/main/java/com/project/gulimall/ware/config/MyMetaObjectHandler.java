@@ -1,9 +1,9 @@
-package com.project.gulimall.product.config;
+package com.project.gulimall.ware.config;
 
 import com.baomidou.mybatisplus.core.handlers.MetaObjectHandler;
 import org.apache.ibatis.reflection.MetaObject;
 import org.springframework.stereotype.Component;
-import java.time.LocalDateTime;
+
 import java.util.Date;
 
 @Component

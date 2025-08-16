@@ -8,7 +8,7 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
-import com.project.gulimall.ware.entity.WareOrderTaskEntity;
+import com.project.gulimall.ware.domain.entity.WareOrderTaskEntity;
 import com.project.gulimall.ware.service.WareOrderTaskService;
 import com.project.common.utils.PageUtils;
 import com.project.common.utils.R;

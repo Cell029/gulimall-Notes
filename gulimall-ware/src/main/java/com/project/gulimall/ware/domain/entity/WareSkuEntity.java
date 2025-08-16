@@ -1,4 +1,4 @@
-package com.project.gulimall.ware.entity;
+package com.project.gulimall.ware.domain.entity;
 
 import com.baomidou.mybatisplus.annotation.TableId;
 import com.baomidou.mybatisplus.annotation.TableName;
@@ -8,11 +8,11 @@ import java.util.Date;
 import lombok.Data;
 
 /**
- * 库存工作单
+ * 商品库存
  */
 @Data
-@TableName("wms_ware_order_task_detail")
-public class WareOrderTaskDetailEntity implements Serializable {
+@TableName("wms_ware_sku")
+public class WareSkuEntity implements Serializable {
 	private static final long serialVersionUID = 1L;
 
 	/**
@@ -25,16 +25,20 @@ public class WareOrderTaskDetailEntity implements Serializable {
 	 */
 	private Long skuId;
 	/**
+	 * 仓库id
+	 */
+	private Long wareId;
+	/**
+	 * 库存数
+	 */
+	private Integer stock;
+	/**
 	 * sku_name
 	 */
 	private String skuName;
 	/**
-	 * 购买个数
+	 * 锁定库存
 	 */
-	private Integer skuNum;
-	/**
-	 * 工作单id
-	 */
-	private Long taskId;
+	private Integer stockLocked;
 
 }

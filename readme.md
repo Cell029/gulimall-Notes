@@ -4403,8 +4403,616 @@ public void saveSpuInfo(SpuSaveVo vo) {
 因为前端允许某些值为空，所以在后端进行表操作的时候一定要对数据是否为空进行判断，否则表与表之间的关联可能发生错误。
 
 ****
+### 6.4 商品管理
 
+#### 6.4.1 spu 检索
 
+在上面的过程中完成了商品的新增，而每个商品又有 spu 和 sku 属性，所以需要区分开来管理它们，而 spu 检索，就是查询 spu 的关键信息找到对应的商品，检索条件分为：
 
+- 分类
+- 品牌
+- 状态（新建/上架/下架）
+- 模糊查询（检索 id 为输入的内容，或 spu 的名称中包含输入的内容）
+
+Controller 层：
+
+```java
+@RequestMapping("/list")
+public R list(@RequestParam Map<String, Object> params){
+    PageUtils page = spuInfoService.queryPageByCondition(params);
+    return R.ok().put("page", page);
+}
+```
+
+Service 层：
+
+对检索条件进行判断，非空时才让它们作为查询条件，否则使用空的 queryWrapper，即无查询条件。需要注意的是，模糊查询里面有用到 or，所以需要把这个 or 用 and 包含起来，
+否则会导致查询条件与预期的不同。
+
+```java
+@Override
+public PageUtils queryPageByCondition(Map<String, Object> params) {
+    QueryWrapper<SpuInfoEntity> queryWrapper = new QueryWrapper<>();
+    // 模糊检索
+    String key = (String) params.get("key");
+    if (!StringUtils.isEmpty(key)) {
+        queryWrapper.and(wrapper -> {
+            wrapper.eq("id", key).or().like("spu_name", key);
+        });
+    }
+    // 状态条件
+    String status = (String) params.get("status");
+    if (!StringUtils.isEmpty(status)) {
+        queryWrapper.eq("publish_status", status);
+    }
+    String brandId = (String) params.get("brandId");
+    // 若 id 为 0 则不作为查询条件
+    if (!StringUtils.isEmpty(brandId)  && !"0".equals(brandId)) {
+        queryWrapper.eq("brand_id", brandId);
+    }
+    String catelogId = (String) params.get("catelogId");
+    if (!StringUtils.isEmpty(catelogId)  && !"0".equals(catelogId)) {
+        queryWrapper.eq("catalog_id", catelogId);
+    }
+    IPage<SpuInfoEntity> page = this.page(
+            new Query<SpuInfoEntity>().getPage(params),
+            queryWrapper
+    );
+    return new PageUtils(page);
+}
+```
+
+****
+#### 6.4.2 sku 检索
+
+sku 检索和上面记录的类似，只不过检索的条件不一样：
+
+- 分类
+- 品牌
+- 价格区间
+- 模糊查询（检索 id 为输入的内容，或 spu 的名称中包含输入的内容）
+
+Controller 层：
+
+```java
+@RequestMapping("/list")
+public R list(@RequestParam Map<String, Object> params){
+    PageUtils page = skuInfoService.queryPageByCondition(params);
+
+    return R.ok().put("page", page);
+}
+```
+
+Service 层：
+
+这里需要注意的是，价格区间的默认值是 0 - 0，如果不对这个数据进行处理的话，那默认查询的就是价格为 0 的 sku 信息，这显然是不可用的，所以需要对传递过来的值进行非 0 的判断。
+
+```java
+@Override
+public PageUtils queryPageByCondition(Map<String, Object> params) {
+    QueryWrapper<SkuInfoEntity> queryWrapper = new QueryWrapper<>();
+    String key = (String) params.get("key");
+    if (!StringUtils.isEmpty(key)) {
+        queryWrapper.and(wrapper -> {
+            queryWrapper.eq("sku_id", key).or().like("sku_name", key);
+        });
+    }
+    String catelogId = (String) params.get("catelogId");
+    if (!StringUtils.isEmpty(catelogId) && !"0".equals(catelogId)) {
+        queryWrapper.eq("catalog_id", catelogId);
+    }
+    String brandId = (String) params.get("brandId");
+    if (!StringUtils.isEmpty(brandId) && !"0".equals(brandId)) {
+        queryWrapper.eq("brand_id", brandId);
+    }
+    String min = (String) params.get("min");
+    if (!StringUtils.isEmpty(min)) {
+        BigDecimal bigDecimal = new BigDecimal(min);
+        if (bigDecimal.compareTo(new BigDecimal("0")) > 0) {
+            // 大于等于
+            queryWrapper.ge("price", min);
+        }
+    }
+    String max = (String) params.get("max");
+    if (!StringUtils.isEmpty(max)) {
+        BigDecimal bigDecimal = new BigDecimal(max);
+        if (bigDecimal.compareTo(new BigDecimal("0")) > 0) {
+            // 小于等于
+            queryWrapper.le("price", max);
+        }
+    }
+    IPage<SkuInfoEntity> page = this.page(
+            new Query<SkuInfoEntity>().getPage(params),
+            queryWrapper
+    );
+    return new PageUtils(page);
+}
+```
+
+****
+## 7. 仓储服务
+
+### 7.1 获取仓库列表
+
+因为逆向生成的代码中包含了简单的增删改查功能，所以关于仓库只需要修改检索功能即可，也较为简单。
+
+Controller 层：
+
+```java
+@RequestMapping("/list")
+public R list(@RequestParam Map<String, Object> params){
+    PageUtils page = wareInfoService.queryPage(params);
+
+    return R.ok().put("page", page);
+}
+```
+
+Service 层：
+
+因为仓库列表的检索包含了所有字段，所以检索条件之间用 or 连接即可。
+
+```java
+@Override
+public PageUtils queryPage(Map<String, Object> params) {
+    QueryWrapper<WareInfoEntity> queryWrapper = new QueryWrapper<>();
+    String key = (String) params.get("key");
+    if (!StringUtils.isEmpty(key)) {
+        queryWrapper
+                .eq("id", key)
+                .or().like("name", key)
+                .or().like("address", key)
+                .or().like("areacode", key);
+    }
+    IPage<WareInfoEntity> page = this.page(
+            new Query<WareInfoEntity>().getPage(params),
+            queryWrapper
+    );
+    return new PageUtils(page);
+}
+```
+
+****
+### 7.2 商品库存
+
+#### 7.2.1 检索商品库存与采购需求
+
+在商品库存页面，某个具体的商品（sku）是和仓库进行关联的，所以检索的条件为具体的仓库和 skuId。
+
+Controller 层：
+
+```java
+@RequestMapping("/list")
+// @RequiresPermissions("ware:waresku:list")
+public R list(@RequestParam Map<String, Object> params){
+    PageUtils page = wareSkuService.queryPage(params);
+
+    return R.ok().put("page", page);
+}
+```
+
+Service 层：
+
+```java
+@Override
+public PageUtils queryPage(Map<String, Object> params) {
+    QueryWrapper<WareSkuEntity> queryWrapper = new QueryWrapper<>();
+    String skuId = (String) params.get("skuId");
+    if (!StringUtils.isEmpty(skuId) && !"0".equals(skuId)) {
+        queryWrapper.eq("sku_id", skuId);
+    }
+    String wareId = (String) params.get("wareId");
+    if (!StringUtils.isEmpty(wareId) && !"0".equals(wareId)) {
+        queryWrapper.eq("ware_id", wareId);
+    }
+    IPage<WareSkuEntity> page = this.page(
+            new Query<WareSkuEntity>().getPage(params),
+            queryWrapper
+    );
+
+    return new PageUtils(page);
+}
+```
+
+不过新增库存并不是在商品库存页面进行新增，这个页面只是一个可视化快捷页面。对于库存操作有个重要的业务叫做采购单，由采购人员将商品采购进对应的仓库。而再进行采购前需要设置一下采购需求，
+也就是采购的商品对应的仓库与数量，在该页面需要新增一下检索功能。
+
+Controller 层：
+
+```java
+@RequestMapping("/list")
+public R list(@RequestParam Map<String, Object> params){
+    PageUtils page = purchaseDetailService.queryPage(params);
+    return R.ok().put("page", page);
+}
+```
+
+Service 层：
+
+```java
+@Override
+public PageUtils queryPage(Map<String, Object> params) {
+    QueryWrapper<PurchaseDetailEntity> queryWrapper = new QueryWrapper<>();
+    String key = (String) params.get("key");
+    if (!StringUtils.isEmpty(key)) {
+        queryWrapper.and((wrapper) -> {
+            wrapper.eq("purchase_id", key).or().eq("sku_id", key);
+        });
+    }
+    String status = (String) params.get("status");
+    if (!StringUtils.isEmpty(status)) {
+        queryWrapper.eq("status", status);
+    }
+    String wareId = (String) params.get("wareId");
+    if (!StringUtils.isEmpty(wareId) && !"0".equals(wareId)) {
+        queryWrapper.eq("ware_id", wareId);
+    }
+    IPage<PurchaseDetailEntity> page = this.page(
+            new Query<PurchaseDetailEntity>().getPage(params),
+            queryWrapper
+    );
+    return new PageUtils(page);
+}
+```
+
+****
+#### 7.2.2 合并采购需求成采购单
+
+##### 7.2.2.1 查询未领取的采购单
+
+Controller 层：
+
+```java
+@RequestMapping("/unreceive/list")
+// @RequiresPermissions("ware:purchase:list")
+public R unreceiveList(@RequestParam Map<String, Object> params){
+    PageUtils page = purchaseService.queryPageUnreceive(params);
+
+    return R.ok().put("page", page);
+}
+```
+
+Service 层：
+
+因为采购单一旦完成，就无法再对其进行某些操作了，所以合并采购需求到采购单就得找那些处于新建或已分配状态的采购单。
+
+```java
+@Override
+public PageUtils queryPageUnreceive(Map<String, Object> params) {
+    IPage<PurchaseEntity> page = this.page(
+            new Query<PurchaseEntity>().getPage(params),
+            new QueryWrapper<PurchaseEntity>().eq("status", 0).or().eq("status", 1)
+    );
+
+    return new PageUtils(page);
+}
+```
+
+****
+##### 7.2.2.2 合并
+
+合并操作就是把采购需求中选中的一些数据分配给采购单中那些状态为新建或已分配采购人的数据，例如采购需求页面的数据为：
+
+|id|采购单id|采购商品id|采购数量|采购金额|仓库id|状态|操作|
+| ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- |
+|1|5|1|10| |1|已分配|修改、删除|
+|2|5|2|100| |2|已分配|修改、删除|
+
+采购单页面的数据：
+
+|  | 采购单id | 采购人id | 采购人名 | 联系方式       | 优先级 | 状态   | 仓库id | 总金额 | 创建日期 | 更新日期 | 操作        |
+| ---- | ------ | ------ | ---- | ----------- | ---- | ---- | ---- | ---- |------|------|-----------|
+|  | 1      | 2      | jack | 1357826987 1 | 1    | 已分配  |      |      |      |      | 分配、修改、删除  |
+|  | 5      | 1      | admin | 1361234567 8 |      | 已分配  |      |      |      |      | 分配、修改、删除  | 
+
+目的就是让这两页的数据关联起来。
+
+Controller 层：
+
+进行合并操作，前端会传递采购单 id 和 采购需求的 id 集合，所以可以封装成对象接收。
+
+```java
+@Data
+public class MergeVo {
+    // 采购单 id
+    private Long purchaseId;
+    // 采购需求 id 集合
+    private List<Long> items;
+}
+```
+
+```java
+@PostMapping("/merge")
+public R merge(@RequestBody MergeVo mergeVo){
+    purchaseService.mergePurchase(mergeVo);
+    return R.ok();
+}
+```
+
+Service 层：
+
+不过在合并的时候可以不选择某个具体的采购单，此时就属于新建一个采购单，所以在后端需要进行判断前端是否传递了采购单 id，如果没有则进行新建操作。不管最终是否为新增采购单，
+都需要修改修改采购需求的信息，即让它们关联上采购单 id 并设置默认值为已分配采购单。所以最终修改的只有采购需求表，除非是新增一个采购单。
+
+```java
+@Transactional
+@Override
+public void mergePurchase(MergeVo mergeVo) {
+  Long purchaseId = mergeVo.getPurchaseId();
+  // 如果没有采购单 id，则需要新建采购单
+  if (purchaseId == null) {
+    PurchaseEntity purchaseEntity = new PurchaseEntity();
+    purchaseEntity.setStatus(WareConstant.PurchaseStatusEnum.CREATED.getCode());
+    this.save(purchaseEntity);
+    // mybatis-plus 会自动把主键 id 返回给实体类上标注了 @TableId(type = IdType.AUTO) 的字段
+    purchaseId = purchaseEntity.getId();
+  }
+  // 确认采购单状态，只有状态是新建或已分配才可以合并
+  PurchaseEntity purchaseEntity = this.getById(purchaseId);
+  if (purchaseEntity.getStatus().equals(WareConstant.PurchaseStatusEnum.CREATED.getCode())
+          || purchaseEntity.getStatus().equals(WareConstant.PurchaseStatusEnum.ASSIGN.getCode())) {
+    List<Long> itemIds = mergeVo.getItems();
+    if (itemIds != null && !itemIds.isEmpty()) {
+      Long finalPurchaseId = purchaseId;
+      List<PurchaseDetailEntity> purchaseDetailEntities = itemIds.stream().map(itemId -> {
+        PurchaseDetailEntity purchaseDetailEntity = new PurchaseDetailEntity();
+        purchaseDetailEntity.setId(itemId);
+        purchaseDetailEntity.setPurchaseId(finalPurchaseId);
+        purchaseDetailEntity.setStatus(WareConstant.PurchaseDetailStatusEnum.ASSIGN.getCode());
+        return purchaseDetailEntity;
+      }).collect(Collectors.toList());
+      purchaseDetailService.updateBatchById(purchaseDetailEntities);
+    }
+  }
+}
+```
+
+****
+#### 7.2.3 领取采购单
+
+领取采购订单后才能进行商品的采购，所以前端会传递需要领取的采购单的 id 集合给后端，后端接收后主要是修改采购单的状态为已领取，采购需求的状态修改为正在采购。
+
+Controller 层：
+
+```java
+@PostMapping("/received")
+public R received(@RequestBody List<Long> purchaseIds){
+    purchaseService.received(purchaseIds);
+    return R.ok();
+}
+```
+
+Service 层：
+
+首先需要判断采购单是否为新建或者已分配的状态（已分配采购人员），然后才能修改它们的状态为已领取。接着再通过采购单的 id 获取到对应的采购需求表的信息，最后修改状态为正在领取即可。
+
+```java
+@Transactional
+@Override
+public void received(List<Long> purchaseIds) {
+    // 1. 确认当前采购单是新建或者已分配状态
+    List<PurchaseEntity> purchaseEntities = purchaseIds.stream().map(purchaseId -> {
+      PurchaseEntity purchaseEntity = this.getById(purchaseId);
+      return purchaseEntity;
+    }).filter(purchaseEntity -> {
+      return purchaseEntity.getStatus() == WareConstant.PurchaseStatusEnum.CREATED.getCode() || purchaseEntity.getStatus() == WareConstant.PurchaseStatusEnum.ASSIGN.getCode();
+    }).map(purchaseEntity -> {
+      Date now = new Date();
+      purchaseEntity.setUpdateTime(now);
+      purchaseEntity.setStatus(WareConstant.PurchaseStatusEnum.RECEIVE.getCode());
+      return purchaseEntity;
+    }).collect(Collectors.toList());
+    if (purchaseEntities.isEmpty()) {
+      return; // 没有可处理的采购单
+    }
+    // 2. 改变采购单的状态
+    this.updateBatchById(purchaseEntities);
+    // 3. 改变采购需求的状态
+    purchaseEntities.forEach(purchaseEntity -> {
+      List<PurchaseDetailEntity> purchaseDetailEntities = purchaseDetailService.listDetailByPurchaseId(purchaseEntity.getId());
+      purchaseDetailEntities.forEach(purchaseDetailEntity -> {
+        purchaseDetailEntity.setStatus(WareConstant.PurchaseDetailStatusEnum.BUYING.getCode());
+      });
+      purchaseDetailService.updateBatchById(purchaseDetailEntities);
+    });
+}
+```
+
+****
+#### 7.2.4 完成采购
+
+完成采购操作由对应的采购人员进行操作，他需要传递采购单的 id、采购需求的 id 集合、采购需求的状态和失败原因，因为没有该功能对应的前端页面，所以用接口请求代替：
+
+```json
+{
+    "purchaseId": 1,
+    "items": [
+        {
+            "purchaseDetailId": 1,
+            "status": 3,
+            "reason": ""
+        },
+        {
+            "purchaseDetailId": 2,
+            "status": 4,
+            "reason": "无货"
+        }
+    ]
+}
+```
+
+这些参数用一个对象来封装接收，需要将它们的字段一一对应，否则需要用 @JsonProperty("...") 指定为前端发送的哪个字段。
+
+```java
+@Data
+public class PurchaseDoneVo {
+    @NotNull
+    private Long purchaseId;
+    private List<PurchaseItemDoneVo> items;
+}
+
+@Data
+public class PurchaseItemDoneVo {
+    private Long purchaseDetailId;
+    private Integer status;
+    private String reason;
+}
+```
+
+Controller 层：
+
+```java
+@PostMapping("/done")
+public R done(@RequestBody PurchaseDoneVo purchaseDoneVo){
+    purchaseService.done(purchaseDoneVo);
+    return R.ok();
+}
+```
+
+Service 层：
+
+完成采购订单主要的功能就是修改采购单和采购需求的状态，通过前端传递的 status 可以很简单的判断出采购需求的状态（直接使用），而采购单的状态则需要通过采购需求的状态来进行判断，
+只有当前采购单关联的所有采购需求的状态都为已完成时，才能将采购单的状态修改为已完成，否则就必须修改成异常。
+
+```java
+@Override
+public void done(PurchaseDoneVo purchaseDoneVo) {
+    Long purchaseId = purchaseDoneVo.getPurchaseId();
+    // 改变采购需求状态
+    Boolean flag = true;
+    List<PurchaseItemDoneVo> items = purchaseDoneVo.getItems();
+    List<PurchaseDetailEntity> purchaseDetailEntities = new ArrayList<>();
+    for (PurchaseItemDoneVo item : items) {
+        PurchaseDetailEntity purchaseDetailEntity = new PurchaseDetailEntity();
+        // 采购失败
+        if (item.getStatus() == WareConstant.PurchaseDetailStatusEnum.ERROR.getCode()) {
+            // 只要有一条采购需求的状态为异常，那么就将该标识符置为 false
+            flag = false;
+            purchaseDetailEntity.setStatus(item.getStatus());
+        } else { // 采购成功
+            purchaseDetailEntity.setStatus(WareConstant.PurchaseDetailStatusEnum.FINISH.getCode());
+            // 将成功采购的商品进行入库（加库存数量）
+            PurchaseDetailEntity entity = purchaseDetailService.getById(item.getPurchaseDetailId());
+            // 增加库存，需要传入商品 id，仓库 id，商品采购数目
+            wareSkuService.addStock(entity.getSkuId(), entity.getWareId(), entity.getSkuNum());
+        }
+        purchaseDetailEntity.setId(item.getPurchaseDetailId());
+        purchaseDetailEntities.add(purchaseDetailEntity);
+    }
+    purchaseDetailService.updateBatchById(purchaseDetailEntities);
+    // 改变采购单状态
+    PurchaseEntity purchaseEntity = new PurchaseEntity();
+    purchaseEntity.setId(purchaseId);
+    // 根据标识符判断应该将采购单的状态设置成什么
+    purchaseEntity.setStatus(flag ? WareConstant.PurchaseStatusEnum.FINISH.getCode() : WareConstant.PurchaseStatusEnum.ERROR.getCode());
+    this.updateById(purchaseEntity);
+}
+```
+
+然后将采购成功的商品的数量添加商品库存 wms_ware_sku 表：
+
+| id  | sku_id | ware_id | stock | sku_name        | stock_locked |
+| --- | ------ | ------- | ----- | --------------- | ------------ |
+| 1   | 29     | 1       | 40    | 华为 A2217黑色8 | 0            |
+| 2   | 30     | 2       | 100   | 华为 A2217黑色1 | 0            |
+
+如果是该表中存在对应的 skuId，那么就是修改操作，让 stock 字段增加，如果没有，则需要新建一条数据。而商品名称在库存服务中是无法查询到的，所以只能通过 product 服务远程调用，
+然后查询到商品名。
+
+```java
+@Transactional
+@Override
+public void addStock(Long skuId, Long wareId, Integer skuNum) {
+    // 如果没有这个库存记录，那就是新增
+    List<WareSkuEntity> wareSkuEntities = wareSkuDao.selectList(new QueryWrapper<WareSkuEntity>().eq("sku_id", skuId).eq("ware_id", wareId));
+    // 为空，进行新增操作
+    if (wareSkuEntities == null || wareSkuEntities.isEmpty()) {
+        WareSkuEntity wareSkuEntity = new WareSkuEntity();
+        wareSkuEntity.setSkuId(skuId);
+        wareSkuEntity.setWareId(wareId);
+        wareSkuEntity.setStock(skuNum);
+        wareSkuEntity.setStockLocked(0);
+        try {
+            R info = productFeignService.info(skuId);
+            if (info.getCode() == 0) {
+                Map<String, Object> data = (Map<String, Object>) info.get("skuInfo");
+                wareSkuEntity.setSkuName(data.get("skuName").toString());
+            }
+        } catch (Exception e) {
+            log.error(e.getMessage());
+        }
+        wareSkuDao.insert(wareSkuEntity);
+    } else {
+        // 更新操作（加库存）
+        wareSkuDao.addStock(skuId, wareId, skuNum);
+    }
+}
+```
+
+wareSkuDao.addStock()：
+
+```sql
+<update id="addStock">
+    update wms_ware_sku set stock = stock + #{skuNum} where sku_id = #{skuId} and ware_id = #{wareId}
+</update>
+```
+
+****
+## 8. spu 管理商品规格
+
+在商品维护的 spu 管理页面，每个 spu 都有一个规格按钮，它就是用来回显在添加商品时填写的那些规格参数基本属性，同样的，既然能回显就能进行修改操作。
+
+Controller 层：
+
+```java
+@GetMapping("/base/listforspu/{spuId}")
+public R baseAttrListForSpu(@PathVariable("spuId") Long spuId){
+    List<ProductAttrValueEntity> productAttrValueEntities = productAttrValueService.baseAttrListForSpu(spuId);
+    return R.ok().put("data", productAttrValueEntities);
+}
+```
+
+Service 层：
+
+回显操作较为简单，因为有一张 pms_sku_sale_attr_value 表，里面记录了每个 spu 对应的规格参数数据，所以直接根据 spuId 查询即可。
+
+```java
+@Override
+public List<ProductAttrValueEntity> baseAttrListForSpu(Long spuId) {
+    List<ProductAttrValueEntity> productAttrValueEntities = productAttrValueDao.selectList(new QueryWrapper<ProductAttrValueEntity>().eq("spu_id", spuId));
+    return productAttrValueEntities;
+}
+```
+
+Controller 层：
+
+```java
+@PostMapping("/update/{spuId}")
+public R updateSpuAttr(@PathVariable("spuId") Long spuId, @RequestBody List<ProductAttrValueEntity> productAttrValueEntities) {
+    productAttrValueService.updateSpuAttr(spuId, productAttrValueEntities);
+    return R.ok();
+}
+```
+
+Service 层：
+
+修改操作的实现与以往记录的不太一样了，他不是接收某个表单的数据后封装成对象然后将该对象作为修改参数。现在是直接接收前端传递的所有有关该规格参数的信息，为什么这样？
+因为规格参数对应的数据较多，如果封装从对象就要进行多次的更新操作，不如直接把原有数据清空，然后将新数据再添加进去，然后还是用 spuId 进行关联（spuId 不是主键）。
+
+```java
+@Transactional
+@Override
+public void updateSpuAttr(Long spuId, List<ProductAttrValueEntity> productAttrValueEntities) {
+    // 1. 删除该 spuId 之前对应的所有属性
+    productAttrValueDao.delete(new QueryWrapper<ProductAttrValueEntity>().eq("spu_id", spuId));
+    // 2. 插入新的数据
+    List<ProductAttrValueEntity> productAttrValueEntities1 = productAttrValueEntities.stream().map(productAttrValueEntity -> {
+        productAttrValueEntity.setSpuId(spuId);
+        return productAttrValueEntity;
+    }).collect(Collectors.toList());
+    this.saveBatch(productAttrValueEntities1);
+}
+```
+
+****
 
 

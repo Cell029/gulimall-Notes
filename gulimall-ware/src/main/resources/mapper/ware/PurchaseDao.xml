@@ -4,7 +4,7 @@
 <mapper namespace="com.project.gulimall.ware.dao.PurchaseDao">
 
 	<!-- 可根据自己的需求，是否要使用 -->
-    <resultMap type="com.project.gulimall.ware.entity.PurchaseEntity" id="purchaseMap">
+    <resultMap type="com.project.gulimall.ware.domain.entity.PurchaseEntity" id="purchaseMap">
         <result property="id" column="id"/>
         <result property="assigneeId" column="assignee_id"/>
         <result property="assigneeName" column="assignee_name"/>

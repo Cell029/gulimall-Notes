@@ -2,7 +2,7 @@ package com.project.gulimall.ware.service;
 
 import com.baomidou.mybatisplus.extension.service.IService;
 import com.project.common.utils.PageUtils;
-import com.project.gulimall.ware.entity.WareOrderTaskDetailEntity;
+import com.project.gulimall.ware.domain.entity.WareOrderTaskDetailEntity;
 
 import java.util.Map;
 
