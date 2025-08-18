@@ -5014,5 +5014,816 @@ public void updateSpuAttr(Long spuId, List<ProductAttrValueEntity> productAttrVa
 ```
 
 ****
+# 五、商城业务
+
+## 1. Elasticsearch 
+
+### 1.1 安装
+
+因为 7.x 版本的 Elasticsearch 没有 8.x 版本的安全验证，所以安装较为简单，无需设置密码也能访问。
+
+```shell
+docker run -d \
+  --name es \
+  -e "ES_JAVA_OPTS=-Xms512m -Xmx512m" \
+  -e "discovery.type=single-node" \
+  -v ./es/data:/usr/share/elasticsearch/data \
+  -v ./es/plugins:/usr/share/elasticsearch/plugins \
+  -v ./es/config/es.yaml:/usr/share/elasticsearch/config/elasticsearch.yml \
+  --privileged \
+  --network gmall-net \
+  -p 9200:9200 \
+  -p 9300:9300 \
+  elasticsearch:7.12.1
+```
+
+```shell
+docker run -d \
+--name kibana \
+-e ELASTICSEARCH_HOSTS=http://es:9200 \
+--network=gmall-net \
+-p 5601:5601  \
+kibana:7.12.1
+```
+
+****
+### 1.2 初步检索
+
+#### 1. _cat
+
+1、集群健康：/_cat/health
+
+```http request
+GET /_cat/health?v
+GET /_cat/health?format=json # 需要 JSON 时
+```
+
+```text
+epoch      timestamp cluster       status node.total node.data shards pri relo init unassign pending_tasks max_task_wait_time active_shards_percent
+175..      07:12:09  elasticsearch green           1         1      6   6    0    0        0             0                  -                100.0%
+```
+
+2、节点信息：/_cat/nodes，看各节点角色、负载、内存、磁盘等
+
+```http request
+GET /_cat/nodes?v&h=ip,nodeRole,name,cpu,load_1m,heap.percent,ram.percent,disk.avail
+GET /_cat/nodes
+```
+
+```text
+172.18.0.2 61 92 32 2.25 2.44 1.68 cdfhilmrstw * 782c524cb5ff
+```
+
+3、索引列表：/_cat/indices
+
+```http request
+GET /_cat/indices?v
+GET /_cat/indices?bytes=gb&s=store.size:desc
+GET /_cat/indices?h=health,status,index,pri,rep,docs.count,store.size&s=index
+```
+
+```text
+health status index                           uuid                   pri rep docs.count docs.deleted store.size pri.store.size
+green  open   .kibana_7.12.1_001              IFxNxKDsQr-9Yk6ENSL3NQ   1   0         29           27      2.1mb          2.1mb
+green  open   .apm-custom-link                n2GHTEW9TBaETfR3M9_u6A   1   0          0            0       208b           208b
+green  open   .apm-agent-configuration        7Cnh2GAhQZqf_uIJXF1Cuw   1   0          0            0       208b           208b
+green  open   .kibana_task_manager_7.12.1_001 2tbWcVfOQuaY5kocHsfu8Q   1   0          9          184    136.8kb        136.8kb
+green  open   .kibana-event-log-7.12.1-000001 OX1RHsDgSmWvpIpQTqDXcA   1   0          1            0      5.6kb          5.6kb
+```
+
+4、文档计数：/_cat/count
+
+```http request
+GET /_cat/count?v
+GET /_cat/count/my-index
+```
+
+```text
+epoch      timestamp count
+1755501352 07:15:52  42
+```
+
+****
+### 1.3 安装 ik 分词器
+
+通过网络获取安装包后挂载到本地的 es 插件目录，不过需要把插件放到对应的目录，比如 ik 分词器就要放到 /plugins/ik（新建一个目录），在 es 容器启动时会自动加载。
+
+```shell
+wget https://get.infini.cloud/elasticsearch/analysis-ik/7.12.1/elasticsearch-analysis-ik-7.12.1.zip
+unzip elasticsearch-analysis-ik-7.12.1.zip -d ./es/plugins/ik
+```
+
+验证：
+
+```http request
+POST /_analyze
+{
+  "analyzer": "ik_smart",
+  "text": "程序员学习java太棒了"
+}
+```
+
+```json
+{
+  "tokens" : [
+    {
+      "token" : "程序员",
+      "start_offset" : 0,
+      "end_offset" : 3,
+      "type" : "CN_WORD",
+      "position" : 0
+    },
+    {
+      "token" : "学习",
+      "start_offset" : 3,
+      "end_offset" : 5,
+      "type" : "CN_WORD",
+      "position" : 1
+    },
+    {
+      "token" : "java",
+      "start_offset" : 5,
+      "end_offset" : 9,
+      "type" : "ENGLISH",
+      "position" : 2
+    },
+    {
+      "token" : "太棒了",
+      "start_offset" : 9,
+      "end_offset" : 12,
+      "type" : "CN_WORD",
+      "position" : 3
+    }
+  ]
+}
+```
+
+****
+### 1.4 Elasticsearch-Rest-Client
+
+#### 1.4.1 简单使用
+
+因为 7.x 和 8.x 版本差距较大，而之前记录的是 8.x 版本的 SpringBoot 整合 es，所以这里简单记录下 7.x 版本。
+
+1、引入依赖
+
+```xml
+<dependency>
+    <groupId>org.elasticsearch.client</groupId>
+    <artifactId>elasticsearch-rest-high-level-client</artifactId>
+    <version>7.12.1</version>
+</dependency>
+```
+
+需要注意的是：SpringBoot 会自动对 elasticsearch 的依赖进行管理，如果要使用自己的版本的话就需要强制使用：
+
+```xml
+<properties>
+    <elasticsearch.version>7.12.1</elasticsearch.version>
+</properties>
+```
+
+2、创建配置文件
+
+将 Elasticsearch 的客户端 RestHighLevelClient 注入到 Spring 容器中，指定 ES 的主机地址和端口（localhost:9200），并通过 builder 初始化客户端。
+
+```java
+@Configuration
+public class GulimallElasticSearchConfig {
+    @Bean
+    public RestHighLevelClient restHighLevelClient() {
+        RestClientBuilder builder = RestClient.builder(new HttpHost("localhost", 9200, "http"));
+        return new RestHighLevelClient(builder);
+    }
+}
+```
+
+3、使用
+
+```java
+@Autowired
+private RestHighLevelClient restHighLevelClient;
+
+@Test
+void contextLoads() {
+    log.info("restHighLevelClient: {}", restHighLevelClient);
+}
+
+@Test
+void indexData() throws IOException {
+    IndexRequest indexRequest = new IndexRequest("users");
+    indexRequest.id("1");
+    // indexRequest.source("userName", "张三", "age", 18, "gender", "男");
+    User user = new User();
+    user.setUserName("张三");
+    user.setAge(18);
+    user.setGender("男");
+    String jsonString = JSON.toJSONString(user);
+    // java.lang.IllegalArgumentException: The number of object passed must be even but was [1]
+    indexRequest.source(jsonString, XContentType.JSON);
+    // 执行操作
+    IndexResponse index = restHighLevelClient.index(indexRequest, RequestOptions.DEFAULT);
+    // 提取有用的响应数据
+    System.out.println(index);
+}
+
+@Data
+class User {
+    private String userName;
+    private String gender;
+    private Integer age;
+}
+```
+
+IndexRequest.source() 有几种重载方式：
+
+```java
+// 方式1：以 key-value 形式传入
+indexRequest.source("userName", "张三", "age", 18, "gender", "男");
+
+// 方式2：以 Map 形式传入
+Map<String, Object> map = new HashMap<>();
+map.put("userName", "张三");
+map.put("age", 18);
+map.put("gender", "男");
+indexRequest.source(map);
+
+// 方式3：以 JSON 字符串传入
+indexRequest.source(jsonString, XContentType.JSON);
+```
+
+但如果用 key-value 方式，传入的参数必须成对出现（也就是 key-value 的形式），否则会报错：
+
+```java
+java.lang.IllegalArgumentException: The number of object passed must be even but was [1]
+```
+
+而使用 JSON 字符串的方式需要指定为 XContentType.JSON，否则也会报上面同样的错误。
+
+****
+#### 1.4.2 复杂检索
+
+首先需要创建检索请求指定检索的索引，这里指定的是 bank 索引库，然后简单的指定一个查询条件，查询 address 字段包含 mill 的数据。然后创建一个分组聚合，名字为 ageAgg，
+ES 会根据 age 字段的值去做分桶（bucket），每个不同的年龄值生成一个桶，最终只取前十个，然后把它作为查询条件进行聚合查询。而查询平均薪资也是利用聚合，
+通过 AggregationBuilders.avg("balanceAvg") 创建一个平均值聚合。
+
+而结果分析则需要连续调用两次 hits，因为 es 展示的结构就是一个大 hits 包裹一个小 hits，然后小 hits 里面包裹多个 _resource。
+通过 searchResponse.getAggregations() 可以从返回结果中获取本次查询的所有聚合结果，聚合结果是一个 Aggregation 集合，每个 Aggregation 对象对应 DSL 里定义的聚合。
+因为年龄这个字段可以有多条不同的值，所以每个 bucket 对应一个 age 值及其文档数量，而平均薪资则可以直接获取值。
+
+```java
+@Autowired
+private RestHighLevelClient restHighLevelClient;
+
+@Test
+void searchData() throws IOException {
+    // 1. 创建检索请求
+    SearchRequest searchRequest = new SearchRequest();
+    // 指定索引
+    searchRequest.indices("bank");
+    // 指定 DSL 检索条件
+    SearchSourceBuilder searchSourceBuilder = new SearchSourceBuilder();
+    searchSourceBuilder.query(QueryBuilders.matchQuery("address", "mill"));
+    // 按照年龄的值分布进行聚合
+    TermsAggregationBuilder ageAgg = AggregationBuilders.terms("ageAgg").field("age").size(10);
+    searchSourceBuilder.aggregation(ageAgg);
+    searchRequest.source(searchSourceBuilder);
+    // 计算平均薪资
+    AvgAggregationBuilder balanceAvg = AggregationBuilders.avg("balanceAvg").field("balance");
+    searchSourceBuilder.aggregation(balanceAvg);
+    System.out.println("检索条件：" + searchSourceBuilder.toString());
+    // 2. 执行检索
+    SearchResponse searchResponse = restHighLevelClient.search(searchRequest, RequestOptions.DEFAULT);
+
+    // 3. 分析结果
+    // 获取所有查到的数据
+    SearchHits hits = searchResponse.getHits();
+    SearchHit[] searchHits = hits.getHits();
+    for (SearchHit hit : searchHits) {
+        String source = hit.getSourceAsString();
+        JsonRootBean account = JSON.parseObject(source, JsonRootBean.class);
+        System.out.println("account：" + account);
+    }
+    // 获取这次检索到的分析信息
+    Aggregations aggregations = searchResponse.getAggregations();
+    for (Aggregation aggregation : aggregations) {
+        System.out.println("当前聚合：" + aggregation.getName());
+    }
+    Terms ageAgg1 = aggregations.get("ageAgg");
+    ageAgg1.getBuckets().forEach(bucket -> {
+        String keyAsString = bucket.getKeyAsString();
+        System.out.println("年龄：" + keyAsString + "，数量：" + bucket.getDocCount());
+    });
+    Avg balanceAvg1 = aggregations.get("balanceAvg");
+    System.out.println("平均薪资：" + balanceAvg1.getValue());
+}
+```
+
+```java
+@Data
+@ToString
+static class JsonRootBean {
+    private int account_number;
+    private int balance;
+    private String firstname;
+    private String lastname;
+    private int age;
+    private String gender;
+    private String address;
+    private String employer;
+    private String email;
+    private String city;
+    private String state;
+}
+```
+
+****
+## 2. 商品上架
+
+### 2.1 构建 es 模型
+
+一般的商品就是按照如下的属性检索，这种写法是直接把需要检索的字段写进去以此达到方便检索的目的，但是这会产生一些冗余字段。例如 spuId 为 11 的商品下有对应的 sku 8 个，
+那这种写法就需要写八次 spu 的 attr 属性，那就很浪费空间。
+
+```json
+{
+  "skuId": 1,
+  "spuId": 11,
+  "skuTitle": 华为,
+  "price": 998,
+  "saleCount": 99,
+  "attrs": [
+    {
+      "尺寸": 5寸
+    },
+    {
+      "CPU": 高通
+    },
+    {
+      "分辨率": 全高清
+    }
+  ]
+}
+```
+
+如果将他们分开存储，一个存储 sku 信息，一个存储 spu 信息，当需要用到 spu 的 attr 属性时就可以通过 spuId 找到 attr 的索引库，这样一个 spu 就只需要写一次 attr，占用更少的空间。
+
+```json
+{
+  "skuId": 1,
+  "spuId": 11,
+  "xxxx": ...,
+}
+```
+
+```json
+{
+  "spuId": 11,
+  "attrs": [
+    {
+      "尺寸": 5寸
+    },
+    {
+      "CPU": 高通
+    },
+    {
+      "分辨率": 全高清
+    }
+  ]
+}
+```
+
+但这种写法存在一种问题，那就是在前端页面展示的时候，每点击一个查询属性，其它的属性就会动态的发生改变，例如搜索小米，此时可能有如下分类：
+
+- 粮食
+- 手机
+- 电器
+
+此时有很多的 sku 都包含小米这个 spu，如果要检索出这些 sku 涉及的所有属性，那就需要发送多次查询。先查询出小米这个 spu 包含的所有可能属性，此时要通过 es 发送大量的查询请求，
+然后再查询 attr 属性，当查询的请求数量较大，那就会占用大量的网络资源，甚至导致系统卡死崩溃。所以 es 中的数据模型还是选择第一种，用空间来换取时间的稳定性。
+
+整体模型：
+
+```json
+PUT product
+{
+    "mappings": {
+        "properties": {
+            "skuId": {
+                "type": "long"
+            },
+            "spuId": {
+                "type": "keyword"
+            },
+            "skuTitle": {
+                "type": "text",
+                "analyzer": "ik_smart"
+            },
+            "skuPrice": {
+                "type": "keyword"
+            },
+            "skuImg": {
+                "type": "keyword",
+                "index": false,
+                "doc_values": false
+            },
+            "saleCount": {
+                "type": "long"
+            },
+            "hasStock": {
+                "type": "boolean"
+            },
+            "hotScore": {
+                "type": "long"
+            },
+            "brandId": {
+                "type": "long"
+            },
+            "catalogId": {
+                "type": "long"
+            },
+            "brandName": {
+                "type": "keyword",
+                "index": false,
+                "doc_values": false
+            },
+            "brandImg": {
+                "type": "keyword",
+                "index": false,
+                "doc_values": false
+            },
+            "catalogName": {
+                "type": "keyword",
+                "index": false,
+                "doc_values": false
+            },
+            "attrs": {
+                "type": "nested",
+                "properties": {
+                    "attrId": {
+                        "type": "long"
+                    },
+                    "attrName": {
+                        "type": "keyword",
+                        "index": false,
+                        "doc_values": false
+                    },
+                    "attrValue": {
+                        "type": "keyword"
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+在这个 es 索引库中，只有 skuTitle 是支持分词检索的，也就是模糊查询，其余字段只支持精确匹配，而有些字段用到了：
+
+- index：默认 true，如果为 false，表示该字段不会被索引，但是检索结果里面有，但字段本身不能
+- doc_values：默认 true，设置为 false，表示不可以做排序、聚合以及脚本操作，这样更节省磁盘空间。还可以通过设定 doc_values 为 true，index 为 false 来让字段不能被搜索但可以用于排序、聚合以及脚本操作
+
+****
+### 2.2 es 的扁平化处理
+
+在 es 中，普通的字段的默认行为就是扁平化，即不区分标量还是数组，把数组看作是是多值字段。当索引对象数组时，es 会把同名字段的值打平到各自的字段上，
+而这会导致丢失同一条对象里字段之间的配对关系。例如：
+
+```json
+{
+  "name": "shoe",
+  "attrs": [
+    {"color": "red",  "size": "M"},
+    {"color": "blue", "size": "L"}
+  ]
+}
+```
+
+如果 attrs 映射为默认，索引后可理解为：
+
+```json
+attrs.color: ["red",  "blue"]
+attrs.size:  ["M",    "L"]
+```
+
+这时查询 color=red AND size=L 会误命中，因为 es 看见的是有文档包含 attrs.color = red，也包含 attrs.size = L，但它不知道这两个值来自不同的对象条目。
+这就导致只要 color 中存在查询的值即判定为找到，size 字段同理。而这种情况是需要避免的，所以 es 提供了对象之间的内联关系，把 attrs 定义为 nested，
+es 会把每个对象条目当成一个隐藏子文档存储，配对关系得到保留。而查询时也必须使用 nested 查询：
+
+```json
+{
+  "nested": {
+    "path": "attrs",
+    "query": {
+      "bool": {
+        "must": [
+          { "term": { "attrs.color": "red" }},
+          { "term": { "attrs.size": "L" }}
+        ]
+      }
+    }
+  }
+}
+```
+
+****
+### 2.3 spu 商品上架功能
+
+#### 2.3.1 整体代码
+
+在上面已经完成了 es 模型的设计，现在就要通过访问后端接口来返回这个模型的具体数据。而在前端点击商品上架后，就需要把该商品的数据封装为上面的 es 设计模型。
+
+Controller 层：
+
+```java
+@PostMapping("/{spuId}/up")
+public R spuUp(@PathVariable("spuId") Long spuId) {
+    spuInfoService.up(spuId);
+    return R.ok();
+}
+```
+
+Service 层：
+
+```java
+@Override
+public List<SkuEsModel> up(Long spuId) {
+  // 查出当前 spuId 对应的所有 sku 信息，包括 skuName
+  List<SkuInfoEntity> skuInfoEntities = skuInfoService.getSkusBySpuId(spuId);
+  // 获取传入的 spuId 对应的 sku 的 id 集合
+  List<Long> skuIds = skuInfoEntities.stream().map(SkuInfoEntity::getSkuId).collect(Collectors.toList());
+
+  // 查询当前 sku 的所有可以被用来检索的规格属性
+  List<ProductAttrValueEntity> productAttrs = productAttrValueService.baseAttrListForSpu(spuId);
+  // 通过 pms_product_attr_value 表获取该 spu 的 attrId
+  List<Long> attrIds = productAttrs.stream().map(ProductAttrValueEntity::getAttrId).collect(Collectors.toList());
+  // 通过 attrId 获取可被检索的 attrId，即查询条件包含 search_type = 1
+  List<Long> searchAttrIds = attrService.selectSearchAttrIds(attrIds);
+  Set<Long> idSet = new HashSet<>(searchAttrIds);
+  // 将可被检索的 attr 与该 spuId 对应的所有 attr 进行对比，相同的就直接拷贝 attr 数据
+  List<SkuEsModel.Attr> esAttrs = productAttrs.stream().filter(productAttrValueEntity -> {
+    return idSet.contains(productAttrValueEntity.getAttrId());
+  }).map(productAttrValueEntity -> {
+    SkuEsModel.Attr attr = new SkuEsModel.Attr();
+    BeanUtils.copyProperties(productAttrValueEntity, attr);
+    return attr;
+  }).collect(Collectors.toList());
+
+  Map<Long, Boolean> hasStockMap = null;
+  try {
+    // 远程调用库存系统查询是否有库存
+    R<List<SkuHasStockVo>> skusHaveStock = wareFeignService.getSkusHaveStock(skuIds);
+    List<SkuHasStockVo> skuHasStockVos = skusHaveStock.getData();
+    hasStockMap = skuHasStockVos.stream().collect(Collectors.toMap(SkuHasStockVo::getSkuId, SkuHasStockVo::getHasStock));
+  } catch (Exception e) {
+    log.error("远程调用库存服务查询是否有库存出现异常:{}", e.getMessage());
+  }
+
+  // 封装每个 sku 的信息
+  Map<Long, Boolean> finalHasStockMap = hasStockMap;
+  List<SkuEsModel> skuEsModels = skuInfoEntities.stream().map(sku -> {
+    // 组装需要的数据
+    SkuEsModel skuEsModel = new SkuEsModel();
+    BeanUtils.copyProperties(sku, skuEsModel);
+    // skuPrice、skuImg、hasStock、hotScore、brandName、brandImg、catelogName、attrs[]
+    skuEsModel.setSkuPrice(sku.getPrice());
+    skuEsModel.setSkuImg(sku.getSkuDefaultImg());
+
+    // TODO 热度评分，刚上架默认为 0
+    skuEsModel.setHotScore(0L);
+
+    // 查询品牌名称
+    BrandEntity brand = brandService.getById(skuEsModel.getBrandId());
+    CategoryEntity category = categoryService.getById(skuEsModel.getCatalogId());
+    skuEsModel.setBrandName(brand.getName());
+    skuEsModel.setBrandImg(brand.getLogo());
+    skuEsModel.setCatalogName(category.getName());
+
+    if (finalHasStockMap == null) {
+      // 设置库存
+      skuEsModel.setHasStock(true);
+    } else {
+      skuEsModel.setHasStock(finalHasStockMap.get(sku.getSkuId()));
+    }
+
+    // 设置 es 里的检索属性 attr，因为是同一个 spu，所以每次设置的 attr 都是一样的
+    skuEsModel.setAttrs(esAttrs);
+    return skuEsModel;
+  }).collect(Collectors.toList());
+  return skuEsModels;
+}
+```
+
+```java
+/**
+ * 在 attr 表中跳出可以被检索的属性
+ * @param attrIds
+ * @return
+ */
+@Override
+public List<Long> selectSearchAttrIds(List<Long> attrIds) {
+    // select attr_id from pms_attr where attr_id in (?) and search_type = 1
+    return attrDao.selectSearchAttrIds(attrIds);
+}
+```
+
+远程调用查询库存：
+
+```java
+@GetMapping("/haveStock")
+public R<List<SkuHasStockVo>> getSkusHaveStock(@RequestBody List<Long> skuIds){
+    List<SkuHasStockVo> vos = wareSkuService.getSkusHaveStock(skuIds);
+    R<List<SkuHasStockVo>> ok = R.ok();
+    ok.setData(vos);
+    return ok;
+}
+```
+
+```java
+@Override
+public List<SkuHasStockVo> getSkusHaveStock(List<Long> skuIds) {
+    List<SkuHasStockVo> skuHasStockVos = skuIds.stream().map(skuId -> {
+        SkuHasStockVo vo = new SkuHasStockVo();
+        // 查询当前 sku 的总库存量
+        // select sum(stock - stock_locked) from wms_ware_sku where sku_id = ?
+        long stock = wareSkuDao.getSkuStock(skuId);
+        vo.setSkuId(skuId);
+        vo.setHasStock(stock > 0);
+        return vo;
+    }).collect(Collectors.toList());
+    return skuHasStockVos;
+}
+```
+
+****
+#### 2.3.2 步骤
+
+商品上架功能是在 spu 管理页面中的，而上架的是一个 spu，所以要先通过前端传递的 spuId 查询出对应的 sku 以及 skuName。而查询出的 sku 又要封装成 es 模型数据，
+所以先设计一个传递对象，专门接收 es 模型数据：
+
+```java
+@Data
+public class SkuEsModel {
+    private Long skuId;
+    private Long spuId;
+    private String skuTitle;
+    private BigDecimal skuPrice;
+    private String skuImg;
+    private Long saleCount;
+    private Boolean hasStock;
+    private Long hotScore;
+    private Long brandId;
+    private Long catalogId;
+    private String brandName;
+    private String brandImg;
+    private String catalogName;
+    private List<Attr> attrs;
+    @Data
+    public static class Attr {
+        private Long attrId;
+        private String attrName;
+        private String attrValue;
+    }
+}
+```
+
+和具体的 SkuInfoEntity 对比后发现，有些数据不能直接通过 BeanUtils 拷贝给 SkuEsModel，而这些数据则需要手动赋值：
+
+- skuPrice
+- skuImg
+- hasStock
+- hotScore
+- brandName
+- brandImg
+- catalogName
+- attrs[]
+
+而一个 spu 对应多个 sku，所以需要把它们封装成集合的形式返回，集合的类型就是 SkuEsModel。这里就是先通过 spu 查询出对应的 sku 的 id。
+
+```java
+// 查出当前 spuId 对应的所有 sku 信息，包括 skuName
+List<SkuInfoEntity> skuInfoEntities = skuInfoService.getSkusBySpuId(spuId);
+// 获取传入的 spuId 对应的 sku 的 id 集合
+List<Long> skuIds = skuInfoEntities.stream().map(SkuInfoEntity::getSkuId).collect(Collectors.toList());
+```
+
+然后查询 pms_product_attr_value 表中关于当前 spuId 的 attr 的一些信息和 attr 的 id 集合。接着查询 pms_attr 表中那些 search_type = 1 的 attr，这样获取到这些可被检索的 attr 的 id 后，
+就和刚刚查出的 pms_product_attr_value 表中的 attr 的 id 对比，然后把 id 一致的拷贝，为什么这样做？因为 es 的 attr 中的字段和 ProductAttrValueEntity 的字段一致，
+可以直接拷贝，所以这样比较。而查询的是同一个 spu 下的 attr，所以这个 attr 属性是多个 sku 共用的，但因为 es 的设计模型，还是得对每个 SkuEsModel 的 attrs 字段赋值。
+
+```java
+// 查询当前 sku 的所有可以被用来检索的规格属性
+List<ProductAttrValueEntity> productAttrs = productAttrValueService.baseAttrListForSpu(spuId);
+// 通过 pms_product_attr_value 表获取该 spu 的 attrId
+List<Long> attrIds = productAttrs.stream().map(ProductAttrValueEntity::getAttrId).collect(Collectors.toList());
+// 通过 attrId 获取可被检索的 attrId，即查询条件包含 search_type = 1
+List<Long> searchAttrIds = attrService.selectSearchAttrIds(attrIds);
+Set<Long> idSet = new HashSet<>(searchAttrIds);
+// 将可被检索的 attr 与该 spuId 对应的所有 attr 进行对比，相同的就直接拷贝 attr 数据
+List<SkuEsModel.Attr> esAttrs = productAttrs.stream().filter(productAttrValueEntity -> {
+    return idSet.contains(productAttrValueEntity.getAttrId());
+}).map(productAttrValueEntity -> {
+    SkuEsModel.Attr attr = new SkuEsModel.Attr();
+    BeanUtils.copyProperties(productAttrValueEntity, attr);
+    return attr;
+}).collect(Collectors.toList());
+```
+
+在 SkuEsModel 中有个库存的字段 hasStock，这个字段并不是展示还剩多少库存，而是展示是否还有库存，所以它的类型是 Boolean，有则为 true，反之则为 false。而库存功能需要调用别的服务，
+所以又要用到 Feign 接口。
+
+```java
+@FeignClient("gulimall-ware")
+public interface WareFeignService {
+    @GetMapping("/ware/waresku/haveStock")
+    R<List<SkuHasStockVo>> getSkusHaveStock(@RequestBody List<Long> skuIds);
+}
+```
+
+最终的返回结果只需要告知商品服务是否还有库存，所以可以简单的设计一个 Vo 对象封装结果，里面只需要包含 sku 的 id 和是否有库存即可。
+
+```java
+@GetMapping("/haveStock")
+public R<List<SkuHasStockVo>> getSkusHaveStock(@RequestBody List<Long> skuIds){
+    List<SkuHasStockVo> vos = wareSkuService.getSkusHaveStock(skuIds);
+    R<List<SkuHasStockVo>> ok = R.ok();
+    ok.setData(vos);
+    return ok;
+}
+
+@Override
+public List<SkuHasStockVo> getSkusHaveStock(List<Long> skuIds) {
+  List<SkuHasStockVo> skuHasStockVos = skuIds.stream().map(skuId -> {
+    SkuHasStockVo vo = new SkuHasStockVo();
+    // 查询当前 sku 的总库存量
+    // select sum(stock - stock_locked) from wms_ware_sku where sku_id = ?
+    long stock = wareSkuDao.getSkuStock(skuId);
+    vo.setSkuId(skuId);
+    vo.setHasStock(stock > 0);
+    return vo;
+  }).collect(Collectors.toList());
+  return skuHasStockVos;
+}
+```
+
+因为是远程调用，那就涉及网络请求，那就要用 try-catch 包起来，防止后续程序因为远程调用的异常而崩溃。这里调用的接口返回的是 R<List<SkuHasStockVo>> 类型，
+为了后面方便比较，就把它转换成 Map 类型，SkuHasStockVo 的 id 作为 key，hasStock 作为 value。在后面赋值的时候判断 Map 集合中的 key 来获取对应的 value（是否有库存）。
+
+```java
+Map<Long, Boolean> hasStockMap = null;
+try {
+    // 远程调用库存系统查询是否有库存
+    R<List<SkuHasStockVo>> skusHaveStock = wareFeignService.getSkusHaveStock(skuIds);
+    List<SkuHasStockVo> skuHasStockVos = skusHaveStock.getData();
+    hasStockMap = skuHasStockVos.stream().collect(Collectors.toMap(SkuHasStockVo::getSkuId, SkuHasStockVo::getHasStock));
+} catch (Exception e) {
+    log.error("远程调用库存服务查询是否有库存出现异常:{}", e.getMessage());
+}
+```
+
+前置条件都完成了，现在就需要将它们赋值给 SkuEsModel。像 skuPrice、skuImg 只是名称不一样，可以直接通过前面获取到的 skuInfoEntities 中取出对应的数据然后赋值。
+而 brandName、brandImg、catalogName 则需要查询对应的表来获取。
+
+```java
+// 封装每个 sku 的信息
+Map<Long, Boolean> finalHasStockMap = hasStockMap;
+List<SkuEsModel> skuEsModels = skuInfoEntities.stream().map(sku -> {
+    // 组装需要的数据
+    SkuEsModel skuEsModel = new SkuEsModel();
+    BeanUtils.copyProperties(sku, skuEsModel);
+    // skuPrice、skuImg、hasStock、hotScore、brandName、brandImg、catalogName、attrs[]
+    skuEsModel.setSkuPrice(sku.getPrice());
+    skuEsModel.setSkuImg(sku.getSkuDefaultImg());
+
+    // TODO 热度评分，刚上架默认为 0
+    skuEsModel.setHotScore(0L);
+
+    // 查询品牌名称
+    BrandEntity brand = brandService.getById(skuEsModel.getBrandId());
+    CategoryEntity category = categoryService.getById(skuEsModel.getCatalogId());
+    skuEsModel.setBrandName(brand.getName());
+    skuEsModel.setBrandImg(brand.getLogo());
+    skuEsModel.setCatalogName(category.getName());
+
+    if (finalHasStockMap == null) {
+        // 设置库存
+        skuEsModel.setHasStock(true);
+    } else {
+        // 根据 skuId 获取 Map 集合中的 value
+        skuEsModel.setHasStock(finalHasStockMap.get(sku.getSkuId()));
+    }
+
+    // 设置 es 里的检索属性 attr，因为是同一个 spu，所以每次设置的 attr 都是一样的
+    skuEsModel.setAttrs(esAttrs);
+    return skuEsModel;
+}).collect(Collectors.toList());
+return skuEsModels;
+```
+
+****
+
+
+
+
 
 

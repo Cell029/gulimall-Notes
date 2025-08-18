@@ -5,11 +5,7 @@ import java.util.Map;
 
 import com.project.gulimall.product.domain.vo.SpuSaveVo;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.web.bind.annotation.PathVariable;
-import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RequestParam;
-import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.bind.annotation.*;
 import com.project.gulimall.product.domain.entity.SpuInfoEntity;
 import com.project.gulimall.product.service.SpuInfoService;
 import com.project.common.utils.PageUtils;
@@ -55,6 +51,15 @@ public class SpuInfoController {
     // @RequiresPermissions("product:spuinfo:save")
     public R save(@RequestBody SpuSaveVo vo){
 		spuInfoService.saveSpuInfo(vo);
+        return R.ok();
+    }
+
+    /**
+     * 商品上架
+     */
+    @PostMapping("/{spuId}/up")
+    public R spuUp(@PathVariable("spuId") Long spuId) {
+        spuInfoService.up(spuId);
         return R.ok();
     }
 
