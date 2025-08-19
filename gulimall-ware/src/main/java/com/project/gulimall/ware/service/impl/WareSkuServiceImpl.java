@@ -82,7 +82,7 @@ public class WareSkuServiceImpl extends ServiceImpl<WareSkuDao, WareSkuEntity> i
             SkuHasStockVo vo = new SkuHasStockVo();
             // 查询当前 sku 的总库存量
             // select sum(stock - stock_locked) from wms_ware_sku where sku_id = ?
-            long stock = wareSkuDao.getSkuStock(skuId);
+            Long stock = wareSkuDao.getSkuStock(skuId);
             vo.setSkuId(skuId);
             vo.setHasStock(stock > 0);
             return vo;

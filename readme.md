@@ -5547,7 +5547,7 @@ Service 层：
 
 ```java
 @Override
-public List<SkuEsModel> up(Long spuId) {
+public void up(Long spuId) {
   // 查出当前 spuId 对应的所有 sku 信息，包括 skuName
   List<SkuInfoEntity> skuInfoEntities = skuInfoService.getSkusBySpuId(spuId);
   // 获取传入的 spuId 对应的 sku 的 id 集合
@@ -5610,7 +5610,6 @@ public List<SkuEsModel> up(Long spuId) {
     skuEsModel.setAttrs(esAttrs);
     return skuEsModel;
   }).collect(Collectors.toList());
-  return skuEsModels;
 }
 ```
 
@@ -5757,7 +5756,7 @@ public List<SkuHasStockVo> getSkusHaveStock(List<Long> skuIds) {
     SkuHasStockVo vo = new SkuHasStockVo();
     // 查询当前 sku 的总库存量
     // select sum(stock - stock_locked) from wms_ware_sku where sku_id = ?
-    long stock = wareSkuDao.getSkuStock(skuId);
+    Long stock = wareSkuDao.getSkuStock(skuId);
     vo.setSkuId(skuId);
     vo.setHasStock(stock > 0);
     return vo;
@@ -5817,8 +5816,517 @@ List<SkuEsModel> skuEsModels = skuInfoEntities.stream().map(sku -> {
     skuEsModel.setAttrs(esAttrs);
     return skuEsModel;
 }).collect(Collectors.toList());
-return skuEsModels;
 ```
+
+****
+### 2.6 R<T> 泛型类的问题
+
+在上面远程调用库存服务查询是否还有库存时对 R 类进行了添加泛型的操作：
+
+```java
+public class R<T> extends HashMap<String, Object> {
+    private T data;
+    public T getData() {
+        return data;
+    }
+    public void setData(T data) {
+        this.data = data;
+    }
+    ...
+}
+```
+
+R 继承了 HashMap<String, Object>，它本身就是一个 Map，现在又让它再额外挂了一个 data 字段，可是在构造返回结果的时候，并没有把 data 字段放到 HashMap 里，
+只是单独调用了 ok.setData(vos)。
+
+```java
+@GetMapping("/haveStock")
+public R<List<SkuHasStockVo>> getSkusHaveStock(@RequestBody List<Long> skuIds){
+    List<SkuHasStockVo> vos = wareSkuService.getSkusHaveStock(skuIds);
+    R<List<SkuHasStockVo>> ok = R.ok();
+    ok.setData(vos);
+    return ok;
+}
+```
+
+在远程调用时，Feign 会把返回的 JSON 反序列化成 R 对象。比如返回 JSON 可能是这样的：
+
+```json
+{
+  "code": 0,
+  "msg": "success",
+  "data": [
+    { "skuId": 1, "hasStock": true },
+    { "skuId": 2, "hasStock": false }
+  ]
+}
+```
+
+但是此时 R 类本质是一个 HashMap，当 Controller 返回 R 时，Spring/Jackson 会把它当成一个 Map 来序列化（因为继承了 HashMap），此时只会把 Map 里的键值对写进 JSON；
+对于单独的 data 字段，默认是不会写进去的。到了 Feign 客户端反序列化时，Jackson 也会把响应当成 Map 来解析（因为类型实现了 Map）。如果响应里真的有 "data" 字段，
+它会被放进这个 Map 的键 "data" 下； 但它不会去调用 setData 给那个私有字段赋值。所以拿到的 r.get("data") 是一个 List<LinkedHashMap>，而不是 List<SkuHasStockVo>。
+
+```java
+public class R extends HashMap<String, Object> {
+
+    public <T> T getData(TypeReference<T> typeReference) {
+        Object data = get("data"); // data 默认为 Map 类型
+        String jsonString = JSON.toJSONString(data); // 先转 JSON
+        T t = JSON.parseObject(jsonString, typeReference); // 再反序列化为指定类型
+        return t;
+    }
+
+    public R setData(Object data) {
+        this.put("data", data);
+        return this;
+    }
+    ...
+}
+```
+
+上面有说到 Feign/Jackson 反序列化时只会把 JSON 映射到 Map 里，所以可以在它反序列化后先重新转换成 JSON，再用 JSON.parseObject 和 TypeReference<T> 指定目标类型反序列化。
+而 Java 的泛型有类型擦除机制，如果使用普同的泛型进行反序列化，那在运行时就会发生擦除，导致无法被序列化成想要的类型，所以要用到 TypeReference<T>，它可以保留泛型参数信息，
+让 FastJSON 正确反序列化。
+
+这种二次序列化的做法可以让第一次序列化时获得的 List<LinkedHashMap> 转成纯 JSON 字符串，然后明确告诉 FastJSON 需要返回一个指定类型的 List<...>，
+此时就能用反射把 JSON 解析成真正的 SkuHasStockVo 对象。所以获取是否还有库存的代码应该修改成：
+
+```java
+Map<Long, Boolean> hasStockMap = null;
+try {
+    // 远程调用库存系统查询是否有库存
+    R r = wareFeignService.getSkusHaveStock(skuIds);
+    // 受保护的对象，要写成内部类的形式
+    TypeReference<List<SkuHasStockVo>> typeReference = new TypeReference<>() {
+    };
+    hasStockMap = r.getData(typeReference).stream().collect(Collectors.toMap(SkuHasStockVo::getSkuId, SkuHasStockVo::getHasStock));
+} catch (Exception e) {
+    log.error("远程调用库存服务查询是否有库存出现异常:{}", e.getMessage());
+}
+```
+
+### 2.5 将数据发送给 es 进行保存
+
+product 服务 Service 层：
+
+远程调用 search 服务上传数据到 es，然后根据返回码结果修改 spu 的状态。
+
+```java
+@Override
+public void up(Long spuId) {
+    ...
+    R r = searchFeignService.productStatusUp(skuEsModels);
+    if (r.getCode() == 0) {
+        // 成功，修改当前 spu 的状态为上架
+        spuInfoDao.updateSpuStatus(spuId, ProductConstant.StatusEnum.SPU_UP.getCode());
+    } else {
+        // 失败
+    }
+}
+```
+
+search 服务 Controller 层：
+
+这里接收的不是来自前端的数据，而是 product 服务远程发送的数据，当接收到 service 层返回的结果为 true 时证明保存数据到 es 客户端失败，需要响应错误信息给前端，
+为 false 即没有发生错误。
+
+```java
+@PostMapping("/product")
+public R productStatusUp(@RequestBody List<SkuEsModel> skuEsModels) {
+    boolean b = false;
+    try {
+        b = productSaveService.productStatusUp(skuEsModels);
+    } catch (IOException e) {
+        log.error("ElasticSaveController 商品上架功能异常:{}", e.getMessage());
+        return R.error(BizCodeEnum.PRODUCT_UP_EXCEPTION.getCode(), BizCodeEnum.PRODUCT_UP_EXCEPTION.getMsg());
+    }
+    if (!b) {
+        return R.ok();
+    } else {
+        return R.error(BizCodeEnum.PRODUCT_UP_EXCEPTION.getCode(), BizCodeEnum.PRODUCT_UP_EXCEPTION.getMsg());
+    }
+}
+```
+
+Service 层：
+
+因为接收到的 sku 可能会有多条，所以需要用到批量操作，而批量操作的本质还是调用多条操作指令，所以这里还是要遍历每个 es 模型数据，然后给每条数据赋值 id 为 skuId，
+存储的对象转换为 JSON 后发送给 es 客户端。在返回对象 BulkResponse 里有个方法可以查看操作是否成功（bulk.hasFailures()），当它返回 true 的时候就是发生错误，
+此时就需要记录日志，而用一个 boolean 值接收并返回，在 Controller 层进行判断返回给前端具体的信息。
+
+```java
+@Override
+public boolean productStatusUp(List<SkuEsModel> skuEsModels) throws IOException {
+    // 保存到 es
+    BulkRequest bulkRequest = new BulkRequest();
+    // 构造批量保存的请求
+    for (SkuEsModel skuEsModel : skuEsModels) {
+        IndexRequest indexRequest = new IndexRequest(EsConstant.PRODUCT_INDEX);
+        indexRequest.id(skuEsModel.getSkuId().toString());
+        String skuEsModelJson = JSON.toJSONString(skuEsModel);
+        indexRequest.source(skuEsModelJson, XContentType.JSON);
+        bulkRequest.add(indexRequest);
+    }
+
+    BulkResponse bulk  = restHighLevelClient.bulk(bulkRequest, RequestOptions.DEFAULT);
+    boolean b = false;
+    if (bulk != null) {
+        // 如果发生错误，b 就变为 true
+        b = bulk.hasFailures();
+        List<String> bulkItemIds = Arrays.stream(bulk.getItems()).map(BulkItemResponse::getId).collect(Collectors.toList());
+        log.info("商品上架 es 完成：{}", bulkItemIds);
+    }
+    return b;
+}
+```
+
+****
+## 3. 首页渲染三级分类
+
+### 3.1 查询一级分类
+
+Controller 层：
+
+这里是发送 / 和 /index.html 请求路径时跳转到本服务的 classpath:/templates/index.html 页面。通过 Service 获取到所有的一级分类，然后通过 Model 视图存入域中。
+这里在 product 服务中引入了商城页面，所以在 Controller 层返回数据时直接进行请求跳转即可，数据则存入请求域中。
+
+```java
+@GetMapping({"/", "/index.html"})
+public String indexPage(Model model) {
+    // 查出所有的一级分类
+    List<CategoryEntity> categoryEntities = categoryService.getLevel1Categories();
+    model.addAttribute("categoryEntities", categoryEntities);
+    // 默认前缀 classpath:/templates/
+    // 默认后缀 .html
+    return "index";
+}
+```
+
+Service 层：
+
+```java
+@Override
+public List<CategoryEntity> getLevel1Categories() {
+    return categoryDao.selectList(new LambdaQueryWrapper<CategoryEntity>().eq(CategoryEntity::getParentCid, 0));
+}
+```
+
+在 html 页面则通过域来获取数据。
+
+```html
+<div class="header_main_left">
+  <ul>
+    <li th:each="category:${categoryEntities}">
+      <a href="#" class="header_main_left_a" th:attr="ctg-data=${category.catId}"><b th:text="${category.name}"></b></a>
+    </li>
+  </ul>
+</div>
+```
+
+****
+### 3.2 查询二、三级分类
+
+在前端页面用于展示三级分类的具体结构如下，它里面有四个字段，一个用于记录一级分类的 id，一个记录三级分类的结构，一个记录当前分类的 id，一个记录当前分类的名字。从这个结构可以看出，
+它是二级分类的结构，所以在处理这些数据的时候，就可以参考它创建一个二级分类的对象，接收传递数据。
+
+```json
+"1": [
+  {
+    "catalog1Id": "1",
+    "catalog3List": [
+      {
+      "catalog2Id": "22",
+      "id": "165",
+      "name": "电子书"
+      },
+    ],
+    "id": "22",
+    "name": "电子书刊"    
+  }
+]
+```
+
+创建一个 Vo 对象用于接收管理前端需要的数据结构，这里给每个字段的名称需要和前端获取的一致：
+
+```java
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+public class Catalog2Vo { // 2 级分类 vo
+    private String catalog1Id; // 1 级父分类 id
+    private List<Catalog3Vo> catalog3List; // 3 级子分类
+    private String id;
+    private String name;
+
+    @Data
+    @AllArgsConstructor
+    @NoArgsConstructor
+    public static class Catalog3Vo { // 3 级分类 vo
+        private String catalog2Id; // 2 级父分类 id
+        private String id;
+        private String name;
+    }
+}
+```
+
+Controller 层：
+
+这里选择返回一个 Map 集合，用一级分类的 id 作为 key，二级分类的结构作为 value，这种结构整合符合前端的需要。
+
+```java
+@ResponseBody
+@GetMapping("index/catalog.json")
+public Map<String, List<Catalog2Vo>> getCatalogJson() {
+    Map<String, List<Catalog2Vo>> catalogJson = categoryService.getCatalogJson();
+    return catalogJson;
+}
+```
+
+Service 层：
+
+```java
+@Override
+public Map<String, List<Catalog2Vo>> getCatalogJson() {
+    // 1. 查出所有一级分类
+    List<CategoryEntity> level1Categories = getLevel1Categories();
+    // 2. 封装数据
+    Map<String, List<Catalog2Vo>> collect = level1Categories.stream().collect(Collectors.toMap(level1Category -> {
+        return level1Category.getCatId().toString();
+    }, level1Category -> {
+        // 查询此一级分类的所有二级分类
+        List<CategoryEntity> category2Entities = categoryDao.selectList(
+                // select * from category where parent_cid = 一级分类的cat_id
+                new LambdaQueryWrapper<CategoryEntity>().eq(CategoryEntity::getParentCid, level1Category.getCatId())
+        );
+        List<Catalog2Vo> catelog2Vos = null;
+        if (!category2Entities.isEmpty()) {
+            catelog2Vos = category2Entities.stream().map(category2Entity -> {
+                Catalog2Vo catelog2Vo = new Catalog2Vo(
+                        level1Category.getCatId().toString(),
+                        null,
+                        category2Entity.getCatId().toString(),
+                        category2Entity.getName()
+                );
+                // 找三级分类
+                List<CategoryEntity> category3Entities = categoryDao.selectList(new LambdaQueryWrapper<CategoryEntity>().eq(CategoryEntity::getParentCid, category2Entity.getCatId()));
+                if (!category3Entities.isEmpty()) {
+                    List<Catalog2Vo.Catalog3Vo> catelog3Vos = category3Entities.stream().map(category3Entity -> {
+                        Catalog2Vo.Catalog3Vo catelog3Vo = new Catalog2Vo.Catalog3Vo(
+                                category2Entity.getCatId().toString(),
+                                category3Entity.getCatId().toString(),
+                                category3Entity.getName()
+                        );
+                        return catelog3Vo;
+                    }).collect(Collectors.toList());
+                    catelog2Vo.setCatalog3List(catelog3Vos);
+                }
+                return catelog2Vo;
+            }).collect(Collectors.toList());
+        }
+        if (catelog2Vos != null && !catelog2Vos.isEmpty()) {
+            return catelog2Vos;
+        } else {
+            return Collections.emptyList();
+        }
+    }));
+    return collect;
+}
+```
+
+因为是要封装成一个 Map 集合的形式，但实际查出的一级分类的数据是一个 List，所以需要对它进行转型，全部转换成 Map，然后封装它的 key 和 value：
+
+```java
+Map<String, List<Catalog2Vo>> collect = level1Categories.stream().collect(Collectors.toMap(level1Category -> {
+    return level1Category.getCatId().toString();
+}, level1Category -> {
+    ...
+}));
+```
+
+这里就是先获取一级分类的 id 作为 key，不过在执行转换前就已经获取了所有的一级分类，所以这里直接通过查出的对象集合挨个获取 id 即可。复杂的是封装二级分类结构。
+
+```java
+level1Category -> {
+    // 查询此一级分类的所有二级分类
+    List<CategoryEntity> category2Entities = categoryDao.selectList(
+            // select * from category where parent_cid = 一级分类的cat_id
+            new LambdaQueryWrapper<CategoryEntity>().eq(CategoryEntity::getParentCid, level1Category.getCatId())
+    );
+    List<Catalog2Vo> catelog2Vos = null;
+    if (!category2Entities.isEmpty()) {
+        catelog2Vos = category2Entities.stream().map(category2Entity -> {
+            Catalog2Vo catelog2Vo = new Catalog2Vo(
+                    level1Category.getCatId().toString(),
+                    null,
+                    category2Entity.getCatId().toString(),
+                    category2Entity.getName()
+            );
+            ...
+        }).collect(Collectors.toList());
+    }
+    if (catelog2Vos != null && !catelog2Vos.isEmpty()) {
+        return catelog2Vos;
+    } else {
+        return Collections.emptyList();
+    }
+}
+```
+
+因为是对查出的一级分类的集合进行转换，所以通过 Stream 获取到的流中的每个对象都是一个一级分类的 CategoryEntity 对象，如果想要获取二级分类 id，就需要查找那些 catId 等于一级分类 id 的数据，
+也就是代码中写的：
+
+```java
+new LambdaQueryWrapper<CategoryEntity>().eq(CategoryEntity::getParentCid, level1Category.getCatId())
+```
+
+获取到二级分类后，就需要遍历它给手动创建的 Catalog2Vo 对象赋值，参照对象结构：第一个参数填写一级分类 id，也就是 level1Category 对象的 catId；
+第二个参数填写三级分类集合，这里先写 null；第三个参数填写二级分类的 id，也就是 category2Entity 的 catId；第三个参数填写二级分类的名称，也就是 category2Entity 的 name。
+数据都获取完毕后，这个二级分类就作为 Map 集合的 value 而存在了。
+
+```java
+// 找三级分类
+List<CategoryEntity> category3Entities = categoryDao.selectList(new LambdaQueryWrapper<CategoryEntity>().eq(CategoryEntity::getParentCid, category2Entity.getCatId()));
+if (!category3Entities.isEmpty()) {
+    List<Catalog2Vo.Catalog3Vo> catelog3Vos = category3Entities.stream().map(category3Entity -> {
+        Catalog2Vo.Catalog3Vo catelog3Vo = new Catalog2Vo.Catalog3Vo(
+                category2Entity.getCatId().toString(),
+                category3Entity.getCatId().toString(),
+                category3Entity.getName()
+        );
+        return catelog3Vo;
+    }).collect(Collectors.toList());
+    catelog2Vo.setCatalog3List(catelog3Vos);
+}
+return catelog2Vo;
+```
+
+关于三级分类集合的获取，其实和获取二级分类时类似，查找那些父类 id 为二级分类的 catId 的对象就好了，也就是代码中的：
+
+```java
+new LambdaQueryWrapper<CategoryEntity>().eq(CategoryEntity::getParentCid, category2Entity.getCatId())
+```
+
+然后对照填写属性：第一个为二级分类的 id，也就是 category2Entity 的 catId；第二个为当前分类的 id，也就是 category3Entity 的 catId；最后一个就是当前分类的名称，
+也就是 category3Entity 的 name。
+
+****
+## 4. 搭建 nginx 
+
+### 4.1 正向代理和反向代理
+
+1、正向代理
+
+正向代理是位于客户端（例如本机的浏览器）和目标服务器（如 Google）之间的一个服务器。客户端会将自己的请求先发送给这个代理服务器，由代理服务器去访问目标服务器，
+然后将结果返回给客户端。
+
+流程：
+
+1. 客户端（浏览器）明确配置要使用代理服务器（例如设置代理IP和端口）。 
+2. 客户端发起对 www.google.com 的请求。 
+3. 这个请求被直接发送到正向代理服务器。 
+4. 正向代理服务器代表客户端，向 www.google.com 发起请求。
+5. www.google.com 将响应返回给正向代理服务器。Google 看到的是代理服务器的IP，而不是客户端的真实IP。 
+6. 正向代理服务器将响应返回给客户端。
+
+2、反向代理
+
+反向代理是位于目标服务器和客户端之间的一个服务器。客户端直接访问反向代理，反向代理接收请求后，会将请求转发给内部网络中的一台或多台服务器（真正的处理者），
+并将从服务器得到的结果返回给客户端。
+
+流程：
+
+1. 客户端发起对 www.example.com 的请求。 
+2. DNS 解析将 www.example.com 指向反向代理服务器的IP地址。 
+3. 反向代理服务器接收请求。 
+4. 反向代理根据预设的规则（负载均衡策略、请求内容等），将请求转发到内部网络中的某台真实服务器（也叫后端服务器）。 
+5. 真实服务器处理请求，并将响应返回给反向代理。 
+6. 反向代理将响应最终返回给客户端。
+
+### 4.2 安装 nginx
+
+1、创建宿主机目录，准备将 Nginx 容器里的配置文件、静态资源、日志，全部挂载到宿主机目录
+
+```shell
+# 创建宿主机目录
+mkdir -p /nginx/conf
+mkdir -p /nginx/conf.d
+mkdir -p /nginx/html
+mkdir -p /nginx/logs
+```
+
+2、拷贝 Nginx 容器的默认配置出来，相当于把容器里的 nginx.conf 和 default.conf 拷贝到宿主机，作为初始配置
+
+```shell
+# 拷贝主配置
+docker run --rm nginx cat /etc/nginx/nginx.conf > /nginx/conf/nginx.conf
+
+# 如果有 default.conf 就拷贝出来
+docker run --rm nginx cat /etc/nginx/conf.d/default.conf > /nginx/conf.d/default.conf
+```
+
+3、运行时挂载目录
+
+```shell
+docker run -d \
+  -p 80:80 \
+  -v /nginx/conf/nginx.conf:/etc/nginx/nginx.conf \
+  -v /nginx/conf.d:/etc/nginx/conf.d \
+  -v /nginx/html:/usr/share/nginx/html \
+  -v /nginx/logs:/var/log/nginx \
+  --name nginx \
+  nginx
+```
+
+****
+### 4.3 使用 nginx 访问
+
+通过上面的安装后，可以查看一下 /nginx/conf.d/default.conf 文件，就是在这里面进行一些反向代理，例如现在要把本地 SpringBoot 的 10000 端口代理到 nginx，就需要：
+
+```shell
+server {
+    listen       80;
+    listen  [::]:80;
+    server_name  localhost;
+    location / {
+        proxy_pass http://host.docker.internal:10000;
+    }
+}
+```
+
+注意这里的 ip 地址不能写 127.0.0.1，因为在 Docker 容器中 127.0.0.1 指向的是容器自身的网络空间而不是宿主机，如果配置的是 127.0.0.1：10000 的话，
+Nginx 会尝试访问容器内部的 10000 端口，但 Spring Boot 服务不是运行在容器内，因此会提示 “连接失败”。在 WSL2 + Docker Desktop 环境中，
+Docker 专门提供了 host.docker.internal 这个特殊域名，用于容器访问宿主机。配置成功后访问 localhost 可以直接进入 10000 端口。
+
+不过通常情况下会启用多个服务，所以它们会有多个端口，如果直接使用 nginx 反向代理到它们的话就需要配置多个端口地址，如果直接让 nginx 反向代理到网关，那就可以让网关动用它的负载均衡能力，
+只需要告知服务名即可负载访问多个端口的服务，修改 nginx：
+
+```shell
+server {
+    listen       80;
+    listen  [::]:80;
+    server_name  localhost;
+    location / {
+        proxy_pass http://host.docker.internal:88;
+    }
+}
+```
+
+为网关配置监听 nginx 请求路径：
+
+```yaml
+spring:
+  cloud:
+    gateway:
+      routes:
+        ...
+        - id: nginx_route
+          uri: lb://gulimall-product
+          predicates:
+            - Path=/**
+```
+
+需要注意的是，这个 nginx 的监听路径要写在所有的网关路由下面，否则有关 localhost 的请求路径都会转发到 gulimall-product 服务，也就是说，只要是 localhost 的请求，
+就一定会经过 nginx 反向代理。
 
 ****
 

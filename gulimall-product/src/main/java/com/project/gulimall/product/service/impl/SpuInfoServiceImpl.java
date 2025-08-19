@@ -1,5 +1,7 @@
 package com.project.gulimall.product.service.impl;
 
+import com.alibaba.fastjson.TypeReference;
+import com.project.common.constant.ProductConstant;
 import com.project.common.to.SkuReductionTo;
 import com.project.common.to.SpuBoundsTo;
 import com.project.common.to.es.SkuEsModel;
@@ -8,6 +10,7 @@ import com.project.gulimall.product.dao.SpuInfoDescDao;
 import com.project.gulimall.product.domain.entity.*;
 import com.project.gulimall.product.domain.vo.*;
 import com.project.gulimall.product.feign.CouponFeignService;
+import com.project.gulimall.product.feign.SearchFeignService;
 import com.project.gulimall.product.feign.WareFeignService;
 import com.project.gulimall.product.service.*;
 import lombok.extern.slf4j.Slf4j;
@@ -54,6 +57,8 @@ public class SpuInfoServiceImpl extends ServiceImpl<SpuInfoDao, SpuInfoEntity> i
     private CategoryService categoryService;
     @Autowired
     private WareFeignService wareFeignService;
+    @Autowired
+    private SearchFeignService searchFeignService;
 
     @Override
     public PageUtils queryPage(Map<String, Object> params) {
@@ -221,7 +226,7 @@ public class SpuInfoServiceImpl extends ServiceImpl<SpuInfoDao, SpuInfoEntity> i
     }
 
     @Override
-    public List<SkuEsModel> up(Long spuId) {
+    public void up(Long spuId) {
         // 查出当前 spuId 对应的所有 sku 信息，包括 skuName
         List<SkuInfoEntity> skuInfoEntities = skuInfoService.getSkusBySpuId(spuId);
         // 获取传入的 spuId 对应的 sku 的 id 集合
@@ -246,9 +251,11 @@ public class SpuInfoServiceImpl extends ServiceImpl<SpuInfoDao, SpuInfoEntity> i
         Map<Long, Boolean> hasStockMap = null;
         try {
             // 远程调用库存系统查询是否有库存
-            R<List<SkuHasStockVo>> skusHaveStock = wareFeignService.getSkusHaveStock(skuIds);
-            List<SkuHasStockVo> skuHasStockVos = skusHaveStock.getData();
-            hasStockMap = skuHasStockVos.stream().collect(Collectors.toMap(SkuHasStockVo::getSkuId, SkuHasStockVo::getHasStock));
+            R r = wareFeignService.getSkusHaveStock(skuIds);
+            // 受保护的对象，要写成内部类的形式
+            TypeReference<List<SkuHasStockVo>> typeReference = new TypeReference<>() {
+            };
+            hasStockMap = r.getData(typeReference).stream().collect(Collectors.toMap(SkuHasStockVo::getSkuId, SkuHasStockVo::getHasStock));
         } catch (Exception e) {
             log.error("远程调用库存服务查询是否有库存出现异常:{}", e.getMessage());
         }
@@ -284,7 +291,13 @@ public class SpuInfoServiceImpl extends ServiceImpl<SpuInfoDao, SpuInfoEntity> i
             skuEsModel.setAttrs(esAttrs);
             return skuEsModel;
         }).collect(Collectors.toList());
-        return skuEsModels;
+        R r = searchFeignService.productStatusUp(skuEsModels);
+        if (r.getCode() == 0) {
+            // 成功，修改当前 spu 的状态为上架
+            spuInfoDao.updateSpuStatus(spuId, ProductConstant.StatusEnum.SPU_UP.getCode());
+        } else {
+            // 失败
+        }
     }
 
 

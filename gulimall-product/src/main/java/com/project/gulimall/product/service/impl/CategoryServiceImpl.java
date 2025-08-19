@@ -1,14 +1,13 @@
 package com.project.gulimall.product.service.impl;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.project.gulimall.product.domain.vo.Catalog2Vo;
 import com.project.gulimall.product.service.CategoryBrandRelationService;
 import org.apache.commons.lang.StringUtils;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
-
 import java.util.*;
 import java.util.stream.Collectors;
-
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.baomidou.mybatisplus.core.metadata.IPage;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
@@ -82,6 +81,59 @@ public class CategoryServiceImpl extends ServiceImpl<CategoryDao, CategoryEntity
         if (!StringUtils.isEmpty(category.getName())) {
             categoryBrandRelationService.updateCategory(category.getCatId(), category.getName());
         }
+    }
+
+    @Override
+    public List<CategoryEntity> getLevel1Categories() {
+        return categoryDao.selectList(new LambdaQueryWrapper<CategoryEntity>().eq(CategoryEntity::getParentCid, 0));
+    }
+
+    @Override
+    public Map<String, List<Catalog2Vo>> getCatalogJson() {
+        // 1. 查出所有一级分类
+        List<CategoryEntity> level1Categories = getLevel1Categories();
+        // 2. 封装数据
+        Map<String, List<Catalog2Vo>> collect = level1Categories.stream().collect(
+                Collectors.toMap(level1Category -> {
+            return level1Category.getCatId().toString();
+        }, level1Category -> {
+            // 查询此一级分类的所有二级分类
+            List<CategoryEntity> category2Entities = categoryDao.selectList(
+                    // select * from category where parent_cid = 一级分类的cat_id
+                    new LambdaQueryWrapper<CategoryEntity>().eq(CategoryEntity::getParentCid, level1Category.getCatId())
+            );
+            List<Catalog2Vo> catelog2Vos = null;
+            if (!category2Entities.isEmpty()) {
+                catelog2Vos = category2Entities.stream().map(category2Entity -> {
+                    Catalog2Vo catelog2Vo = new Catalog2Vo(
+                            level1Category.getCatId().toString(),
+                            null,
+                            category2Entity.getCatId().toString(),
+                            category2Entity.getName()
+                    );
+                    // 找三级分类
+                    List<CategoryEntity> category3Entities = categoryDao.selectList(new LambdaQueryWrapper<CategoryEntity>().eq(CategoryEntity::getParentCid, category2Entity.getCatId()));
+                    if (!category3Entities.isEmpty()) {
+                        List<Catalog2Vo.Catalog3Vo> catelog3Vos = category3Entities.stream().map(category3Entity -> {
+                            Catalog2Vo.Catalog3Vo catelog3Vo = new Catalog2Vo.Catalog3Vo(
+                                    category2Entity.getCatId().toString(),
+                                    category3Entity.getCatId().toString(),
+                                    category3Entity.getName()
+                            );
+                            return catelog3Vo;
+                        }).collect(Collectors.toList());
+                        catelog2Vo.setCatalog3List(catelog3Vos);
+                    }
+                    return catelog2Vo;
+                }).collect(Collectors.toList());
+            }
+            if (catelog2Vos != null && !catelog2Vos.isEmpty()) {
+                return catelog2Vos;
+            } else {
+                return Collections.emptyList();
+            }
+        }));
+        return collect;
     }
 
 
