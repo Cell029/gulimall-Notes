@@ -6329,8 +6329,544 @@ spring:
 就一定会经过 nginx 反向代理。
 
 ****
+## 5. 性能压测
 
+压力测试考察当前软硬件环境下系统所能承受的最大负荷并帮助找出系统瓶颈所在，压力测试都是为了系统在线上的处理能力和稳定性维持在一个标准范围内。
 
+### 5.1 性能指标
+
+1、响应时间
+
+指用户发出请求到接收到响应的总时间，常用统计：
+
+- 平均响应时间 
+- P95 响应时间（95% 请求的响应时间不超过某值） 
+- P99 响应时间（99% 请求的响应时间不超过某值）
+- 例如：电商网站下单接口，平均 300ms，P95 800ms，P99 1.5s。
+
+2、吞吐量
+
+指单位时间内系统处理的请求数。单位：TPS（Transactions Per Second，每秒事务次数）、RPS（Requests Per Second，每秒请求数）、QPS（Queries Per Second，每秒处理查询次数）。
+对于互联网业务中，如果某些业务有且仅有一个请求连接，那么 TPS=RPS=QPS，一般情况下用 TPS 来衡量整个业务流程，用 QPS 来衡量接口查询次数，用 RPS 来衡量对服务器的请求数。
+一个事务 (Transaction) = 多个请求 (Request)；一个请求 (Request) = 多个查询 (Query)。因此：
+
+- TPS 粒度最大，强调业务流程（如下单）
+- RPS 粒度中等，强调接口层面的请求数
+- QPS 粒度最细，强调数据库/搜索引擎的查询数
+
+3、并发用户数
+
+同一时刻活跃的用户数。而并发连接数是指一个用户可能打开多个页面或发多个请求。
+
+4、错误率
+
+指请求失败的比例。
+
+5、吞吐-响应时间曲线
+
+正常情况：随着并发量增加，吞吐量线性上升，响应时间保持稳定。当达到瓶颈后：吞吐量不再上升，响应时间急剧增加，错误率升高（这个点就是性能拐点）。
+
+****
+### 5.2 Jmeter 压力测试
+
+Apache JMeter 是 Apache 基金会出品的开源性能测试工具，最初用于 Web 测试，现在已支持多种测试：
+
+- Web (HTTP/HTTPS)
+- FTP 
+- JDBC (数据库)
+- SOAP/REST API 
+- JMS (消息)
+- TCP、SMTP、POP3 等协议
+
+但其本质是 JMeter 通过模拟并发用户请求，来测试系统的性能和稳定性。在官网下载并解压好后找到 jmeter.bat 双击启动即可。在 JMeter 中：
+
+- 一个线程就是一个虚拟用户，一个线程能模拟用户从发请求 -> 等响应 -> 再发下一个请求的全过程。
+- 线程组就是线程的集合，用于控制压测规模，可以设置：线程数（并发用户数）、Ramp-Up 时间（多久启动完所有线程）、循环次数（每个线程执行请求的次数）。例如：线程数=100，Ramp-Up=10s，循环次数=5，表示在 10 秒内启动 100 个用户，每个用户执行 5 次请求。
+- 采样器则是具体的请求动作。比如一个 HTTP Sampler 就代表一次 HTTP 请求。
+- 监听器用于收集和展示测试结果，如表格、图形、日志。
+- 逻辑控制器用于控制请求的执行逻辑，如顺序、循环、条件。
+
+一个典型的 Jmeter 压力测试脚本结构：
+
+```scss
+测试计划 (Test Plan)
+ └── 线程组 (Thread Group)
+      ├── HTTP请求默认值 (配置元件)
+      ├── HTTP请求 (Sampler)
+      ├── CSV 数据文件 (参数化)
+      ├── 定时器 (控制请求间隔)
+      └── 监听器 (结果收集)
+```
+
+****
+### 5.3 jvisualvm
+
+在 JDK 8 以前，jvisualvm 是自带的，可以在命令窗口输入 jvisualvm 直接访问，但后面的版本就不再自带了，就需要取官网手动安装。它是一个基于 JDK Attach/JMX 的 Java 进程观察与分析工具，
+适合排查性能与稳定性问题。只要本地启动了进程，那么就可以监控到，例如 CPU、堆内存、类加载、线程、GC 活动曲线（需下载 GC 插件，直观观察年轻代/老年代/幸存区变化）。
+
+****
+### 5.4 中间件对性能的影响
+
+中间件是介于客户端与后端服务之间的软件层，负责处理路由转发、负载均衡、安全验证、缓存、日志等核心功能（如 Nginx、网关、Redis、Kafka 等）。它们对系统性能的影响是双向的：
+既能通过优化流量分配、减少重复计算等提升整体性能，也可能因额外的处理逻辑、网络跳转等引入性能损耗。
+
+1、反向代理 / 网关类中间件（如 Nginx、Spring Cloud Gateway）
+
+这类中间件是请求进入系统的入口，负责请求转发、负载均衡、鉴权等，对性能的影响体现在延迟、吞吐量、资源占用三个维度。
+
+- 网络延迟增加：
+
+客户端请求需先经过中间件，再转发到后端服务，多一次网络跳转（从客户端 -> 服务变为客户端 -> 中间件 -> 服务）。即使中间件与服务部署在同一台设备，单次转发也可能增加 0.1~1ms 的延迟（取决于网络环境）；
+跨设备署时，延迟可能增至 10~100ms。例如 Nginx 反向代理时，需解析请求头、匹配路由规则，再建立与后端服务的 TCP 连接，这些操作都会消耗时间。
+
+- 计算资源消耗：
+
+中间件需处理请求解析（如 HTTP 头、参数）、路由匹配（正则表达式、路径匹配）、负载均衡算法（轮询、哈希、权重计算）等逻辑，会占用 CPU 和内存。
+
+  - 高并发场景下（如每秒 10 万条请求），Nginx 的 CPU 使用率可能从 0% 飙升至 50% 以上
+  - 网关若开启复杂功能（如 JWT 鉴权、请求加密 / 解密），单请求处理时间可能增加1~5ms，直接降低吞吐量
+
+- 连接数压力：
+
+中间件需同时维护与客户端、后端服务的连接。若客户端使用短连接（如 HTTP/1.1 无 keep-alive，一次通信完成就断开的网络连接），中间件会频繁创建与关闭连接，
+导致等待状态的连接堆积，占用系统端口资源，最终限制并发量。
+
+虽然中间件越多造成的性能损耗越多，但这些中间件的正面优化通常是更高的，所以合理搭配使用时反而能提高系统的工作效率。
+
+****
+### 5.5 代码对性能的影响
+
+1、算法的影响
+
+算法的执行时间随数据量增长的趋势（如 O (1)、O (log n)、O (n)、O (n²)），在业务初期数据量小时，低效算法（如嵌套循环）可能表现正常，
+但随着数据增长（如用户量从 1 万到 100 万），性能会突然崩溃。若空间复杂度高（如 O (n²)），会导致内存占用激增，触发频繁 GC（垃圾回收），甚至 OOM（内存溢出）。
+
+2、数据结构的选择
+
+不同数据结构的操作效率（查询、插入、删除）差异显著，需根据业务场景匹配，例如：
+
+- ArrayList 和 LinkedList：
+
+ArrayList 基于数组，访问（get(index)）效率高（O (1)），但插入与删除中间元素需移动数据（O (n)）；LinkedList 基于链表，插入、删除中间元素效率高（O (1)，只需修改指针），
+但访问则需遍历整个链表（O (n)）。
+
+- HashMap 和 TreeMap：
+
+HashMap 查询、插入效率高（O (1)，基于哈希），但整体无序；TreeMap 基于红黑树，查询、插入效率为 O (log n)，但支持有序遍历。
+
+3、IO 操作
+
+IO 操作（磁盘 IO、网络 IO、数据库 IO）是代码性能的主要瓶颈，而 CPU 的速度（纳秒级）远快于 IO 速度（毫秒级，差距约 10^6 倍），所以代码中对 IO 的处理方式可以直接决定性能上限。
+
+4、并发处理
+
+服务通常通过多线程提升并发能力，但代码中对线程、锁的处理不当，会导致并发降低性能。所以需要合理配置线程池与锁的使用。
+
+5、内存管理
+
+代码中对内存的使用方式，会影响 JVM 的垃圾回收效率，严重时甚至导致内存泄漏。例如频繁创建短生命周期的大对象，这就会导致年轻代（Young GC）频繁触发（每几秒一次），
+每次 GC 会暂停线程，累积延迟影响用户体验。而无用对象未被及时回收时，它会持续占用内存，最终导致内存不够实用而发生泄露。
+
+****
+### 5.6 nginx 优化之动静分离
+
+核心思想就是将静态资源和动态资源的请求分开处理，让 nginx 专注于静态资源，后端服务器处理动态请求，从而提升性能和并发能力。Nginx 擅长高并发静态文件的访问，不用启动应用服务器或查询数据库就可以获取静态资源。
+后端服务器只需要处理动态请求，这样就可以降低很多压力。Nginx 可以通过 location 匹配规则将不同类型的请求转发到不同的处理方式：
+
+1. 静态资源请求 -> Nginx 本地目录或缓存 
+2. 动态请求 -> 后端应用服务器（如 Tomcat、Node.js、PHP-FPM）
+
+例如：
+
+```shell
+http://localhost/index.html -> 静态文件
+http://localhost/api/getUser -> 动态接口
+```
+
+Nginx 会根据请求路径或文件后缀判断请求类型，静态资源直接读取磁盘或缓存返回。动态资源通过 proxy_pass 转发到后端服务器。可以将 product 服务中的 index 静态资源放进 nginx 容器中，
+然后设置一个 location 的请求路径，例如 location  /static，那么访问 localhost/static 的时候就会查找里面填写的路径：
+
+```shell
+location /static/ {
+    root /usr/share/nginx/html;
+}
+```
+
+1、先把本地的静态资源拷贝进 nginx 挂载的宿主机目录
+
+```shell
+cp -r /mnt/d/docker_dataMountDirectory/gulimall-product/index /nginx/html/static/
+```
+
+2、修改 default.conf 文件，配置静态资源路径
+
+```shell
+location /static/ {
+    root    /usr/share/nginx/html;
+}
+```
+
+因为 nginx 挂载到了本地，所以访问以上路径的时候其实就是访问挂载到本地的那个 html 目录。
+
+3、将 product 服务中的 index.html 中的 index 路径修改为 /static/index
+
+当启动 product 服务时，页面会跳转到 index.html 页面，该页面会通过发送 /static/index/... 请求取寻找静态资源，而此时的静态资源全部放入了 nginx 且也配置了反向代理，
+所以会直接在 nginx 中进行查找。
+
+****
+### 5.7 三级分类数据获取的优化
+
+在原先的查询三级分类功能中写的代码是一种不断嵌套查询数据库获取数据的方法，这种写法就会导致与数据库进行多次交互，这就会导致性能较差。
+
+```java
+// 一级分类循环
+for (CategoryEntity level1Category : level1Categories) {
+    // 查询二级分类
+    List<CategoryEntity> category2Entities = categoryDao.selectList(
+            new LambdaQueryWrapper<CategoryEntity>().eq(CategoryEntity::getParentCid, level1Category.getCatId())
+    );
+    
+    // 二级分类循环
+    for (CategoryEntity category2Entity : category2Entities) {
+        // 查询三级分类
+        List<CategoryEntity> category3Entities = categoryDao.selectList(
+                new LambdaQueryWrapper<CategoryEntity>().eq(CategoryEntity::getParentCid, category2Entity.getCatId())
+        );
+    }
+}
+```
+
+原始的写法中一级分类数量 x 二级分类数量会导致大量 SQL 查询：
+
+- 如果一级分类 10 个，每个一级分类 10 个二级分类，三级分类又各 10 个 -> 总共 SQL 查询次数 = 1 + 10 + 100 = 111 次
+- 每次 categoryDao.selectList(...) 都要访问数据库 -> 性能瓶颈明显
+- 所以这种写法就是典型的 N+1 查询问题，也就是需要查询 1 个父对象及其关联的 N 个子对象
+
+既然发现了问题所在，那么就可以通过预加载的方式一次性查询所有关联数据。
+
+```java
+@Override
+public Map<String, List<Catalog2Vo>> getCatalogJson() {
+  List<CategoryEntity> categoryEntities = categoryDao.selectList(null);
+  // 1. 查出所有一级分类
+  // List<CategoryEntity> level1Categories = getLevel1Categories();
+  List<CategoryEntity> level1Categories = getCategoryParent(categoryEntities, 0L);
+  // 2. 封装数据
+  Map<String, List<Catalog2Vo>> collect = level1Categories.stream().collect(
+          Collectors.toMap(level1Category -> {
+            return level1Category.getCatId().toString();
+          }, level1Category -> {
+            // 查询此一级分类的所有二级分类
+            List<CategoryEntity> category2Entities = getCategoryParent(categoryEntities, level1Category.getCatId());
+            ...
+              catelog2Vos = category2Entities.stream().map(category2Entity -> {
+                Catalog2Vo catelog2Vo = new Catalog2Vo(
+                        level1Category.getCatId().toString(),
+                        null,
+                        category2Entity.getCatId().toString(),
+                        category2Entity.getName()
+                );
+                // 找三级分类
+                List<CategoryEntity> category3Entities = getCategoryParent(categoryEntities, category2Entity.getCatId());
+                ...
+              }).collect(Collectors.toList());
+            }
+            ...
+}
+```
+
+```java
+private List<CategoryEntity> getCategoryParent(List<CategoryEntity> categoryEntities, Long parentCid) {
+    // 查询那些 parent_cid = 当前分类 id 的数据
+    List<CategoryEntity> collect = categoryEntities.stream().filter(categoryEntity -> categoryEntity.getParentCid().equals(parentCid)).collect(Collectors.toList());
+    return collect;
+}
+```
+
+修改后的代码则是先查询出所有的三级分类集合，此时整个 category 表的数据都加载到内存中，存在了 categoryEntities 这个 List 里，数据库访问结束，
+后续对 categoryEntities 的任何操作都只是操作 Java 内存中的对象，不会再访问数据库。后续调用的 getCategoryParent 方法则是对内存中 categoryEntities 这个 List 的遍历。
+filter(...) 是对对象属性的判断，整个过程没有任何数据库操作，只是 Java 内存里的循环和判断，只要那些 parentCid = 传递过来的当前分类的 id。
+既然此时是对内存的操作，那么就必然会提高程序的性能。
+
+****
+## 6. 缓存
+
+### 6.1 本地缓存与分布式缓存
+
+1、本地缓存
+
+本地缓存就是缓存数据存储在应用进程的本地内存中，程序可以直接从内存读取，无需网络请求。但它的生命周期与应用进程一致（进程重启后缓存数据丢失）。本地缓存的实现简单灵活，常见方式包括：
+
+- 基础数据结构：如 Java 中的 HashMap、ConcurrentHashMap
+- 专用缓存库：如 Java 的 Guava Cache、Caffeine（支持自动过期、容量限制、淘汰策略）
+- 框架内置缓存：如 Spring 的 @Cacheable（可配置本地缓存管理器）
+
+本地缓存的优势：
+
+- 本地缓存数据存储在应用内存中，访问速度可达纳秒级（远快于分布式缓存的毫秒级网络开销，或数据库的磁盘 IO）。适合高频访问、低延迟要求的场景（如热点配置、字典表查询）
+- 无需部署独立缓存服务（如 Redis），无需处理网络连接、序列化等问题，仅通过进程内代码即可实现（如用 HashMap 缓存查询结果）
+- 不依赖外部服务，避免了分布式缓存的网络故障、服务宕机等依赖风险（如 Redis 集群不可用时，本地缓存仍可提供数据）
+
+本地缓存存在的问题：
+
+- 数据一致性问题
+
+本地缓存的最大问题是分布式场景下的数据不一致，当应用以集群方式部署时，每个实例都拥有自己的本地缓存，但数据更新不好同步，这就会导致不同实例的缓存数据存在差异。例如：
+电商系统中，多个订单服务实例都缓存了商品库存（本地缓存）。当某一实例处理订单扣减库存后，却只能更新自己的缓存，但数据库是通用的，其他实例的本地缓存仍保留旧库存值。
+此时，用户可能看到虚假库存，导致超卖或下单失败。
+
+- 内存资源消耗失控
+
+本地缓存占用应用进程的内存，如果处理不正确则可能导致内存耗尽，影响应用稳定性。
+
+2、分布式缓存
+
+分布式缓存则是独立部署的缓存服务集群，数据存储在专门的缓存节点中，而非应用进程内存，应用程序通过网络协议（如 TCP、HTTP）访问缓存数据。核心特点包括：
+
+- 存储位置：独立的缓存服务集群（如 Redis 集群、Memcached 集群）
+- 访问方式：通过网络 IO（如 Socket）与缓存服务交互，存在一定网络开销
+- 生命周期：与缓存服务进程一致，不受单个应用实例重启影响
+- 数据共享：集群内所有应用实例共享同一套缓存数据，天然支持分布式场景
+
+优势：
+
+- 全局数据一致性
+
+分布式缓存是所有应用实例共享的数据源，数据更新后所有实例都可以读取到最新值，从根本上避免了本地缓存的数据不一致问题。但既然是缓存，就一定存在与数据库数据的数据不一致问题。
+
+- 集群资源利用率高
+
+分布式缓存的数据只需要存储一份（或按分片存储），因为它是通用的，所以避免了本地缓存的数据重复存储问题，这可以降低内存资源的浪费。
+
+- 缓存与应用解耦
+
+分布式缓存作为独立服务存在，与应用程序解耦，不需要在程序中专门写一大堆代码去获取。
+
+存在问题：
+
+- 网络开销导致性能损耗
+
+既然分布式缓存是一种中间件，那它就依赖网络通信，每次访问都存在网络 IO 开销（通常为毫秒级），性能低于本地缓存（纳秒级）。在极端高频访问场景，例如每秒数十万次查询，
+网络延迟可能成为瓶颈。
+
+- 依赖外部服务的可用性风险
+
+若缓存服务宕机或网络中断，将会直接影响应用可用性。此时所有请求可能穿透到数据库，导致数据库压力骤增，甚至引发雪崩问题。又或者因为应用与缓存服务之间发生网络分区，无法访问缓存，
+导致超时失败。
+
+- 数据一致性与更新策略复杂
+
+分布式缓存虽解决了本地缓存的多实例数据不一致问题，但仍需解决缓存与数据库一致性的情况。
+
+- 序列化与兼容性问题
+
+分布式缓存中的数据需经过序列化才能存储，例如 Redis 只存储字节数组，通常需要由客户端将数据序列化成字符串或者 JSON。这无疑会提高性能消耗。
+
+****
+### 6.2 redis
+
+#### 6.2.1 安装
+
+```shell
+# 创建数据目录（用于持久化Redis数据）
+mkdir -p /redis/data
+# 创建配置目录，并下载默认配置文件（或手动创建自定义配置）
+mkdir -p /redis/conf
+# 从Redis官网下载默认配置文件（可选，也可手动创建）
+wget https://raw.githubusercontent.com/redis/redis/7.0/redis.conf -O /redis/conf/redis.conf
+```
+
+```shell
+docker run -d \
+  --name redis \
+  -p 6379:6379 \
+  -v /redis/data:/data \
+  -v /redis/conf/redis.conf:/etc/redis/redis.conf \
+  redis:latest redis-server /etc/redis/redis.conf
+```
+
+****
+#### 6.2.2 使用
+
+1、引入依赖
+
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-redis</artifactId>
+</dependency>
+```
+
+2、配置 yaml 文件
+
+```yaml
+spring:
+  redis:
+    host: 127.0.0.1
+    port: 6379
+    password: 123
+```
+
+3、注入 Redis Bean
+
+```java
+@Autowired
+private StringRedisTemplate stringRedisTemplate;
+@Test
+void testStringRedisTemplate() {
+    stringRedisTemplate.opsForValue().set("hello", "world_" + UUID.randomUUID().toString());
+    // 查询
+    String hello = stringRedisTemplate.opsForValue().get("hello");
+    System.out.println(hello);
+}
+```
+
+****
+### 6.3 使用 redis 改造三级分类
+
+这里直接把原始的方法修改为 getCatalogJsonFromDb()，当 redis 中没有缓存时则调用此方法查询数据库；有缓存则查询缓存。但需要注意的是：因为当时封装的对象为一个 Map 类型，
+如果直接使用 catalogJsonFromDb.toString() 作为 JSON 传入 redis 的话，就会出现 JSON 解析错误，因为 Map.toString() 方法生成的字符串不是标准 JSON，
+而是 Java 对象的默认字符串表示（例如 {11=[...], 12=[...]}），其特点是：
+
+- 键没有双引号（如 11 = 而非 "11":）
+- 字符串值用单引号（如 'name' 而非 "name"）
+- 不符合 JSON 语法规范，导致 ObjectMapper 解析失败
+
+所以需要使用工具来将该对象转换成一个标准的 JSON 对象，可以使用 fastjson 的 parseObject 方法，但是它存在一定的安全泄露问题，所以还是推荐 SpringMVC 的 ObjectMapper。
+当然解析 JSON 时也尽量使用 SpringMVC 的 ObjectMapper，它是 Jackson 库中用于处理所有 Java 类型 与 JSON 之间相互转换的工具。而对于 List、Map、数组等复杂结构，
+需要通过 TypeReference 指定泛型类型（避免泛型擦除导致解析错误）。
+
+```java
+@Override
+public Map<String, List<Catalog2Vo>> getCatalogJson() {
+    String catalogJson = stringRedisTemplate.opsForValue().get("catalogJson");
+    if (StringUtils.isEmpty(catalogJson)) {
+        // 缓存未命中，查询数据库
+        Map<String, List<Catalog2Vo>> catalogJsonFromDb = getCatalogJsonFromDb();
+        // 存入缓存
+        ObjectMapper objectMapper = new ObjectMapper();
+        try {
+            // 转换成 JSON
+            String jsonStr = objectMapper.writeValueAsString(catalogJsonFromDb);
+            // 存入 Redis 的是标准 JSON
+            stringRedisTemplate.opsForValue().set("catalogJson", jsonStr);
+        } catch (JsonProcessingException e) {
+            log.error("JSON序列化失败：{}", e.getMessage());
+        }
+        // 直接返回数据库查询结果，避免重复解析
+        return catalogJsonFromDb;
+    }
+    log.info("catalogJson: {}", catalogJson);
+    // 将获取到的缓存数据转换成需要的对象类型
+    ObjectMapper objectMapper = new ObjectMapper();
+    Map<String, List<Catalog2Vo>> result = null;
+    try {
+        result = objectMapper.readValue(
+                catalogJson, new TypeReference<Map<String, List<Catalog2Vo>>>() {}
+        );
+    } catch (Exception e) {
+        log.error("JSON解析失败：{}", e.getMessage());
+        // 清除错误缓存
+        stringRedisTemplate.delete("catalogJson");
+    }
+    return result;
+}
+```
+
+****
+### 6.4 缓存问题
+
+1、缓存穿透
+
+缓存穿透是指用户请求查询的数据在缓存和数据库中都不存在，导致请求每次都穿透缓存，直接访问数据库，且数据库也无法返回结果。由于缓存无法命中（不存在数据），所有请求都会直达数据库。
+如果请求量巨大（比如恶意攻击），数据库会被高频无效查询压垮，甚至宕机。
+
+解决方法：
+
+- 缓存空值：当数据库查询结果为 null 时，将 “空值” 写入缓存（如key:null），并设置较短的过期时间（如 5-10 分钟），后续相同 key 的请求会先命中缓存的空值，直接返回，避免再次访问数据库。这也是常用的方法。
+- 布隆过滤器：布隆过滤器是一种概率性数据结构，可快速判断一个元素是否存在于集合中（存在一定误判率，但效率极高）
+- 接口层校验：对请求参数进行合法性校验（如用户 ID 必须为正数、商品 ID 范围限制），直接拦截明显无效的请求（如 key=-1），从源头阻挡无效请求发起者
+
+2、缓存击穿
+
+缓存击穿是指一个热点 key（被高频访问的 key）在缓存中过期的瞬间，大量请求同时到达，导致所有请求都穿透缓存，直接访问数据库。
+
+解决方法：
+
+- 热点 key 不设置过期时间：从逻辑上让热点 key 不过期（或者直接不设置过期时间），后台启动定时任务，定期主动更新该 key 的缓存（如每 10 分钟更新一次），保证缓存数据与数据库一致。
+- 使用互斥锁：当缓存失效时，通过分布式锁（如 Redis 的 setnx 命令）保证只有一个线程能去数据库查询并重建缓存，其他线程等待缓存重建完成后再从缓存获取数据。
+
+3、缓存雪崩
+
+缓存雪崩是指大量缓存 key 在同一时间点过期，或缓存服务（如 Redis 集群）整体宕机，导致缓存层整体失效，所有请求全部打向数据库，引发数据库崩溃。若数据库宕机后，缓存仍未恢复，
+系统会陷入请求 -> 数据库失败 -> 重试的恶性循环，最终导致整个系统崩溃。
+
+解决方法：
+
+- 过期时间加随机值：对缓存 key 的过期时间添加随机偏移量，让缓存的过期时间分散，避免同一时间点集中过期。
+- 服务熔断与降级：当缓存失效且数据库压力剧增时，通过熔断与降级操作限制请求流量，保护数据库
+
+****
+### 6.5 本地锁解决缓存击穿问题
+
+本地锁的核心思想是只允许一个请求去重建（查询数据库并写入）缓存，其它请求则等待，当缓存重建完成后，就可以直接从缓存中获取数据，避免全部查询数据库。
+
+流程：
+
+1. 请求到来，首先尝试从缓存（如Redis）中获取数据
+2. 如果数据存在，直接返回
+3. 缓存未命中（击穿发生）：
+   - 在尝试查询数据库之前，先尝试获取一个锁，这个锁的目的是保证在同一时间，只有一个请求线程可以执行查询数据库的操作
+   - 在成功获取锁之后，再次检查缓存，因为可能在获取锁的过程中，另一个抢先获取到锁的请求已经完成了数据库查询和缓存写入的操作。如果此时缓存中已有数据，就直接返回，避免垃圾查询。
+   - 如果第二次检查缓存依然为空，则执行真正的业务逻辑：查询数据库
+   - 将从数据库查到的数据写入缓存，并设置过期时间
+   - 最后释放锁，让其他被阻塞的线程可以继续执行
+
+```java
+public Map<String, List<Catalog2Vo>> getCatalogJsonFromDb() {
+    synchronized (this) {
+        // 得到锁后应该再去缓存中查询一遍，如果没有再进行查询数据库
+        String catalogJson = stringRedisTemplate.opsForValue().get("catalogJson");
+        if (!StringUtils.isEmpty(catalogJson)) {
+            System.out.println("getCatalogJsonFromDb 缓存命中...");
+            // 将获取到的缓存数据转换成需要的对象类型
+            ObjectMapper objectMapper = new ObjectMapper();
+            Map<String, List<Catalog2Vo>> result = null;
+            try {
+                result = objectMapper.readValue(
+                        catalogJson, new TypeReference<Map<String, List<Catalog2Vo>>>() {
+                        }
+                );
+            } catch (Exception e) {
+                log.error("JSON解析失败：{}", e.getMessage());
+                // 清除错误缓存
+                stringRedisTemplate.delete("catalogJson");
+            }
+            return result;
+        }
+        System.out.println("开始查询数据库...");
+        ...
+        // 存入缓存
+        ObjectMapper objectMapper = new ObjectMapper();
+        try {
+            // 转换成 JSON
+            String jsonStr = objectMapper.writeValueAsString(collect);
+            // 存入 Redis 的是标准 JSON
+            stringRedisTemplate.opsForValue().set("catalogJson", jsonStr);
+        } catch (JsonProcessingException e) {
+            log.error("JSON序列化失败：{}", e.getMessage());
+        }
+        return collect;
+    }
+}
+```
+
+这种方法在单服务的情况下可以保证只有一个线程执行查询数据库的操作，但在分布式系统环境中仍存在问题，因为本地锁（如 synchronized 或 ReentrantLock）只在当前 JVM 进程内有效，
+假设商品服务部署在三台服务器上（A, B, C），当缓存失效时，三个来自不同用户的请求可能分别被负载均衡到服务器 A、B、C 上。每个服务器上的本地锁只能锁住本机的线程，于是，
+这三个请求会各自成功获取到自己服务器上的本地锁，然后各自去查询一次数据库。这会导致数据库同时承受 3 个查询请求，如果节点数更多，压力会更大。
+这完全违背了只允许一个请求去查数据库的初衷。并且，如果该节点在处理数据库查询时崩溃，可能导致锁无法释放，缓存也重建失败，后续请求可能会再次触发击穿流程。
+
+****
 
 
 
