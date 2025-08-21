@@ -6867,7 +6867,786 @@ public Map<String, List<Catalog2Vo>> getCatalogJsonFromDb() {
 这完全违背了只允许一个请求去查数据库的初衷。并且，如果该节点在处理数据库查询时崩溃，可能导致锁无法释放，缓存也重建失败，后续请求可能会再次触发击穿流程。
 
 ****
+### 6.6 分布式锁
 
+本地锁的存在的局限就是只能锁住本服务，无法锁住其它服务，而分布式锁就能解决这个问题。一个正确的分布式锁必须至少满足以下三个基本属性：
+
+- 互斥性：在任意时刻，只有一个客户端能持有锁
+- 无死锁：即使持有锁的客户端崩溃或者网络分区，锁最终也能被释放，从而允许其他客户端获取锁
+- 容错性：只要大部分 Redis 节点正常运行，客户端就能获取和释放锁
+
+最初，人们使用 SETNX（SET if Not exists）命令来实现：
+
+```redis
+SETNX key value
+```
+
+- 如果返回 1，说明设置成功，客户端获取了锁
+- 如果返回 0，说明 key 已存在，获取锁失败
+
+解锁则是直接通过删除该 key 来完成：
+
+```redis
+DEL key
+```
+
+基于以上特征，可以利用 Redis 的 SETNX 来作为分布式锁，因为 Redis 天然具有全局一致性，配合该命令就能保证只有一个服务的一个线程可以拿到锁：
+
+```java
+public Map<String, List<Catalog2Vo>> getCatalogJsonFromDbWithRedisLock() {
+    // 1. 占用分布式锁
+    Boolean lock = stringRedisTemplate.opsForValue().setIfAbsent("lock", "111");
+    if (lock) {
+        // 加锁成功
+        Map<String, List<Catalog2Vo>> dataFromDb = getDataFromDb();
+        stringRedisTemplate.delete("lock"); // 删除锁
+        return dataFromDb;
+    } else { // 加锁失败，自旋重试
+        return getCatalogJsonFromDbWithRedisLock();
+    }
+}
+```
+
+不过这种方式存在一些问题，那就是当程序发生异常而无法正常释放锁时，那该锁就变成了死锁，不过既然是存在 Redis 中的 key，那就可以设置过期时间，让它自动释放锁。
+
+```java
+if (lock) { // 加锁成功
+    // 2. 设置过期时间
+    stringRedisTemplate.expire("lock", 30, TimeUnit.SECONDS);
+    Map<String, List<Catalog2Vo>> dataFromDb = getDataFromDb();
+    stringRedisTemplate.delete("lock"); // 删除锁
+    return dataFromDb;
+} else { // 加锁失败，自旋重试
+    return getCatalogJsonFromDbWithRedisLock();
+}
+```
+
+但是，这种增加过期时间的操作并不是原子的，如果在增加过期时间前就发生异常，那么结果还是和之前一样变成死锁。因为 SETNX 和 EXPIRE 是两条命令，
+如果客户端在执行完 SETNX 后、执行 EXPIRE 前崩溃了，那么锁依然永远不会释放，导致死锁。所以在 Redis 2.6.12 之后，SET 命令增加了 NX、EX 等选项，
+使得加锁和设置超时时间可以原子性地完成，这是目前实现单节点 Redis 锁的标准方法。
+
+```java
+Boolean lock = stringRedisTemplate.opsForValue().setIfAbsent("lock", uuid, 30, TimeUnit.SECONDS);
+```
+
+死锁的问题解决了，可是如果：
+
+1. 客户端 A 获取锁（lock_key，过期时间 30 秒）
+2. 客户端 A 因为某些操作（如 GC、网络延迟）导致耗时超过 30 秒，锁自动过期释放了
+3. 此时客户端 B 成功获取了同一个锁
+4. 客户端 A 操作完成，执行 DEL lock_key，错误地将客户端 B 的锁释放了
+
+所以应该在删除锁之前，先判断当前锁是否属于自己，也就是检查该锁对应的 value 是否还是自己当初设置的那个值，如果是，才能删除。
+
+```java
+String uuid = UUID.randomUUID().toString();
+if (uuid.equals(stringRedisTemplate.opsForValue().get("lock"))) {
+    stringRedisTemplate.delete("lock"); // 删除锁
+}
+```
+
+不过现在又有问题出现，那就是判断和删除锁的操作并不是原子性的，可能出现：
+
+1. 线程 A 获取锁 lock:order，值为 uuidA，过期时间 5 秒，此时正好判断完锁是否属于自己。
+2. 线程 A 完成整个业务流程，花了 6 秒，但锁在第 5 秒自动过期。
+3. 线程 B 在第 5 秒时获取锁，值为 uuidB。
+4. 第 6 秒，线程 A 业务执行完，进入释放逻辑，由于已经判断过该锁属于自己（但实际上 value 已经修改为 uuidB），就直接执行删除锁操作。
+5. 结果误删线程 B 的锁。
+
+所以现在还必须解决判断与删除操作的原子性问题，而 Redis 的 lua 脚本正好可以保证操作的原子性，释放锁的脚本代码如下：
+
+```lua
+if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("del", KEYS[1])
+else
+    return 0
+end
+```
+
+- KEYS[1]：锁的 key，这里是 "lock"
+- ARGV[1]：锁的唯一值，这里是 uuid
+
+执行流程：
+
+1. 获取当前锁的值：redis.call('get', KEYS[1])
+2. 比较值是否匹配：== ARGV[1]
+3. 如果匹配：删除锁并返回1（成功） 
+4. 如果不匹配：返回0（失败）
+
+使用 Java 代码表示则如下：
+
+```java
+try {
+    dataFromDb = getDataFromDb();
+} catch (Exception e) {
+    log.error("getDataFromDb 发生错误：{}", e.getMessage());
+} finally {
+    String script =
+            "if redis.call('get', KEYS[1]) == ARGV[1] then " +
+                    "    return redis.call('del', KEYS[1]) " +
+                    "else " +
+                    "    return 0 " +
+                    "end";
+    Long lock1 = stringRedisTemplate.execute(
+            new DefaultRedisScript<>(script, Long.class), // 脚本对象
+            Arrays.asList("lock"), // KEYS 列表
+            uuid // ARGV 参数
+    );
+}
+```
+
+调用 StringRedisTemplate 的 execute 方法，它要求传递脚本对象、KEYS 列表、多个参数（如果有），因为 Redis 规定 KEYS 和 ARGV 必须分开传递。
+
+```java
+public <T> T execute(RedisScript<T> script, List<K> keys, Object... args) {
+    return (T)this.scriptExecutor.execute(script, keys, args);
+}
+```
+
+****
+### 6.7 Redisson
+
+Redisson 是基于 Netty 的 Redis Java 客户端，除了基本的 K-V 操作外，它把大量分布式数据结构与并发原语封装成了与 Java 标准库近似的 API，开箱即用，极大简化了分布式开发。
+
+#### 6.7.1 常见部署
+
+1、引入依赖
+
+这两个依赖都是 Redisson 的，不过第一个是专门为 Spring Boot 项目提供的自动配置支持：
+
+- 自动加载 redisson.yaml / redisson.json 配置文件。 
+- 自动配置 RedissonClient Bean，直接注入即可使用。 
+- 和 Spring Boot 的配置体系整合（application.yml 里就能配置）。 
+- 内置了对 Spring Cache、Spring Transaction、Spring Session 等的支持。
+
+```xml
+<dependency>
+  <groupId>org.redisson</groupId>
+  <artifactId>redisson-spring-boot-starter</artifactId>
+  <version>3.18.0</version>
+</dependency>
+```
+
+第二个则是 Redisson 的 核心库，包含了所有分布式对象（锁、集合、队列、ExecutorService 等）的实现，它不依赖 Spring Boot，可以在任意 Java 项目中使用，但需要手动创建和配置 RedissonClient。
+
+```xml
+<dependency>
+    <groupId>org.redisson</groupId>
+    <artifactId>redisson</artifactId>
+    <version>3.17.7</version>
+</dependency>
+```
+
+2、配置客户端信息
+
+如果是引入了第一个依赖，那么就可以直接通过该 Redis 的配置文件进行使用
+
+```yaml
+spring:
+  redis:
+    host: 127.0.0.1
+    port: 6379
+    password: 123   # 若 Redis 开了密码，必须配上
+```
+
+如果是第二个依赖，就需要手动写一个配置类：
+
+```java
+@Configuration
+public class MyRedissonConfig {
+    @Bean(destroyMethod = "shutdown")
+    public RedissonClient redisson() {
+        Config config = new Config();
+        config.useSingleServer()
+                .setAddress("redis://localhost:6379") // 需要带上 redis:// ，如果启用了加密 SSL，那就需要用 rediss://
+                .setPassword("123");
+        RedissonClient redissonClient = Redisson.create(config);
+        return redissonClient;
+    }
+}
+```
+
+****
+#### 6.7.2 lock 锁测试
+
+Redisson 提供了加锁功能，通过从 Redis 中获取一个指定名称的 key 来达到加锁的目的（不存在则会自动创建），该锁是阻塞式等待的，当锁被其他线程持有时，当前线程会一直阻塞等待，直到获取到锁。
+它没有超时时间，会一直等待，并且默认是非公平锁，但可以通过配置改为公平锁。该锁同样具有可重入性（RLock extends Lock），并且自带自动续期机制，也就是说它解决了传统分布式锁的局限。
+这也是 Redisson 锁的最重要特性之一。另外一个就是可以自动避免死锁，它底层设置了自动过期时间（默认 30 s），到期自动释放锁。
+
+```java
+@ResponseBody
+@GetMapping("/hello")
+public String hello() {
+    // 1. 获取一把锁，只要锁的名字一样，那就是同一把锁
+    RLock rLock = redisson.getLock("my-lock");
+    // 2. 加锁
+    rLock.lock(); // 阻塞时等待
+    try {
+        System.out.println("加锁成功，执行业务..." + Thread.currentThread().getName());
+        Thread.sleep(10000);
+    } catch (Exception e) {
+        e.printStackTrace();
+    } finally {
+        System.out.println("释放锁..." + Thread.currentThread().getName());
+        rLock.unlock();
+    }
+    return "hello";
+}
+```
+
+该锁在 Redis 中的存储结构：
+
+```json
+Key: "my-lock" // 指定的锁名称
+Type: Hash // 哈希表结构
+Value: 
+  field: "b983c153-4721-4b12-bb5c-d5c6b6a886a8:1" // 锁持有者的标识，UUID:threadId 
+  value: 1 // 重入次数计数器
+```
+
+使用 Redisson 修改原有代码：
+
+```java
+public Map<String, List<Catalog2Vo>> getCatalogJsonFromDbWithRedissonLock() {
+    RLock rLock = redisson.getLock("CatalogJson-lock");
+    rLock.lock();
+    Map<String, List<Catalog2Vo>> dataFromDb = null;
+    try {
+        dataFromDb = getDataFromDb();
+    } catch (Exception e) {
+        log.error("getDataFromDb 发生错误：{}", e.getMessage());
+    } finally {
+        rLock.unlock();
+    }
+    return dataFromDb;
+}
+```
+
+****
+#### 6.7.3 看门狗机制
+
+当给 lock() 方法指定过期时间后，则会进入下面这个放方法：
+
+```java
+public void lock(long leaseTime, TimeUnit unit) {
+    try {
+        this.lock(leaseTime, unit, false);
+    } catch (InterruptedException var5) {
+        throw new IllegalStateException();
+    }
+}
+```
+
+然后会调用底层代码设置过期时间，第一个参数 -1L 表示重试时间。然后便会进入一个死循环，这也是为什么 Redisson 的锁为阻塞等待式的原因，而在不断循环的过程也会检查过期时间。
+
+```java
+private void lock(long leaseTime, TimeUnit unit, boolean interruptibly) throws InterruptedException {
+    long threadId = Thread.currentThread().getId();
+    Long ttl = this.tryAcquire(-1L, leaseTime, unit, threadId);
+    if (ttl != null) {
+        ...
+        try {
+            while(true) {
+                ttl = this.tryAcquire(-1L, leaseTime, unit, threadId);
+                if (ttl == null) {
+                    return;
+                }
+                if (ttl >= 0L) {
+                    try {
+                        entry.getLatch().tryAcquire(ttl, TimeUnit.MILLISECONDS);
+                    } 
+                    ...
+                } 
+                ...
+            }
+        } 
+    }
+}
+```
+
+获取过期时间的方法如下，判断传入的过期时间是否大于 0（若未手动设置过期时间，leaseTime 就为 -1）。不管是否手动设置过期时间，都要执行 tryLockInnerAsync() 方法，
+只是传入的参数不同。
+
+```java
+private <T> RFuture<Long> tryAcquireAsync(long waitTime, long leaseTime, TimeUnit unit, long threadId) {
+    RFuture<Long> ttlRemainingFuture;
+    if (leaseTime > 0L) {
+        ttlRemainingFuture = this.<Long>tryLockInnerAsync(waitTime, leaseTime, unit, threadId, RedisCommands.EVAL_LONG);
+    } else {
+        ttlRemainingFuture = this.<Long>tryLockInnerAsync(waitTime, this.internalLockLeaseTime, TimeUnit.MILLISECONDS, threadId, RedisCommands.EVAL_LONG);
+    }
+    CompletionStage<Long> f = ttlRemainingFuture.thenApply((ttlRemaining) -> {
+        if (ttlRemaining == null) {
+            if (leaseTime > 0L) {
+                this.internalLockLeaseTime = unit.toMillis(leaseTime);
+            } else {
+                this.scheduleExpirationRenewal(threadId);
+            }
+        }
+        ...
+    });
+    return new CompletableFutureWrapper(f);
+}
+```
+
+该方法最终都是把传递的参数作为 lua 脚本执行的参数，
+
+```java
+<T> RFuture<T> tryLockInnerAsync(long waitTime, long leaseTime, TimeUnit unit, long threadId, RedisStrictCommand<T> command) {
+    return this.evalWriteAsync(this.getRawName(), LongCodec.INSTANCE, command,
+            "if (redis.call('exists', KEYS[1]) == 0) " +
+                    "then redis.call('hincrby', KEYS[1], ARGV[2], 1); " +
+                    "redis.call('pexpire', KEYS[1], ARGV[1]); return nil; " +
+                    "end; " +
+                    "if (redis.call('hexists', KEYS[1], ARGV[2]) == 1) " +
+                    "then redis.call('hincrby', KEYS[1], ARGV[2], 1);" +
+                    " redis.call('pexpire', KEYS[1], ARGV[1]); " +
+                    "return nil; " +
+                    "end; " +
+                    "return redis.call('pttl', KEYS[1]);",
+            Collections.singletonList(this.getRawName()), new Object[]{unit.toMillis(leaseTime), this.getLockName(threadId)});
+}
+```
+
+在 tryAcquireAsync 方法中，如果没手动设置过期时间，那就会执行如下方法，该方法就是用来刷新过期时间的。该方法内部会执行 renewExpirationAsync()，
+而该方法每 30 / 3 = 10 s 则会重新检测一遍。
+
+```java
+private void renewExpiration() {
+    ...
+    if (ee != null) {
+        Timeout task = this.commandExecutor.getConnectionManager().newTimeout(new TimerTask() {
+            public void run(Timeout timeout) throws Exception {
+                ...
+                if (ent != null) {
+                    Long threadId = ent.getFirstThreadId();
+                    if (threadId != null) {
+                        CompletionStage<Boolean> future = RedissonBaseLock.this.renewExpirationAsync(threadId);
+                        ...
+                    }
+                }
+            }
+        }, this.internalLockLeaseTime / 3L, TimeUnit.MILLISECONDS);
+        ee.setTimeout(task);
+    }
+}
+```
+
+通过执行 lua 脚本，将新的看门狗时间作为过期时间：
+
+```java
+protected CompletionStage<Boolean> renewExpirationAsync(long threadId) {
+    return this.<Boolean>evalWriteAsync(this.getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN, "if (redis.call('hexists', KEYS[1], ARGV[2]) == 1) then redis.call('pexpire', KEYS[1], ARGV[1]); return 1; end; return 0;", Collections.singletonList(this.getRawName()), this.internalLockLeaseTime, this.getLockName(threadId));
+}
+```
+
+不过在实际开发中并不建议使用看门狗机制一直延长过期时间，因为 30 s 的时间内还没执行完业务流程那证明是某些地方发生异常或崩溃，应该主动检查才对，所以建议直接设置一个合理的过期时间，
+避免无效演唱过期时间。
+
+****
+#### 6.7.4 读写锁
+
+读写锁允许多个读操作同时进行，但写操作是独占的，也就是说：多个线程可以同时持有读锁，但同一时间只能有一个线程持有写锁，并且读写互斥，有写锁时不能加读锁，有读锁时不能加写锁。
+
+```java
+@ResponseBody
+@GetMapping("/write")
+public String write() {
+    RReadWriteLock readWriteLock = redisson.getReadWriteLock("rw-lock");
+    String s = "";
+    RLock rLock = readWriteLock.writeLock();
+    // 1. 该数据加写锁，读数据加读锁
+    rLock.lock();
+    System.out.println("写锁加锁成功..." + Thread.currentThread().getName());
+    try {
+        s = UUID.randomUUID().toString();
+        Thread.sleep(10000);
+        stringRedisTemplate.opsForValue().set("writeValue", s);
+    } catch (Exception e) {
+        e.printStackTrace();
+    } finally {
+        System.out.println("写锁释放..." + Thread.currentThread().getName());
+        rLock.unlock();
+    }
+    return s;
+}
+
+@ResponseBody
+@GetMapping("/read")
+public String read() {
+    RReadWriteLock readWriteLock = redisson.getReadWriteLock("rw-lock");
+    RLock rLock = readWriteLock.readLock();
+    String s = "";
+    rLock.lock();
+    System.out.println("读锁加锁成功..." + Thread.currentThread().getName());
+    try {
+        s = stringRedisTemplate.opsForValue().get("writeValue");
+    } catch (Exception e) {
+        e.printStackTrace();
+    } finally {
+        System.out.println("读锁释放..." + Thread.currentThread().getName());
+        rLock.unlock();
+    }
+    return s;
+}
+```
+
+经过测试：
+
+- 读 + 读：相当于无锁，只会在 Redis 中记录当前的读锁，多个线程之间可以同时加锁成功
+- 写 + 读：需要等待写锁释放才能成功加锁读锁
+- 写 + 写：第二个线程需要等待写锁释放后才能获取
+- 读 + 写：写锁需要等待读锁释放后才能加锁成功
+
+****
+#### 6.7.5 信号量
+
+在并发编程里，信号量是一种控制并发访问资源数量的机制。它类似一个许可池，每个线程在访问资源前必须申请许可证，用完后归还许可证，如果许可证用光了，后续线程就必须等待，
+直到有其他线程释放许可证。而 Redisson 实现了两种分布式信号量：
+
+1、RSemaphore，不带租约时间的信号量
+
+获取到的许可证如果没有主动释放，就会一直占用，适合需要严格手动释放 的场景，比如限流。
+
+```java
+// 创建
+RSemaphore semaphore = redisson.getSemaphore("mySemaphore");
+
+// 初始化许可证数量
+semaphore.trySetPermits(5);
+
+// 获取许可证（阻塞直到成功）
+semaphore.acquire();
+
+// 获取许可证（非阻塞）
+boolean success = semaphore.tryAcquire();
+
+// 获取多个许可证
+semaphore.acquire(3);
+
+// 释放许可证
+semaphore.release();
+
+// 释放多个许可证
+semaphore.release(2);
+```
+
+- trySetPermits(n) 只会在第一次调用时生效，用于初始化信号量值
+- acquire() 会阻塞直到获取成功
+- tryAcquire() 会立即返回 true/false
+- tryAcquire(timeout, unit) 会在超时时间内等待
+
+2、RPermitExpirableSemaphore。带租约时间的信号量
+
+每个许可证都有一个有效期，如果线程崩溃、服务宕机，许可证在租约到期后会自动归还。避免了许可证泄漏的问题，适合不可靠环境，比如分布式微服务。
+
+```java
+// 创建
+RPermitExpirableSemaphore semaphore = redisson.getPermitExpirableSemaphore("myExpirableSemaphore");
+
+// 初始化
+semaphore.trySetPermits(3);
+
+// 获取许可证，返回一个带 ID 的 permit
+String permitId = semaphore.acquire();
+
+// 或者带超时等待
+String permitId = semaphore.tryAcquire(5, 10, TimeUnit.SECONDS);
+
+// 归还许可证时，需要传入 ID
+semaphore.release(permitId);
+```
+
+- acquire() 返回的是一个 String permitId
+- 每个 permit 有一个 有效期，到期会自动释放
+- 必须用 ID 来释放对应的许可证
+
+****
+#### 6.7.6 闭锁
+
+闭锁的作用是：设置一个计数器，多个参与方不断把计数减到 0；等待方阻塞在门口，直到计数归零才一起放行。Redisson 提供的是 分布式闭锁，计数存在 Redis 里，多个进程、服务都能共同参与。
+典型的就是关门案例。
+
+```java
+// 创建
+RCountDownLatch latch = redisson.getCountDownLatch("latch:import-batch");
+
+// 仅当当前计数为 0 时，才能设置初始计数，成功返回 true
+latch.trySetCount(10);
+
+// 阻塞等待直到计数归零
+latch.await();
+
+// 带超时等待，超时返回 false，不再阻塞
+boolean ok = latch.await(30, TimeUnit.SECONDS);
+
+// 参与方：把计数减 1（最常用）
+latch.countDown();
+
+// 查询剩余计数
+long left = latch.getCount();
+
+// 清理 Redis 中的状态（可选）
+latch.delete();
+```
+
+例如关门案例：
+
+```java
+@GetMapping("/lockDoor")
+@ResponseBody
+public String lockDoor() throws InterruptedException {
+    RCountDownLatch latch = redisson.getCountDownLatch("door");
+    latch.trySetCount(5);
+    latch.await();
+    return "放假了";
+}
+
+@GetMapping("/gogogo/{id}")
+@ResponseBody
+public String gogogo(@PathVariable("id") Integer id) {
+    RCountDownLatch latch = redisson.getCountDownLatch("door");
+    latch.countDown(); // 计数减一
+    return id + " 班的人走了";
+}
+```
+
+****
+### 6.8 缓存一致性解决方案
+
+缓存一致性指的是数据库中的数据与缓存中的数据保持一致的状态。而产生该问题的主要原因如下：
+
+1. 先更新数据库，后更新缓存 -> 网络延迟导致缓存更新失败
+2. 先更新缓存，后更新数据库 -> 数据库更新失败但缓存已更新
+3. 并发读写 -> 多个操作顺序错乱导致数据不一致
+
+解决方案：
+
+1、双写模式
+
+该模式同时更新数据库和缓存，保证两者的强一致性。虽然这种模式的一致性可以得到解决，但是写的性能较低，并且网络问题可能导致数据不一致。
+
+- 线程 A：更新数据库为 valueA，但网络延迟缓存更新慢 
+- 线程 B：更新数据库为 valueB，更新缓存为 valueB 
+- 线程 A：终于更新缓存为 valueA -> 产生脏数据
+
+这种情况可以使用分布式锁或利用版本号控制来解决。对同一个业务 key（如商品ID）加细粒度分布式写锁，把写库 + 写缓存放到同一临界区。这样 A/B 不会交错执行，谁先拿到锁，
+谁就先完整地把库和缓存都更新，后来的再更新一次即可，不会出现后者覆盖的情况；或者每次更新生成单调递增的版本号，写缓存时不直接覆盖，而是检查版本后再写，
+只有当本次的版本 >= 缓存中的版本才允许覆盖；否则跳过，这样旧写值不会覆盖新写值。
+
+2、失效模式
+
+该模式则是更新数据库后删除缓存，在下次读取时再重新加载。该模式追求的是一种最终一致的状态（在分布式系统中，强一致性代价极高），但这些失效模式会使系统长时间甚至永久处于不一致状态。
+例如先更新数据库再删缓存：
+
+1. 时刻 T1：线程 A 执行写操作，它首先成功更新了数据库（例如，将值从 10 设置为 20）。 
+2. 时刻 T2：在线程 A 删除缓存之前，线程 B 执行读操作，它发现缓存失效（或未命中），于是去读取数据库。 
+3. 时刻 T3：线程 B 读到了线程 A 更新后的新值（20）。
+4. 时刻 T4：线程 B 将读取到的数据 value=20 写入缓存。 
+5. 时刻 T5：线程 A 才执行删除缓存的操作。 
+6. 最终结果：缓存中被设置为了正确的值 20，一切正常。
+
+但存在：
+
+1. 时刻 T1：线程 A 更新数据库（set 20）。 
+2. 时刻 T2：线程 A 删除了缓存（del key）。（注意：这一步提前了） 
+3. 时刻 T3：线程 B 来读，缓存未命中，去读数据库。此时数据库可能还未完成事务提交（例如主从同步延迟），或者线程 A 的更新操作还未最终提交，线程 B 读到了旧值 10。 
+4. 时刻 T4：线程 B 将 value=10 写入缓存。 
+5. 时刻 T5：数据库更新操作最终提交完成。 
+6. 最终结果：数据库是 20，但缓存是 10，此时数据不一致了，并且这个不一致会持续到下一次更新或缓存过期。
+
+根本原因就是更新数据库和删除缓存这两个步骤之间存在一个时间窗口，在这个窗口内，另一个读请求可能会读到数据库的中间状态（旧值）并将其重新加载到缓存中。
+
+再例如先删缓存再更新数据库，虽然可以解决上述问题，但仍然存在新的问题：
+
+1. 时刻 T1：线程 A 执行写操作，它首先删除了缓存。
+2. 时刻 T2：在线程 A 更新数据库之前，线程 B 来读。发现缓存不存在，去读数据库，读到旧值 10。 
+3. 时刻 T3：线程 B 将 value=10 写入缓存。 
+4. 时刻 T4：线程 A 才执行更新数据库的操作（set 20）。 
+5. 最终结果： 数据库是 20，但缓存是 10，数据不一致。
+
+而这些问题也可以使用分布式锁解决，只允许一个请求去数据库加载数据并回填缓存，其他请求等待。
+
+****
+## 7. SpringCache
+
+### 7.1 概述
+
+Spring Cache 并不是一个具体的缓存实现（比如 Redis），而是一个缓存抽象层，它提供了一组统一的注解和 API，允许开发者以声明式的方式使用方法级别的缓存，
+而无需关心底层的缓存提供商是啥。通过在方法上添加简单的注解（如 @Cacheable），来定义方法的返回值应该被缓存，以及如何被缓存。它的实现原理是 Spring 的 AOP，
+Spring 在运行时为被注解的方法创建代理，由代理来处理缓存的逻辑（检查缓存、调用方法、更新缓存）。
+
+1、引入依赖
+
+```xml
+<!-- Spring Cache-->
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-cache</artifactId>
+</dependency>
+
+<!-- Redis -->
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-redis</artifactId>
+</dependency>
+```
+
+2、启用缓存
+
+在 Spring Boot 的主配置类上添加 @EnableCaching 注解，这是必须的一步，它告诉 Spring 开启对注解式缓存的支持。
+
+3、配置缓存提供商
+
+```yaml
+spring:
+  redis:
+    host: 127.0.0.1
+    port: 6379
+    password: 123
+  cache:
+    type: redis # 明确指定使用redis作为缓存实现
+    redis:
+      time-to-live: 3600000 # 缓存 ttl，单位毫秒
+```
+
+4、在方法上使用 @Cacheable 注解
+
+如果缓存存在，则使用缓存；否则执行方法，并将结果存入缓存：
+
+```java
+@Cacheable(value = "category", value = "'Level1Categories'")
+@Override
+public List<CategoryEntity> getLevel1Categories() {
+    System.out.println("getLevel1Categories...");
+    return categoryDao.selectList(new LambdaQueryWrapper<CategoryEntity>().eq(CategoryEntity::getParentCid, 0));
+}
+```
+
+在查询一级分类的方法上添加注解并指定一个工作区（文件夹），然后 key 的名称为 Level1Categories。上面有提到，Spring Cache 的功能（检查缓存、存入缓存等）并不是直接修改方法代码来实现的，
+而是通过 Spring AOP 技术实现的，Spring 在启动时，会寻找并发现的 CategoryService Bean 上有些方法有 @Cacheable 注解，它就会创建一个这个类的代理对象，
+然后把这个代理对象作为 CategoryService Bean 注册到容器里，所以如果使用 @Cacheable 注解的那个方法调用了本类中的方法，即使用了 this. ，那么就会跳过缓存逻辑，
+导致该注解失效。
+
+****
+### 7.2 自定义缓存配置
+
+CacheAutoConfiguration 是 Spring Boot 缓存自动配置的总入口，当引入了相关缓存的依赖并在 application 文件中配置了 spring.cache.type=redis，那么这个自动配置类就会生效。
+在这个配置类中有个方法：
+
+```java
+static class CacheConfigurationImportSelector implements ImportSelector {
+    public String[] selectImports(AnnotationMetadata importingClassMetadata) {
+        CacheType[] types = CacheType.values();
+        String[] imports = new String[types.length];
+        for(int i = 0; i < types.length; ++i) {
+            imports[i] = CacheConfigurations.getConfigurationClass(types[i]);
+        }
+        return imports;
+    }
+}
+```
+
+这个方法就是用来获取所有的缓存自动配置类，进入 getConfigurationClass()：
+
+```java
+static String getConfigurationClass(CacheType cacheType) {
+    String configurationClassName = (String)MAPPINGS.get(cacheType);
+    Assert.state(configurationClassName != null, () -> "Unknown cache type " + cacheType);
+    return configurationClassName;
+}
+```
+
+而 MAPPINGS 在这个类初始化时就会加载：
+
+```java
+private static final Map<CacheType, String> MAPPINGS;
+
+static {
+    Map<CacheType, String> mappings = new EnumMap(CacheType.class);
+    mappings.put(CacheType.GENERIC, GenericCacheConfiguration.class.getName());
+    mappings.put(CacheType.EHCACHE, EhCacheCacheConfiguration.class.getName());
+    mappings.put(CacheType.HAZELCAST, HazelcastCacheConfiguration.class.getName());
+    mappings.put(CacheType.INFINISPAN, InfinispanCacheConfiguration.class.getName());
+    mappings.put(CacheType.JCACHE, JCacheCacheConfiguration.class.getName());
+    mappings.put(CacheType.COUCHBASE, CouchbaseCacheConfiguration.class.getName());
+    mappings.put(CacheType.REDIS, RedisCacheConfiguration.class.getName());
+    mappings.put(CacheType.CAFFEINE, CaffeineCacheConfiguration.class.getName());
+    mappings.put(CacheType.SIMPLE, SimpleCacheConfiguration.class.getName());
+    mappings.put(CacheType.NONE, NoOpCacheConfiguration.class.getName());
+    MAPPINGS = Collections.unmodifiableMap(mappings);
+}
+```
+
+而这里面就有 RedisCacheConfiguration 自动配置类，进入看看，它里面有个 RedisCacheManager Bean，这个 Bean 就是用来负责所有缓存分区的创建和管理。而在这个配置类中，
+也对缓存的相关数据进行初始化，如果在配置文件中配置了，那么就用配置文件的，否则就用默认的：
+
+```java
+private org.springframework.data.redis.cache.RedisCacheConfiguration createConfiguration(CacheProperties cacheProperties, ClassLoader classLoader) {
+    CacheProperties.Redis redisProperties = cacheProperties.getRedis();
+    org.springframework.data.redis.cache.RedisCacheConfiguration config = org.springframework.data.redis.cache.RedisCacheConfiguration.defaultCacheConfig();
+    config = config.serializeValuesWith(SerializationPair.fromSerializer(new JdkSerializationRedisSerializer(classLoader)));
+    if (redisProperties.getTimeToLive() != null) {
+        config = config.entryTtl(redisProperties.getTimeToLive());
+    }
+    if (redisProperties.getKeyPrefix() != null) {
+        config = config.prefixCacheNameWith(redisProperties.getKeyPrefix());
+    }
+    if (!redisProperties.isCacheNullValues()) {
+        config = config.disableCachingNullValues();
+    }
+    if (!redisProperties.isUseKeyPrefix()) {
+        config = config.disableKeyPrefix();
+    }
+    return config;
+}
+```
+
+所以自定义一个 RedisCacheConfiguration Bean 后，Spring 在初始化时会发现这个由用户提供的、更高优先级的 Bean，从而放弃使用自动配置类内部的默认配置。
+
+这里自定义一个 Redis 缓存的配置类：
+
+```java
+@EnableConfigurationProperties(CacheProperties.class)
+@Configuration
+@EnableCaching
+public class MyCacheConfig {
+
+    @Autowired
+    private CacheProperties cacheProperties;
+
+    @Bean
+    RedisCacheConfiguration redisCacheConfiguration() {
+        RedisCacheConfiguration config = RedisCacheConfiguration.defaultCacheConfig();
+        config = config.serializeKeysWith(RedisSerializationContext.SerializationPair.fromSerializer(new StringRedisSerializer()));
+        config = config.serializeValuesWith(RedisSerializationContext.SerializationPair.fromSerializer(new GenericJackson2JsonRedisSerializer()));
+        // 让配置文件中的数据生效
+        CacheProperties.Redis redisProperties = cacheProperties.getRedis();
+        if (redisProperties.getTimeToLive() != null) {
+            config = config.entryTtl(redisProperties.getTimeToLive());
+        }
+
+        if (redisProperties.getKeyPrefix() != null) {
+            config = config.prefixCacheNameWith(redisProperties.getKeyPrefix());
+        }
+
+        if (!redisProperties.isCacheNullValues()) {
+            config = config.disableCachingNullValues();
+        }
+
+        if (!redisProperties.isUseKeyPrefix()) {
+            config = config.disableKeyPrefix();
+        }
+        return config;
+    }
+}
+```
+
+参照官方的写法，先 new 一个默认的 RedisCacheConfiguration，然后通过赋值的方式进行自定义配置。需要注意的是：没有引入 CacheProperties 使它生效的话，那配置文件中的内容就无法生效，
+CacheProperties.class 是 Spring Boot 官方提供的一个配置属性类，专门用来绑定配置文件中以 spring.cache 开头的所有属性，也就是正好和配置文件中的属性对应，
+在 CacheAutoConfiguration 中也使用这个 @EnableConfigurationProperties({CacheProperties.class})。
+
+****
 
 
 
