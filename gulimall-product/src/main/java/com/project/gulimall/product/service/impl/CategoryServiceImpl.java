@@ -12,6 +12,7 @@ import org.apache.commons.lang.StringUtils;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
@@ -93,6 +94,7 @@ public class CategoryServiceImpl extends ServiceImpl<CategoryDao, CategoryEntity
      *
      * @param category
      */
+    @CacheEvict(value = "category", allEntries = true)
     @Override
     public void updateCascade(CategoryEntity category) {
         this.updateById(category);
@@ -108,7 +110,54 @@ public class CategoryServiceImpl extends ServiceImpl<CategoryDao, CategoryEntity
         return categoryDao.selectList(new LambdaQueryWrapper<CategoryEntity>().eq(CategoryEntity::getParentCid, 0));
     }
 
+    @Cacheable(value = "category", key = "#root.method.name")
     @Override
+    public Map<String, List<Catalog2Vo>> getCatalogJson() {
+        List<CategoryEntity> categoryEntities = categoryDao.selectList(null);
+        // 1. 查出所有一级分类
+        List<CategoryEntity> level1Categories = getCategoryParent(categoryEntities, 0L);
+        // 2. 封装数据
+        Map<String, List<Catalog2Vo>> collect = level1Categories.stream().collect(
+                Collectors.toMap(level1Category -> {
+                    return level1Category.getCatId().toString();
+                }, level1Category -> {
+                    // 查询此一级分类的所有二级分类
+                    List<CategoryEntity> category2Entities = getCategoryParent(categoryEntities, level1Category.getCatId());
+                    List<Catalog2Vo> catelog2Vos = null;
+                    if (!category2Entities.isEmpty()) {
+                        catelog2Vos = category2Entities.stream().map(category2Entity -> {
+                            Catalog2Vo catelog2Vo = new Catalog2Vo(
+                                    level1Category.getCatId().toString(),
+                                    null,
+                                    category2Entity.getCatId().toString(),
+                                    category2Entity.getName()
+                            );
+                            // 找三级分类
+                            List<CategoryEntity> category3Entities = getCategoryParent(categoryEntities, category2Entity.getCatId());
+                            if (!category3Entities.isEmpty()) {
+                                List<Catalog2Vo.Catalog3Vo> catelog3Vos = category3Entities.stream().map(category3Entity -> {
+                                    Catalog2Vo.Catalog3Vo catelog3Vo = new Catalog2Vo.Catalog3Vo(
+                                            category2Entity.getCatId().toString(),
+                                            category3Entity.getCatId().toString(),
+                                            category3Entity.getName()
+                                    );
+                                    return catelog3Vo;
+                                }).collect(Collectors.toList());
+                                catelog2Vo.setCatalog3List(catelog3Vos);
+                            }
+                            return catelog2Vo;
+                        }).collect(Collectors.toList());
+                    }
+                    if (catelog2Vos != null && !catelog2Vos.isEmpty()) {
+                        return catelog2Vos;
+                    } else {
+                        return Collections.emptyList();
+                    }
+                }));
+        return collect;
+    }
+
+    /*@Override
     public Map<String, List<Catalog2Vo>> getCatalogJson() {
         String catalogJson = stringRedisTemplate.opsForValue().get("catalogJson");
         if (StringUtils.isEmpty(catalogJson)) {
@@ -144,7 +193,7 @@ public class CategoryServiceImpl extends ServiceImpl<CategoryDao, CategoryEntity
             stringRedisTemplate.delete("catalogJson");
         }
         return result;
-    }
+    }*/
 
     private List<CategoryEntity> getCategoryParent(List<CategoryEntity> categoryEntities, Long parentCid) {
         // 查询那些 parent_cid = 当前分类 id 的数据

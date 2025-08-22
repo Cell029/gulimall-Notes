@@ -22,10 +22,12 @@ spring:
   cache:
     type: redis # 明确指定使用redis作为缓存实现
     redis:
-      time-to-live: 3600000 # 缓存 ttl，单位毫秒
-      key-prefix: CACHE_ # 设置缓存 key 前缀
+      time-to-live: 600000 # 缓存 ttl，单位毫秒
+#      key-prefix: CACHE_ # 设置缓存 key 前缀
       use-key-prefix: true # 是否开启前缀
       cache-null-values: true # 是否缓存空值
+      null-value-ttl: 2m # null 占位 TTL
+
 
 feign:
   client:

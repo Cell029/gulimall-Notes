@@ -7647,6 +7647,460 @@ CacheProperties.class 是 Spring Boot 官方提供的一个配置属性类，专
 在 CacheAutoConfiguration 中也使用这个 @EnableConfigurationProperties({CacheProperties.class})。
 
 ****
+### 7.3 @CacheEvict
+
+@CacheEvict 的核心目的是在方法执行后（或前）清除一个或多个缓存条目。当数据库中的数据发生变化时（如更新、删除操作），缓存中旧的、失效的数据就必须被清理掉，
+否则后续的读取操作将会拿到错误的数据。@CacheEvict 就是用来完成这个清理任务的，即失效模式中使用。
+
+清除 books 缓存分区中的数据，通常需要指定要清除的缓存条目的唯一键，如果不指定，默认使用所有方法参数组合生成的键，然后删除这个键对应的缓存。
+
+```java
+@CacheEvict(value = "books")
+public void deleteBookById(Long id) {
+    // ... 删除逻辑
+}
+```
+
+如果需要删除某个缓存分区下的多个缓存，则可以使用 allEntries = true，但该属性和 key 属性是互斥的，不能同时指定。
+
+```java
+@CacheEvict(cacheNames = "books", allEntries = true)
+public void reloadAllBooks() {
+    // ... 重新加载所有书籍的逻辑，可能涉及大量更新
+}
+```
+
+beforeInvocation 是用来决定清除操作执行的时机：
+
+- false (默认)：在方法成功执行之后执行清除。如果方法执行抛出异常，则清除操作不会进行
+- true：在方法执行之前执行清除，无论方法成功还是抛出异常，缓存都会被清除
+
+如果希望无论方法执行成功与否，都必须清除掉可能脏的缓存时。例如，一个删除操作：即使删除本身失败了（比如要删除的资源不存在），仍然希望清除缓存，
+因为缓存中的数据可能本身就是无效的或已经被别的方式修改了。
+
+```java
+// 无论删除是否成功，都先清除缓存
+@CacheEvict(cacheNames = "books", key = "#id", beforeInvocation = true)
+public void deleteBookById(Long id) {
+    // ... 删除操作
+}
+```
+
+condition 是一个 SpEL 表达式，用于条件判断。只有当表达式求值为 true 时，才会执行缓存清除操作。
+
+```java
+// 只有当 id 大于 10 时才清除缓存
+@CacheEvict(cacheNames = "books", key = "#id", condition = "#id > 10")
+public void updateBook(Long id, Book book) {
+    // ...
+}
+```
+
+****
+### 7.4 SpringCache 解决缓存问题
+
+在上面有提到缓存数据存在三个问题：缓存穿透、缓存击穿、缓存雪崩，而 SpringCache 也有对应的方发来解决这些问题。
+
+#### 7.4.1 解决缓存穿透
+
+缓存穿透是指查询一个根本不存在的数据，这个数据在缓存和数据库中都不存在，导致每次请求都会直接打到数据库上，给数据库带来巨大压力。例如 @Cacheable 的 unless 属性：
+
+```java
+@Cacheable(cacheNames = "users", key = "#id", 
+           unless = "#result == null") // 当结果为 null 时不缓存
+public User findUserById(Long id) {
+    return userRepository.findById(id).orElse(null);
+}
+```
+
+第一次查询不存在的 ID，会访问数据库，得到 null，由于 unless 条件，这个 null 不会被缓存，后续相同的请求依然会访问数据库。这并没有完全解决穿透，但防止了缓存被大量的无意义空值占满。
+如果需要缓存空值来防止大量请求查询数据库的话，就可以在配置文件中配置 spring.cache.redis.cache-null-values=true。为了完全解决，通常需要与布隆过滤器配合，
+或者在缓存中显式地设置一个短暂的空值（例如缓存 5 分钟的 NULL），而 Spring Cache 允许通过自定义 CacheManager 或 Cache 实现来达成后者。
+
+在自定义配置类前先了解一下 RedisCache 里方法的调用时机，核心触发点为 @Cacheable 注解，当调用使用该注解的方法时，Spring 的缓存拦截器会介入：
+
+1. Spring 会根据 @Cacheable 的 key 属性和缓存名称 value="category" 生成一个唯一的 Redis 键，例如 category::123。
+2. 调用 lookup(key)
+
+   - Spring 会调用 cacheManager.getCache("category") 拿到自定义的 RedisCache 实例，然后调用其 lookup 方法（最终会执行 Redis 的 GET 命令）。
+   - 在执行业务方法之前会检查缓存中是否已存在所需数据，这是一个读操作
+
+3. 调用 put(key, value)
+
+   - 如果第 2 步 lookup 返回 null（代表缓存未命中），Spring 拦截器就会去查询数据库，拿到结果后，它会调用 RedisCache 的 put 方法，将结果缓存起来。
+   - 它会判断要缓存的值 value 是否是 null，是 null 则抛出异常
+   - 该操作是在执行业务方法之后（缓存未命中时）执行的，目的是将业务方法的执行结果存储到缓存中，这是一个写操作
+
+所以可以从重写 put 方法这里入手解决缓存空值的问题，步骤如下：
+
+1、创建一个特殊的、可序列化的标记对象，用来在 Redis 中代表 null
+
+```java
+public class NullValue implements Serializable {
+    private static final long serialVersionUID = 1L;
+    public static final NullValue INSTANCE = new NullValue();
+
+    private NullValue() {}
+
+    public String getType() { // 添加 getter
+      return "NullValue";
+    }
+}
+```
+
+这个类用来区分“缓存未命中”和“缓存了空值”的情况，如果直接在 Redis 里存一个普通的空字符串 "" 或者字符串 "null"，在反序列化时，就无法确定这到底是业务数据本身就是一个空字符串，
+还是缓存的 null 结果。因此使用一个独一无二的 NullValue 对象可以明了地进行区分。而 Redis 存储的是二进制数据（byte[]），
+所以需要一个实现了 Serializable 接口的对象才能被正确地序列化和反序列化。
+
+不过已经有自定义一个 RedisCacheConfiguration，里面配置了缓存数据的序列化与反序列化器，而 Jackson 序列化对象的规则：
+
+- 默认只会序列化有 getter 属性或字段的类
+- Jackson 默认配置 FAIL_ON_EMPTY_BEANS=true，如果一个类没有可序列化的属性，即空对象，那序列化就会报 InvalidDefinitionException
+
+所以在设置空对象时需要提供可以被序列化的属性，即一个 getter 方法，让它能序列化。
+
+2、写一个 CustomRedisCache 类来自定义缓存逻辑的核心
+
+```java
+public class CustomRedisCache extends RedisCache {
+    private final RedisCacheWriter cacheWriter;
+    private final RedisCacheConfiguration cacheConfig;
+    private final Duration nullValueTtl;
+    // 构造方法，完成初始化
+    public CustomRedisCache(String name, // 缓存的唯一标识符，对应 Redis 中的 key 前缀
+                            RedisCacheWriter cacheWriter, // 真正执行 Redis 读写操作的核心组件
+                            RedisCacheConfiguration cacheConfig, // 缓存的配置信息容器，包含所有序列化和行为配置
+                            Duration nullValueTtl // 专门为 null 值设置的独立过期时间
+    ) { 
+        super(name, cacheWriter, cacheConfig);
+        this.cacheWriter = cacheWriter;
+        this.cacheConfig = cacheConfig;
+        this.nullValueTtl = nullValueTtl;
+    }
+
+    @Override
+    public void put(Object key, Object value) {
+        if (value == null) {
+            // 如果是 null，缓存 NullValue 占位符
+            byte[] cacheKey = this.serializeCacheKey(key.toString());
+            byte[] cacheValue = this.serializeCacheValue(NullValue.INSTANCE);
+            cacheWriter.put(getName(), cacheKey, cacheValue, nullValueTtl);
+        } else {
+            super.put(key, value);
+        }
+    }
+
+    @Override
+    protected Object lookup(Object key) {
+        Object value = super.lookup(key);
+        if (value instanceof NullValue) {
+            return null;
+        }
+        return value;
+    }
+}
+```
+
+2.1、提供构造方法
+
+CustomRedisCache 继承自 RedisCache，调用 super() 是为了正确初始化父类的状态，父类 RedisCache 的构造方法会设置缓存名称（name）、初始化缓存写入器（cacheWriter）、
+配置缓存序列化器等组件以及完成其他必要的初始化工作。如果不调用 super()，就需要在子类中重新实现父类的所有初始化逻辑，这是重复且容易出错的。
+所以为了确保子类与父类具有相同的行为基础，需要写上一个 super()。
+
+
+2.2、在默认的 RedisCache.put() 方法中，如果传入的 value 是 null，它不会执行 SET 操作：
+
+```java
+public void put(Object key, @Nullable Object value) {
+    Object cacheValue = this.preProcessCacheValue(value);
+    if (!this.isAllowNullValues() && cacheValue == null) {
+        throw new IllegalArgumentException(String.format("Cache '%s' does not allow 'null' values. Avoid storing null via '@Cacheable(unless=\"#result == null\")' or configure RedisCache to allow 'null' via RedisCacheConfiguration.", this.name));
+    } else {
+        this.cacheWriter.put(this.name, this.createAndConvertCacheKey(key), this.serializeCacheValue(cacheValue), this.cacheConfig.getTtl());
+    }
+}
+```
+
+但当前的目的是即使数据不存在，也要用一个占位符把坑占住，告诉后续的请求“这个 key 已经查过了，没有数据，别再查数据库了”，因此，必须重写 put 方法来覆盖框架的这个默认行为，
+将 null 视为一个需要被特殊缓存的值。重写 put 方法后可以将防空穿透的细节封装在缓存层，而对上层的业务代码完全透明。即：
+
+1. 没有自定义 put 的情况，业务代码需要自己处理空值
+
+```java
+@Cacheable(value = "users")
+public User getUserById(Long id) {
+    User user = userDao.findById(id);
+    if (user == null) {
+        // 业务层需要知道缓存穿透，并做一些特殊操作
+    }
+    return user;
+}
+```
+
+2. 有自定义 put 的情况，业务代码可以只关心业务，不需要考虑缓存层的空值问题
+
+```java
+@Cacheable(value = "users") // 只需一个注解，其他不用管
+public User getUserById(Long id) {
+    return userDao.findById(id); // 直接返回，哪怕是 null
+}
+```
+
+并且在处理空值缓存的情况时，正常的数据缓存和空值缓存的失效策略应该是不同的，也就是它们应该使用不通的 TTL，但在配置文件中只能统一设置。而正常数据 TTL 可能较长，
+但空值数据的 TTL 应该较短，因为缓存只是临时防护手段，没必要长期占用内存；其次较短的 TTL 使得缓存能更快地自动失效，从而有机会重新查询数据库获取新值。
+通过重写 put 方法，可以为空值单独指定一个 TTL 而不影响全局的缓存配置，这在默认的缓存实现中是无法做到的。
+
+```java
+@Override
+public void put(Object key, Object value) {
+    if (value == null) {
+        // 如果是 null，缓存 NullValue 占位符
+        byte[] cacheKey = this.serializeCacheKey(key.toString()); // 把字符串 key 序列化成 Redis 可存储的字节数组（byte[]）
+        byte[] cacheValue = this.serializeCacheValue(NullValue.INSTANCE);
+        cacheWriter.put(getName(), cacheKey, cacheValue, nullValueTtl);
+    } else {
+        super.put(key, value);
+    }
+}
+```
+
+2.3、重写 lookup 方法
+
+重写完 put() 方法其实就已经解决了缓存穿透的问题了，但是为了完成存入 NullValue，读出 null 的闭环，就也需要重写一下 lookup()。当从缓存中查询数据时，lookup 方法会被调用。
+它首先通过父类方法从 Redis 中拿到数据（此时可能是一个业务对象，也可能是之前存的 NullValue 实例）。如果发现取到的值是 NullValue 类型，
+它就明白这代表的是一个数据库中的 null 结果，于是向调用方（Service 层代码）返回 Java 中的 null。对于业务代码来说，它完全感知不到底层用了 NullValue 这个占位符，
+它只知道查到了数据或者没查到数据（返回null），整个过程是透明的。
+
+```java
+@Override
+protected Object lookup(Object key) {
+    Object value = super.lookup(key);
+    if (value instanceof NullValue) {
+        return null;
+    }
+    return value;
+}
+```
+
+3、CacheManager 配置，组装自定义组件
+
+使用这个的目的就是让 Spring 使用自定义的 CustomRedisCache 来代替默认的 RedisCache，通过匿名内部类重写了 RedisCacheManager 的 createRedisCache 工厂方法，
+这样每当 Spring 需要为一个缓存分区（如 @Cacheable(value = "product")中的 "product"）创建 Cache 实例时，它创建的就是 CustomRedisCache，而不是原来的 RedisCache。
+并且这里将 null 值的 TTL（5分钟）与全局缓存的 TTL 分开了。
+
+```java
+@Bean
+public CacheManager cacheManager(RedisConnectionFactory connectionFactory) {
+    RedisCacheWriter writer = RedisCacheWriter.nonLockingRedisCacheWriter(connectionFactory);
+    RedisCacheConfiguration config = redisCacheConfiguration();
+    // null 缓存 TTL（可配置化，先写死 5 分钟）
+    Duration nullValueTtl = Duration.ofMinutes(5);
+    return new RedisCacheManager(writer, config) {
+        @Override
+        protected RedisCache createRedisCache(String name, RedisCacheConfiguration cacheConfig) {
+            return new CustomRedisCache(name, writer, cacheConfig, nullValueTtl);
+        }
+    };
+}
+```
+
+```json
+{
+  "@class": "com.project.gulimall.product.config.NullValue",
+  "type": "NullValue"
+}
+```
+
+不过由于之前重写过 RedisConfiguration 配置类，所以为了让自定义的 CustomRedisCache 能够使用自定义的配置信息，就需要对原有的代码进行一些修改：
+
+```java
+@Override
+public void put(Object key, Object value) {
+    String cacheName = getName();
+    byte[] cacheKey = serializeCacheKey(key.toString());
+    byte[] cacheValue;
+    Duration ttl;
+
+    if (value == null) {
+        // 处理null值
+        cacheValue = serializeCacheValue(NullValue.INSTANCE);
+        ttl = nullValueTtl;
+        System.out.println("缓存空值: " + key + ", TTL: " + ttl);
+    } else {
+        // 处理正常值
+        cacheValue = serializeCacheValue(value);
+        ttl = normalValueTtl; // 使用显式存储的TTL
+        System.out.println("缓存正常值: " + key + ", TTL: " + ttl);
+    }
+
+    // 确保TTL不为null或负数
+    if (ttl == null || ttl.isNegative() || ttl.isZero()) {
+        ttl = Duration.ofMinutes(10); // 默认值
+    }
+
+    cacheWriter.put(cacheName, cacheKey, cacheValue, ttl);
+}
+```
+
+其实这个 put 方法可以不用修改也能使用自定义的配置，因为在创建 CacheManager 时就已经使用了自定义的配置，这里的 redisCacheConfiguration() 就是自定义的，
+不过为了初期好理解，还是修改了一下。
+
+```java
+@Bean
+@Primary
+public CacheManager cacheManager(RedisConnectionFactory connectionFactory) {
+    RedisCacheWriter writer = RedisCacheWriter.nonLockingRedisCacheWriter(connectionFactory);
+    RedisCacheConfiguration redisCacheConfiguration = redisCacheConfiguration();
+    // null 缓存 TTL（可配置化，先写死 5 分钟）
+    Duration nullValueTtl = Duration.ofMinutes(5);
+
+    return new RedisCacheManager(writer, redisCacheConfiguration) {
+        @Override
+        protected RedisCache createRedisCache(String name, RedisCacheConfiguration cacheConfig) {
+            return new CustomRedisCache(name, writer, cacheConfig, nullValueTtl);
+        }
+    };
+}
+```
+
+基本的配置都完成了，但是目前的 null 缓存的 TTL 是写死在代码里的，这不利于后期的修改，像这种属性应该把它写进配置文件中，不过 Redis 的配置中并没有该设置，所以只能自定义：
+
+```yaml
+spring:
+  cache:
+    redis:
+      null-value-ttl: 2m # 自定义 null 占位 TTL
+```
+
+在需要用到该属性的配置类中使用：
+
+```java
+// 扫描配置文件，如果没有找到则用默认值 5m
+@Value("${spring.cache.redis.null-value-ttl:5m}")
+private Duration nullValueTtl;
+```
+
+****
+#### 7.4.2 解决缓存击穿
+
+缓存击穿是指某个热点 key 在过期的瞬间，同时有大量的请求进来，导致所有请求都无法从缓存中拿到数据，从而全部并发地打到数据库上。但标准的 @Cacheable 注解在缓存未命中时，
+会允许多个线程同时执行方法体去数据库查询，但 Spring Cache 抽象层为了保持通用性，没有在注解层面提供锁的配置，解决击穿通常需要引入分布式锁并在业务代码中显式处理。
+
+****
+#### 7.4.3 解决缓存雪崩
+
+缓存雪崩是指缓存中大量的 key 在同一时间过期，导致所有这些数据的请求瞬间都打到数据库上，引起数据库压力激增甚至崩溃。同样的，SpringCache 也没有提供方法解决，但可以通过简单的配置来有效避免。
+为缓存设置不同的过期时间，这是最有效的方法：
+
+```java
+@Configuration
+public class MyCacheConfig {
+    // 定义不同缓存的TTL
+    private Map<String, Duration> cacheTtls = Map.of(
+        "category", Duration.ofHours(6), // 分类缓存6小时
+        "product", Duration.ofMinutes(30), // 商品缓存30分钟
+        "brand", Duration.ofHours(2), // 品牌缓存2小时
+        "attr", Duration.ofHours(4) // 属性缓存4小时
+    );
+    @Bean
+    @Primary
+    public CacheManager cacheManager(RedisConnectionFactory connectionFactory) {
+        RedisCacheWriter writer = RedisCacheWriter.nonLockingRedisCacheWriter(connectionFactory);
+        RedisCacheConfiguration defaultConfig = redisCacheConfiguration();
+        return new RedisCacheManager(writer, defaultConfig) {
+            @Override
+            protected RedisCache createRedisCache(String name, RedisCacheConfiguration cacheConfig) {
+                // 为特定缓存创建自定义配置
+                Duration specificTtl = cacheTtls.getOrDefault(name, cacheConfig.getTtl()); // 如果 cacheTtls 中有对应缓存名，则使用自定义 TTL
+                RedisCacheConfiguration specificConfig = cacheConfig.entryTtl(specificTtl); // 返回一个新的 RedisCacheConfiguration 实例，并覆盖默认 TTL
+                return new CustomRedisCache(name, writer, specificConfig, nullValueTtl);
+            }
+        };
+    }
+}
+```
+
+****
+# 六、检索服务 
+
+## 1. 搭建页面环境
+
+### 1.1 自定义域名搭配 nginx 反向代理
+
+之前有记录过通过 nginx 反向代理到网关，不过当时是用 localhost 来进行代理转发的，现在利用本机的 hosts 来进行自定义域名，通过该域名来访问 nginx 并进行反向代理。
+Hosts 文件可以把域名映射到某个 IP，通常在 C:\Windows\System32\drivers\etc\hosts，不过需要用管理员身份打开：
+
+```text
+172.23.0.1 gulimall.com
+```
+
+例如像这样配置，将 wsl2 的 IP 映射为 gulimall.com，当访问 http://gulimall.com 时就相当于访问本机的 172.23.0.1。此时再配置 nginx 的反向代理，
+就可以通过 gulimall.com 访问到本机的 88 端口，也就是配置的网关的端口，然后再由网关转发到各个服务。
+
+```nginx
+server {
+    listen       80;
+    listen  [::]:80;
+    server_name  *.gulimall.com;
+
+    location /static/ {
+        root    /usr/share/nginx/html;
+    }
+    
+    location / {
+        proxy_set_header Host $host;
+        proxy_pass http://host.docker.internal:88;
+    }
+}
+```
+
+这里不直接使用 localhost 是因为后续会有多个不通的服务经过 nginx 的反向代理，它们都需要经过网关的负载均衡与转发，如果使用 localhost 的话就需要配置多个请求路径来进行区分，
+因为不同的服务都处于不通的端口，使用 localhost 的话每次添加新服务都需要修改 nginx 路径映射，配置不够灵活。如果直接用自定义的域名的话就较为便捷一点，因为使用域名后，
+请求头中携带的 Host 就会变成该域名，在网关中对域名进行筛选并转发到对应的服务，例如：
+
+```yaml
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: nginx_search_route
+          uri: lb://gulimall-search
+          predicates:
+            - Host=search.gulimall.com
+
+        - id: nginx_host_route
+          uri: lb://gulimall-product
+          predicates:
+            - Host=gulimall.com
+```
+
+然后配置静态资源，在 /nginx/html/static/ 下新建一个 search 目录，然后把静态资源拷贝进这个目录，因为已经配置了反向代理到该目录，所以可以直接使用：
+
+```shell
+cp -r /mnt/d/docker_dataMountDirectory/gmall-static-resource/search/. /nginx/html/static/search
+```
+
+****
+### 1.2 本地 hosts 失效原因
+
+通过判断发送请求的 Host 来进行区分就较为方便，不用考虑路径的问题了，不过需要在 nginx 的文件中添加上 proxy_set_header Host $host;因为只有写了这个，
+nginx 才能将原始 Host 转发给网关，因为 nginx 默认是不携带 Host 的。
+
+需要注意的是：Hosts 文件是操作系统最底层的 DNS 解析方式，当访问一个域名时，操作系统会先查 hosts 文件，看它里面是否有匹配条目，如果有，就直接返回对应 IP，
+如果没有再通过 DNS 服务器解析。所以上面的配置中访问 http://gulimall.com 就会直接使用 172.23.0.1（wsl2 IP），再经由 nginx 反向代理到 gulimall-product 服务。
+但开启 VPN 后会发生路由和 DNS 被 VPN 接管的情况，因为 VPN 会强制使用远程 DNS 来覆盖本地 DNS 设置（正向代理），所以本地的 hosts 文件会被绕过，并且某些 VPN 会阻止本地 DNS 查询。
+
+而 DNS 在访问互联网中的作用就是进行域名解析，平常访问网址时浏览器并不知道 IP，系统通过 DNS 把域名解析成 IP，然后连接对应的服务器。VPN 则会提供它自己的 DNS 服务器，
+通过 VPN DNS，所有域名解析结果都是海外可访问的 IP（可以正确解析被屏蔽网站的 IP），这就是科学上网的关键，也是本地　DNS　失效的原因。
+
+****
+
+
+
+
+
+
+
 
 
 
