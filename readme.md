@@ -8094,7 +8094,1013 @@ nginx 才能将原始 Host 转发给网关，因为 nginx 默认是不携带 Hos
 通过 VPN DNS，所有域名解析结果都是海外可访问的 IP（可以正确解析被屏蔽网站的 IP），这就是科学上网的关键，也是本地　DNS　失效的原因。
 
 ****
+## 2. 检索查询
 
+### 2.1 查询参数模型
+
+前端在搜索页面发起请求时会携带很多查询条件，往往这些条件都是直接传递给后端的，如果用一个参数接收一种条件，那么在 Controller 层就需要接收很多个字段，不如把它封装成一个对象，
+利用 SpringMVC 的特点自动匹配字段，这样就可以简化接收参数列表了。后端拿到这个对象之后，会根据里面的字段拼接 Elasticsearch DSL 语句（或者 SQL），再去执行查询，
+最终返回结果。而本案例选择封装一个 VO 对象取名 SearchParam：
+
+```java
+/**
+ * 封装页面可能传递的所有查询条件
+ */
+@Data
+public class SearchParam {
+    // 全文匹配关键字
+    private String keyword;
+    // 三级分类 id
+    private Long catalog3Id;
+    /**
+     * sort = saleCount_asc/desc，销量排序
+     * sort = skuPrice_asc/desc，价格排序
+     * sort = hotScore_asc/desc，综合排序（热度评分）
+     */
+    private String sort; // 排序条件
+    /**
+     * 过滤条件
+     *   hasStock（是否有货）、skuPrice 区间、brandId、catalog3Id、attrs
+     *   hasStock = 0/1
+     *   skuPrice = 1_500/_500/500_（1 - 500/500 以内/大于 500）
+     */
+    private Integer hasStock; // 是否只显示有货
+    private String skuPrice; // 价格区间
+    private List<Long> brandId; // 按品牌筛选（品牌 Id），允许多选
+    private List<String> attrs; // 按属性筛选
+    private Integer pageNum; // 页码
+}
+```
+
+1、全文匹配关键字
+
+用户在搜索框输入的内容，比如 "华为手机"、"轻薄笔记本"，后端通常会在商品标题、商品描述等建立分词索引，通过 match 或 multi_match 查询。如果 keyword == null，
+就表示用户是通过筛选条件进入的分类页，而不是直接搜索。
+
+2、分类筛选
+
+表示三级分类 ID（本电商系统有三级分类，例如：一级：手机数码 -> 二级：手机通讯 -> 三级：手机）。如果用户点击了分类菜单（三级分类），这个参数就会有值。
+检索时可以直接用 term 或者 filter 限定 catalog3Id 字段。
+
+3、排序条件
+
+在完成初步检索后，商城页面往往会有一个排序的按钮，里面可以有多种排序条件，常见的就是销量、价格与热度，而本模型的约定格式为排序字段_asc/desc（升序/降序），例如：
+
+- saleCount_asc/desc：按销量升序/降序 
+- skuPrice_asc/desc：按价格升序/降序 
+- hotScore_asc/desc：按热度评分升序/降序
+
+解析时就可以：
+
+```java
+if(sort != null) {
+   String[] parts = sort.split("_"); 
+   String field = parts[0]; // saleCount, skuPrice, hotScore
+   String order = parts[1]; // asc / desc
+   // 构建排序条件
+}
+```
+
+4、库存过滤
+
+这个功能就是用来显示有货商品或者全部（含无货）商品，一般用 1 显示有货商品，0 显示全部。后端映射到 es 时，会有个布尔字段 hasStock，可以用 term 过滤。
+
+5、价格区间
+
+这个就是很常见的一个检索方式了，通过设置不通的价格展示对应的商品，而本模型选择的表达方式用 "_" 代替大小号：
+
+- "1_500"：价格在 1 到 500 之间
+- "_500"：价格小于等于 500
+- "500_"：价格大于等于 500
+
+6、品牌筛选
+
+用户可能勾选多个品牌（如华为、小米、OPPO），所以用 List 接收，查询时就是 terms 过滤。
+
+7、属性筛选
+
+电商商品有很多规格参数，例如："2:6.5寸"，代表属性 ID = 2（屏幕大小），值 = 6.5寸；"3:8G"，代表属性 ID = 3（运行内存），值 = 8G，不过这里并没有选择使用 Map<Long, String> 来接受，
+而是使用的 List<String>，因为这样前端传参时更灵活，可以用 URL 方式：
+
+```text
+/list.html?attrs=2:6.5寸&attrs=3:8G
+```
+
+8、分页参数
+
+后端一般还会配合一个 pageSize（每页显示多少条），因为电商场景里一个分类下可能有成千上万件商品，如果不分页，一次性把所有商品都查出来返回给前端，那系统性能就会收到影响，
+通过传递分页参数来限制查询的数据条数，控制性能。
+
+****
+### 2.2 返回结果模型
+
+同样的，有请求参数模型，也就需要有返回结果模型，就是对商城搜索结果的返回数据的封装，它跟上面的 SearchParam 是一对，后端根据条件查完 Elasticsearch（或数据库），
+把结果按结构封装好，返回给前端页面渲染。
+
+```java
+@Data
+public class SearchResult {
+    /**
+     * 商品信息
+     */
+    private List<SkuEsModel> products; // 查询到的所有商品信息
+    /**
+     * 分页信息
+     */
+    private Integer pageNum; // 当前页码
+    private Long total; // 总记录数
+    private Integer totalPages; // 总页码
+
+    private List<BrandVo> brands; // 当前查询到的结果，所涉及到的所有品牌
+
+    private List<AttrVo> attrs; // 当前查询到的结果，所涉及到的所有属性
+
+    private List<CatalogVo> catalogs; // 当前查询到的结果，所涉及到的所有分类
+
+    @Data
+    private static class BrandVo {
+        private Long brandId;
+        private String brandName;
+        private String brandImg;
+    }
+
+    @Data
+    private static class AttrVo {
+        private Long attrId;
+        private String attrName;
+        private List<String> attrValue;
+    }
+
+    @Data
+    private static class CatalogVo {
+        private Long catalogId;
+        private String catalogName;
+    }
+}
+```
+
+1、商品信息部分
+
+该字段用来存放搜索到的商品集合，也就是之前封装过的 es 模型（SkuEsModel），前端会用这个 list 渲染商品卡片列表，同时它也是搜索结果的核心数据。
+
+2、分页信息部分
+
+这些字段是配合前端分页条用的，例如：搜索结果总共有 500 件商品，每页显示 20 条，那么 total = 500，totalPages = 25。前端据此渲染分页按钮，比如：
+
+```text
+<< 上一页   1  2  3 ... 25   下一页 >>
+```
+
+3、结果聚合部分
+
+电商搜索的特色就是除了商品列表，还要显示品牌、属性、分类等过滤条件，方便用户二次筛选。封装一个品牌列表来封装当前结果涉及到的所有品牌，前端通常在侧边栏或顶部展示，
+方便用户进一步勾选，里面包含 id（查询条件）、品牌名和品牌图片，有了 brandImg，前端可以显示图片，比如“华为、苹果、小米”。
+
+而检索结果中涉及到的所有商品规格参数，比如“内存”、“屏幕大小”、“颜色”，它们可以作为前端渲染的多选过滤条件，但这些数据必须和已经进行筛选的条件相关联，也就是展示对应的规格参数，
+例如选择了华为后，就要显示华为的所有规格参数。
+
+而当前搜索结果涉及到的所有分类（通常是三级分类），就是便于前端在搜索结果页顶部显示“分类导航”。
+
+****
+### 2.3 检索 DSL 查询部分
+
+在通过后端进行 es 查询前，先手动写一下 es 的查询语句，这样后续对照着写 Java 代码较为方便。对于电商的查询来说，它是一个复合布尔查询，它应该结合全文搜索、精确过滤、
+嵌套对象查询、范围查询，并且需要包含排序、分页和高亮功能（高亮全文搜索的关键词）。而查询的结构大致应该为：
+
+```json
+{
+  "query": {
+    "bool": {
+      "must": [ ... ],
+      "filter": [ ... ]
+    }
+  }
+}
+```
+
+因为 bool 允许组合多个查询子句，而不同的子句类型（must, should, must_not, filter）有不同的逻辑和行为。在电商系统中，用户通常会输入关键词，同时还会选择分类、品牌、价格区间、库存情况等过滤条件。
+如果不用 bool 就没法在一个请求里同时把 “关键词匹配” + “属性过滤” + “价格区间” + “库存条件” 结合起来。所以 bool 查询就是逻辑拼接器，它有 4 种子句：
+
+- must：条件必须成立（相当于 sql 里的 and） 
+- should：条件可以成立也可以不成立，如果成立会提高相关性得分（相当于 sql 的 or） 
+- must_not：条件必须不成立（相当于 sql 的 not） 
+- filter：条件必须成立，但不会影响相关性算分（类似 where 里的过滤，不计算得分，更快）
+
+当然为了性能和相关性评分的优化，需要区分 must 和 filter：
+
+- must：子句必须出现在匹配的文档中，并且会影响文档的相关性得分（_score），在全文搜索时得分高的文档（匹配度更高的）排名会更靠前
+- filter：子句必须出现在匹配的文档中，但不会影响得分，而且，es 会自动缓存常用的过滤器子句，极大地提升了查询性能。对于精确匹配、范围查询等不需要相关性计算的场景，都应该放在 filter 中
+
+前置条件解析完，就需要开始编写检索条件：
+
+1、全文搜索
+
+使用 match 查询进行全文检索，它会对查询文本进行分词，然后在设定的 field 中查找包含该词的文档，例如找到所有商品标题中包含 “华为” 这个词的商品：
+
+```json
+"query": {
+  "bool": {
+    "must": [
+      {
+        "match": {
+          "skuTitle": "华为"
+        }
+      }
+    ]
+  }
+}
+```
+
+2、精确过滤
+
+通过上面的全文检索后可以查询出大致的商品，但还需要用到更精细的过滤器，用于快速的缩小范围。
+
+1. 按分类 ID 过滤
+
+```json
+{
+  "term": {
+    "catalogId": "225"
+  }
+}
+```
+
+term 查询用于精确值匹配，它不会对查询值 “225” 进行分词，而是直接去倒排索引中查找完全匹配的文档，通常 catalogId 这种标识符会被定义为 keyword 类型以确保精确匹配。
+
+2. 按多个品牌 ID 过滤
+
+```json
+{
+  "terms": {
+    "brandId": ["1", "2", "16"]
+  }
+}
+```
+
+terms 是 term 的复数形式，用于匹配多个精确值，相当于 sql 中的 brandId in ('1', '2', '16')，只要有符合条件的就查询出来。
+
+3. 按是否有库存过滤
+
+```json
+{
+  "term": {
+    "hasStock": {
+      "value": "true"
+    }
+  }
+}
+```
+
+只显示有库存 (hasStock: true) 的商品，这也是精确匹配。
+
+4. 按价格区间过滤
+
+```json
+{
+  "range": {
+    "skuPrice": {
+      "gte": 0,
+      "lte": 6500
+    }
+  }
+}
+```
+
+使用 range 匹配数值在某个范围内的文档，这里是查询价格在 0 到 6500 之间的商品。
+
+5. 按属性筛选
+
+```json
+{
+  "nested": {
+    "path": "attrs",       // 1. 指定嵌套对象的路径
+    "query": {             // 2. 定义在嵌套文档上执行的查询
+      "bool": {
+        "must": [          // 3. 嵌套文档必须同时满足两个条件
+          {
+            "term": {
+              "attrs.attrId": { // 4. 条件一：属性 ID 必须为 15（例如“CPU型号”）
+                "value": "15"
+              }
+            }
+          },
+          {
+            "terms": {
+              "attrs.attrValue": [ // 5. 条件二：属性值必须是“骁龙665”或“高通(Qualcomm)”
+                "骁龙665",
+                "高通(Qualcomm)"
+              ]
+            }
+          }
+        ]
+      }
+    }
+  }
+}
+```
+
+之前有记录过 es 的扁平化特性，所以对于嵌套的对象属性对它定义为 nested 类型，所以进行查询时也需要用 nested 查询，然后再进行嵌套查询。
+
+5. 排序、分页、高亮
+
+```json
+"sort": [ { "skuPrice": { "order": "desc" } } ],
+"from": 0,
+"size": 20,
+"highlight": {
+  "fields": { "skuTitle": {} }, // 要高亮的字段
+  "pre_tags": "<b style='colro:red'>", // 自定义高亮前缀标签
+  "post_tags": "</b>" // 自定义高亮后缀标签
+}
+```
+
+这些东西就不属于需要过滤的属性了，所以不用写在 filter 里面。
+
+整体 es 查询语句代码：
+
+```json
+GET product/_search
+{
+  "query": {
+    "bool": {
+      "must": [
+        {
+          "match": {
+            "skuTitle": "华为"
+          }
+        }
+      ],
+      "filter": [
+        {
+          "term": {
+            "catalogId": "225"
+          }
+        },
+        {
+          "terms": {
+            "brandId": [
+              "1",
+              "2",
+              "16"
+            ]
+          }
+        },
+        {
+          "nested": {
+            "path": "attrs",
+            "query": {
+              "bool": {
+                "must": [
+                  {
+                    "term": {
+                      "attrs.attrId": {
+                        "value": "15"
+                      }
+                    }
+                  },
+                  {
+                    "terms": {
+                      "attrs.attrValue": [
+                        "骁龙665",
+                        "高通(Qualcomm)"
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "term": {
+            "hasStock": {
+              "value": "true"
+            }
+          }
+        },
+        {
+          "range": {
+            "skuPrice": {
+              "gte": 0,
+              "lte": 6500
+            }
+          }
+        }
+      ]
+    }
+  },
+  "sort": [
+    {
+      "skuPrice": {
+        "order": "desc"
+      }
+    }
+  ],
+  "from": 0,
+  "size": 20,
+  "highlight": {
+    "fields": {
+      "skuTitle": {}
+    }, 
+    "pre_tags": "<b style='colro:red'>",
+    "post_tags": "</b>"
+  }
+}
+```
+
+当然这只是一部分的查询，具体的查询还需要根据查询出的东西动态显示，这种动态查询就需要添加聚合（brands/attrs/catalogs 的聚合 buckets）。
+
+****
+### 2.4 聚合检索
+
+当初步筛选出商品后，还需要对更加精细的分类条件进行聚合筛选，具体包括价格、系统、尺寸等商品的规格参数，这些都是根据查出的商品动态展示的，并不是写死的。目前需要动态展示的有：
+品牌、分类以及规格属性，所以 es 的聚合查询大致结构可以写成：
+
+```json
+{
+  "query": { "match_all": {} }, 
+  "aggs": { 
+    "brand_agg": { ... }, // 品牌维度聚合
+    "catalog_agg": { ... }, // 分类维度聚合
+    "attr_agg": { ... } // 规格属性维度聚合
+  }
+}
+```
+
+接下来分开记录这三者的聚合：
+
+1、品牌聚合
+
+```json
+"brand_agg": {
+  "terms": { // 1. 使用词项聚合
+    "field": "brandId", // 2. 按 brandId 字段分组
+    "size": 10 // 3. 只返回前 10 个最常见的品牌 ID
+  },
+  "aggs": { // 4. 在同一个品牌 ID 桶内，再做子聚合
+    "brand_name_agg": {
+      "terms": {
+        "field": "brandName", // 5. 获取该品牌 ID 对应的品牌名
+        "size": 10
+      }
+    },
+    "brand_img_agg": {
+      "terms": {
+        "field": "brandImg", // 6. 获取该品牌 ID 对应的品牌图片 URL
+        "size": 10
+      }
+    }
+  }
+}
+```
+
+因为 brandId 是标识品牌的唯一键，所以用它做聚合可以确保统计准确，并且一个 brandId 对应一个桶，不过只 brandId 并不能拿到关键信息，前端显示需要的是品牌的名称和 logo 图片，
+所以需要利用到子聚合，在每个 brandId 桶内再去查找对应的 brandName 和 brandImg，最终返回的结果：
+
+```json
+"brand_agg" : {
+  "doc_count_error_upper_bound" : 0,
+  "sum_other_doc_count" : 0,
+  "buckets" : [
+    {
+      "key" : 16,
+      "doc_count" : 2,
+      "brand_img_agg" : {
+        "doc_count_error_upper_bound" : 0,
+        "sum_other_doc_count" : 0,
+        "buckets" : [
+          {
+            "key" : "https://cell-gmall.oss-cn-beijing.aliyuncs.com/2025-08-15//3dfdee1d-38e0-42d2-8a30-392e50dded5a_huawei.png",
+            "doc_count" : 2
+          }
+        ]
+      },
+      "brand_name_agg" : {
+        "doc_count_error_upper_bound" : 0,
+        "sum_other_doc_count" : 0,
+        "buckets" : [
+          {
+            "key" : "华为",
+            "doc_count" : 2
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+2、分类聚合
+
+```json
+"catalog_agg": {
+  "terms": {
+    "field": "catalogId", // 按分类ID分组
+    "size": 10
+  },
+  "aggs": {
+    "catalog_name_agg": {
+      "terms": {
+        "field": "catalogName", // 获取分类ID对应的分类名称
+        "size": 10
+      }
+    }
+  }
+}
+```
+
+其原理与品牌聚合相同，通过 catalogId 聚合出桶，再通过子聚合 catalog_name_agg 获取分类名称：
+
+```json
+"catalog_agg" : {
+  "doc_count_error_upper_bound" : 0,
+  "sum_other_doc_count" : 0,
+  "buckets" : [
+    {
+      "key" : 225,
+      "doc_count" : 2,
+      "catalog_name_agg" : {
+        "doc_count_error_upper_bound" : 0,
+        "sum_other_doc_count" : 0,
+        "buckets" : [
+          {
+            "key" : "手机",
+            "doc_count" : 2
+          }
+        ]
+      }
+    }
+  ]
+},
+```
+
+3、规格属性聚合
+
+```json
+"attr_agg": {
+  "nested": { // 1. 进入嵌套文档路径
+    "path": "attrs"  
+  },
+  "aggs": { // 2. 在嵌套文档范围内做聚合
+    "attr_id_agg": { // 3. 按属性 ID 分组
+      "terms": {
+        "field": "attrs.attrId",
+        "size": 10
+      },
+      "aggs": { // 4. 在同一个属性 ID 桶内，做子聚合
+        "attr_name_agg": { // 5. 获取属性 ID 对应的属性名（如 “CPU 型号”）
+          "terms": {
+            "field": "attrs.attrName",
+            "size": 10
+          }
+        },
+        "attr_value_agg": { // 6. 获取该属性下的所有属性值（如 “骁龙 665”）
+          "terms": {
+            "field": "attrs.attrValue",
+            "size": 10
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+因为 attrs 是 nested 类型，所以进行聚合时需要和查询时一样，使用 nested 语法并指定对象。不过这里并没有完全和查询时一样，因为查询时是把查询语句嵌套进 nested 中，
+而这里的聚合是和它同级编写的，即起一个指定作用。
+
+****
+### 2.5 SearchRequest 的构建
+
+#### 2.5.1 构建查询部分
+
+Controller 层：
+
+```java
+/**
+ * 携带检索参数跳转到页面
+ */
+@GetMapping({"/list.html"})
+public String indexPage(SearchParam param, Model model) {
+    // 1. 根据传递来的页面的查询参数去 es 中检索商品
+    SearchResult result = mallSearchService.search(param);
+    model.addAttribute("result", result);
+    return "list";
+}
+```
+
+Service 层：
+
+将数据从 es 端查询出来就需要构造查询语句，而要将数据发送给前端页面，就需要将查询出来的数据封装成对应的格式，所以这里定义了两个方法，一个用于构建查询请求，
+一个分析查询出的响应数据。
+
+```java
+@Override
+public SearchResult search(SearchParam param) {
+    // 动态构建出查询需要的 DSL 语句
+    SearchResult result = null;
+    // 1. 准备检索请求
+    SearchRequest searchRequest = buildSearchRequest(param);
+    SearchResponse searchResponse;
+    try {
+        // 2. 执行检索请求
+        searchResponse = restHighLevelClient.search(searchRequest, RequestOptions.DEFAULT);
+        // 3. 分析响应数据，封装成需要的格式
+        result = buildSearchResult(searchResponse);
+    } catch (IOException e) {
+        log.error("构建检索失败：{}", e.getMessage());
+    }
+    return result;
+}
+```
+
+后端的整体代码类似于上面记录的 es 代码，所以也需要构建一个复合的 bool 查询，以此包含全文搜索和多种过滤条件。所以需要通过代码先创建一个布尔查询容器，然后添加全文搜索条件：
+
+```java
+// 1. 构建 bool-query
+BoolQueryBuilder boolQueryBuilder = QueryBuilders.boolQuery();
+// 构建 must 模糊匹配
+if (StringUtils.isNotBlank(param.getKeyword())) {
+    boolQueryBuilder.must(QueryBuilders.matchQuery("skuTitle", param.getKeyword()));
+}
+```
+
+接着就是处理过滤条件了，es 的写法就是用 filter 包裹住需要过滤的条件，里面的查询用 term 或 terms 进行精确匹配，主要需要进行过滤的为：三级分类 id、品牌 id、具体属性、是否有库存：
+
+1、分类 id
+
+```java
+// 构建 filter
+// 按照三级分类 id 查询
+if (param.getCatalog3Id() != null) {
+    boolQueryBuilder.filter(QueryBuilders.termQuery("catalogId", param.getCatalog3Id()));
+}
+```
+
+2、按品牌 id 集合过滤
+
+```java
+// 按照品牌 id 集合查询
+if (param.getBrandId() != null && !param.getBrandId().isEmpty()) {
+    boolQueryBuilder.filter(QueryBuilders.termsQuery("brandId", param.getBrandId()));
+}
+```
+
+3、按属性过滤
+
+这里拟定的前端传递的属性参数格式为：1_5寸:8寸，即 attrId = 1 和 attrValue[] = ["5寸", "8寸"]，因为它是直接作为一个字符串传递的，所以需要对其进行拆分，用 "_" 拆分 id 和 value，
+用 ":" 拆分不同的 value。通常就是直接构建一个 bool-query，然后里面执行检索条件，但这个对象是 nested 类型，所以得封装为 nested 查询。而 Java 代码的写法与 es 的略有不同，
+es 中是先写 nested，然后把查询嵌套写进去；但这里是先封装查询条件，然后把它作为参数封装为 nested 查询。不管怎样，都是把查询封装为 nested 查询。因为要处理多个属性值，
+所以是利用循环处理，依次遍历传入的属性列表，然后依次封装为 nested 查询。
+
+```java
+// 按照属性查询
+if (param.getAttrs() != null && !param.getAttrs().isEmpty()) {
+    for (String attrStr : param.getAttrs()) {
+        BoolQueryBuilder nestedBoolQueryBuilder = QueryBuilders.boolQuery();
+        // attrs=1_5寸:8寸&attrs=2_16G:8G
+        String[] s = attrStr.split("_");
+        String attrId = s[0]; // 检索的属性 id
+        String[] attrValues = s[1].split(":"); // 检索的属性值
+        nestedBoolQueryBuilder.must(QueryBuilders.termQuery("attrs.attrId", attrId));
+        nestedBoolQueryBuilder.must(QueryBuilders.termsQuery("attrs.attrValue", attrValues));
+        // 每一个 attr 都要生成一个 nested 查询
+        NestedQueryBuilder nestedQueryBuilder = QueryBuilders.nestedQuery("attrs", nestedBoolQueryBuilder, ScoreMode.None);
+        boolQueryBuilder.filter(nestedQueryBuilder);
+    }
+}
+```
+
+4、按库存过滤
+
+这里需要注意的则是需要把传入的值转换为 boolean 类型，因为 es 中存储的 hasStock 字段就是该类型。
+
+```java
+// 按照是否有库存查询
+if (param.getHasStock() != null) {
+    boolQueryBuilder.filter(QueryBuilders.termQuery("hasStock", param.getHasStock() == 1));
+}
+```
+
+处理完过滤后，就需要处理一些其它条件：
+
+1、按价格区间过滤
+
+这里拟定的前端传递的价格区间的格式为 1_500/_500/500_（1 - 500/小于 500/大于 500），所以可以和上面获取属性一样对字符串进行分割，但需要注意的是：
+String.split() 方法在分隔符位于开头或结尾时，会产生空字符串的元素，所以进行区分时需要对首尾元素进行非空判断再进行赋值。
+
+```java
+// 按照价格区间查询
+if (StringUtils.isNotBlank(param.getSkuPrice())) {
+    // 约定格式：1_500/_500/500_
+    RangeQueryBuilder rangeQueryBuilder = QueryBuilders.rangeQuery("skuPrice");
+    // 解析 skuPrice 格式
+    String[] s = param.getSkuPrice().split("_");
+    if (s.length == 2) {
+        if (!s[0].isEmpty()) rangeQueryBuilder.gte(s[0]);
+        if (!s[1].isEmpty())rangeQueryBuilder.lte(s[1]);
+    } else {
+        // 判断是大于还是小于
+        if (param.getSkuPrice().startsWith("_")) {
+            // 以 "_" 开头证明是小于
+            if (!s[0].isEmpty()) { // 对于 "_500", s[0] 是空字符串，所以不会执行
+                rangeQueryBuilder.lte(s[0]);
+            }
+            if (s.length > 1 && !s[1].isEmpty()) {
+                rangeQueryBuilder.lte(s[1]);
+            }
+            // rangeQueryBuilder.lte(s[0]);
+        } else if (param.getSkuPrice().endsWith("_")) {
+            // 处理 500_
+            if (!s[0].isEmpty()) {
+                rangeQueryBuilder.gte(s[0]);
+            }
+        }
+    }
+    boolQueryBuilder.filter(rangeQueryBuilder);
+}
+```
+
+至此，查询条件封装完毕，把它们放作为参数传递给 SearchSourceBuilder
+
+```java
+searchSourceBuilder.query(boolQueryBuilder);
+```
+
+接着就是非查询条件，也就是排序、分页、高亮操作：
+
+```java
+/**
+ * 排序、分页、高亮
+ */
+// 排序
+if (StringUtils.isNotBlank(param.getSort())) {
+    String sort = param.getSort();
+    String[] s = sort.split("_");
+    if (!s[0].isEmpty() && !s[1].isEmpty()) {
+        SortOrder sortOrder = s[1].equals("asc") ? SortOrder.ASC : SortOrder.DESC;
+        searchSourceBuilder.sort(s[0], sortOrder);
+    }
+}
+// 分页
+searchSourceBuilder.from((param.getPageNum() - 1) * EsConstant.PRODUCT_PAGESIZE);
+searchSourceBuilder.size(EsConstant.PRODUCT_PAGESIZE);
+// 高亮
+if (StringUtils.isNotBlank(param.getKeyword())) {
+    HighlightBuilder highlightBuilder = new HighlightBuilder();
+    highlightBuilder.field("skuTitle");
+    highlightBuilder.preTags("<span style='color:red'>");
+    highlightBuilder.postTags("</span>");
+    searchSourceBuilder.highlighter(highlightBuilder);
+}
+```
+
+****
+#### 2.5.2 聚合分析
+
+根据 es 的代码，对品牌、三级分类以及属性进行聚合分析：
+
+1、品牌聚合和三级分类聚合
+
+按 brandId 字段对商品进行分组，统计每个品牌下的商品数量，和 es 操作的一样，使用 terms 进行聚合，将字段的每个不同值作为一个桶，并计算每个桶里的文档数量。
+然后调用 subAggregation() 方法生成对应的子聚合。
+
+```java
+// 1. 品牌聚合
+TermsAggregationBuilder brand_agg = AggregationBuilders.terms("brand_agg");
+brand_agg.field("brandId").size(50); // 按 brandId 分桶
+// 品牌聚合的子聚合
+brand_agg.subAggregation(AggregationBuilders.terms("brand_name_agg").field("brandName").size(1)); // 获取品牌名
+brand_agg.subAggregation(AggregationBuilders.terms("brand_img_agg").field("brandImg").size(10)); // 获取品牌图片
+searchSourceBuilder.aggregation(brand_agg); // 加入查询
+
+// 2. 分类聚合
+TermsAggregationBuilder catalog_agg = AggregationBuilders.terms("catalog_agg");
+catalog_agg.field("catalogId").size(50); // 按 catalogId 分桶
+// 分类聚合的子聚合
+catalog_agg.subAggregation(AggregationBuilders.terms("catalog_name_agg").field("catalogName").size(1)); // 获取分类名
+searchSourceBuilder.aggregation(catalog_agg);
+```
+
+2、属性聚合
+
+属性聚合则需要使用 nested 聚合，通过调用 nested() 方法将聚合的上下文从主文档（商品）切换到嵌套文档，然后在嵌套文档的上下文中，按 attrId 对所有的属性项进行分组。
+这里与 es 的写法不同，es 中是平级关系（但实际为嵌套），这里则是直接把所有的聚合都作为 nested 的子聚合，名称和属性值则作为子聚合的子聚合。
+
+```java
+// 3. 属性聚合
+NestedAggregationBuilder attr_agg = AggregationBuilders.nested("attr_agg", "attrs"); // 进入嵌套文档
+// 作为 nested 的子聚合
+TermsAggregationBuilder attr_id_agg = AggregationBuilders.terms("attr_id_agg").field("attrs.attrId").size(50); // 按属性 id 分桶
+// 作为 nested 的子聚合的子聚合，即名字和属性值
+attr_id_agg.subAggregation(AggregationBuilders.terms("attr_name_agg").field("attrs.attrName").size(1)); // 获取属性名
+attr_id_agg.subAggregation(AggregationBuilders.terms("attr_value_agg").field("attrs.attrValue").size(50)); // 获取属性值
+attr_agg.subAggregation(attr_id_agg); // 将属性 id 聚合设为嵌套聚合的子聚合
+// 放入 SearchSourceBuilder
+searchSourceBuilder.aggregation(attr_agg);
+```
+
+****
+### 2.6 SearchResponse 的分析
+
+上面记录了查询条件的构建，现在则需要对响应结果进行解析然后封装为具体的对象返回给前端页面展示。在设计返回模型 SearchResult 的就记录了需要返回哪些数据，所以这里直接按顺序记录。
+
+1、商品列表处理
+
+首先通过 hit.getSourceAsString() 获取文档的 JSON 字符串表示，然后将其转换为 SkuEsModel 模型，其实整个 es 就是该模型，但是并没有选择直接返回它给前端，
+因为前端不仅仅需要该对象用来展示，还需要一些相关联的属性用于动态展示，为了避免再通过 SkuEsModel 中的字段再查询数据库获取关联数据，就直接把它们全封装为一个新的对象，
+把需要用到的数据用更方便的形式展示与获取。
+
+```java
+// 1. 返回所有查询到的商品
+List<SkuEsModel> skuEsModels = new ArrayList<>();
+SearchHits hits = searchResponse.getHits();
+if (hits.getHits() != null && hits.getHits().length > 0) {
+    for (SearchHit hit : hits.getHits()) {
+        String sourceAsString = hit.getSourceAsString();
+        SkuEsModel skuEsModel = JSON.parseObject(sourceAsString, SkuEsModel.class);
+        skuEsModels.add(skuEsModel);
+    }
+}
+searchResult.setProducts(skuEsModels);
+```
+
+2、品牌聚合处理
+
+es 聚合通常是多层次的，并且上面在记录 es 的查询代码时也验证了，通过获取到的聚合获取到该聚合里面的桶数据，而品牌 id 聚合的桶数据的 key 则为 id，不过通常该数据有多条，
+所以获取到的桶有多个，那么就需要进行遍历。在遍历的过程中获取它的子聚合，而子聚合通常只有一条数据，所以直接获取第一个桶数据的 key 即可获取到对应的值。
+
+```java
+"brand_agg" : {
+  "buckets" : [
+    {
+      "key" : 12,
+      "doc_count" : 18,
+      "brand_img_agg" : {
+        "buckets" : [
+          {
+            "key" : "https://cell-gmall.oss-cn-beijing.aliyuncs.com/2025-08-11/d89a6efc-e070-4ebf-8328-6f130eb8cda4_a34a3e5ed1b162dd71d9ac48f9d48974.jpg",
+            "doc_count" : 18
+          }
+        ]
+      },
+      "brand_name_agg" : {
+        "buckets" : [
+          {
+            "key" : "Apple",
+            "doc_count" : 18
+          }
+        ]
+      }
+    },
+    {
+      "key" : 16,
+      "doc_count" : 4,
+      "brand_img_agg" : {
+        "buckets" : [
+          {
+            "key" : "https://cell-gmall.oss-cn-beijing.aliyuncs.com/2025-08-15//3dfdee1d-38e0-42d2-8a30-392e50dded5a_huawei.png",
+            "doc_count" : 4
+          }
+        ]
+      },
+      "brand_name_agg" : {
+        "buckets" : [
+          {
+            "key" : "华为",
+            "doc_count" : 4
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+```java
+// 2. 当前查询到的结果，所涉及到的所有品牌
+List<SearchResult.BrandVo> brandVos = new ArrayList<>();
+Terms brand_agg = searchResponse.getAggregations().get("brand_agg");
+if (brand_agg != null && !brand_agg.getBuckets().isEmpty()) {
+    brand_agg.getBuckets().forEach(bucket -> {
+        SearchResult.BrandVo brandVo = new SearchResult.BrandVo();
+        // 获取品牌 id
+        brandVo.setBrandId(bucket.getKeyAsNumber().longValue());
+        // 获取品牌名称
+        Terms brand_name_agg = bucket.getAggregations().get("brand_name_agg");
+        if (brand_name_agg != null && !brand_name_agg.getBuckets().isEmpty()) {
+            brandVo.setBrandName(brand_name_agg.getBuckets().get(0).getKeyAsString());
+        }
+        // 获取品牌的图片
+        Terms brand_img_agg = bucket.getAggregations().get("brand_img_agg");
+        if (brand_img_agg != null && !brand_img_agg.getBuckets().isEmpty()) {
+            brandVo.setBrandImg(brand_img_agg.getBuckets().get(0).getKeyAsString());
+        }
+        brandVos.add(brandVo);
+    });
+}
+```
+
+3、分类聚合处理
+
+该聚合处理同理：
+
+```java
+// 3. 当前查询到的结果，所涉及到的所有分类
+List<SearchResult.CatalogVo> catalogVos = new ArrayList<>();
+Terms catalog_agg = searchResponse.getAggregations().get("catalog_agg");
+if (catalog_agg != null && !catalog_agg.getBuckets().isEmpty()) {
+    catalog_agg.getBuckets().forEach(bucket -> {
+        SearchResult.CatalogVo catalogVo = new SearchResult.CatalogVo();
+        // 得到分类 id
+        String keyAsString = bucket.getKeyAsString();
+        catalogVo.setCatalogId(Long.valueOf(keyAsString));
+        // 得到分类名
+        Terms catalog_name_agg = bucket.getAggregations().get("catalog_name_agg");
+        if (catalog_name_agg != null && !catalog_name_agg.getBuckets().isEmpty()) {
+            String catalogName = catalog_name_agg.getBuckets().get(0).getKeyAsString();
+            catalogVo.setCatalogName(catalogName);
+        }
+        catalogVos.add(catalogVo);
+    });
+}
+```
+
+4、属性聚合处理
+
+而属性聚合的嵌套相比上面就更复杂一些，因为它是 nested 类型的对象，所以它的聚合天生嵌套在 nested 中，所以要获取第一层属性 id 的聚合就要从 nested 中获取，
+即使用 searchResponse.getAggregations().get("attr_agg"); 获取第一层聚合，然后再获取子聚合得到属性 id 的聚合。而属性值的聚合则不再是单一值了，
+它可能存在多个值，所以不能直接通过获取桶数据的第一个值来获取，而是需要遍历整个桶数据了，就和遍历属性 id 聚合的桶一致，不过最终是把数据转换成 List<String> 形式，
+所以得用到流的 map() 方法。
+
+```java
+// 4. 当前查询到的结果，所涉及到的所有属性
+List<SearchResult.AttrVo> attrVos = new ArrayList<>();
+Nested attr_agg = searchResponse.getAggregations().get("attr_agg");
+if (attr_agg != null) {
+    Terms attr_id_agg = attr_agg.getAggregations().get("attr_id_agg");
+    if (attr_id_agg != null && !attr_id_agg.getBuckets().isEmpty()) {
+        attr_id_agg.getBuckets().forEach(bucket -> {
+            SearchResult.AttrVo attrVo = new SearchResult.AttrVo();
+            // 1. 得到属性 id
+            attrVo.setAttrId(bucket.getKeyAsNumber().longValue());
+            Terms attr_name_agg = bucket.getAggregations().get("attr_name_agg");
+            if (attr_name_agg != null && !attr_name_agg.getBuckets().isEmpty()) {
+                // 2. 得到属性名称
+                attrVo.setAttrName(attr_name_agg.getBuckets().get(0).getKeyAsString());
+            }
+            Terms attr_value_agg = bucket.getAggregations().get("attr_value_agg");
+            if (attr_value_agg != null && !attr_value_agg.getBuckets().isEmpty()) {
+                List<String> attrValueList = attr_value_agg.getBuckets().stream()
+                    .map(MultiBucketsAggregation.Bucket::getKeyAsString)
+                    .collect(Collectors.toList());
+                attrVo.setAttrValue(attrValueList);
+            }
+            attrVos.add(attrVo);
+        });
+    }
+    searchResult.setAttrs(attrVos);
+}
+```
+
+5、分页信息处理
+
+这里主要是处理总记录条数、总页数和当前页码，当前页码前端会传递过来，而总条数和总页数则需要手动计算，总条数在 es 的返回结果中可以看到，它有显示，所以可以直接获取第一个 hits 来获取。
+而总页数则需要注意不满一页的情况，不满一页也应该算为一页，所以在计算时需要加上每页的条数 - 1 依次达到向上取整的目的，确保未满一页的数据也能算作一页，而恰好一页则不会受影响，
+例如：total=10，pageSize=8 -> (10+8-1)/8 = 17/8 = 2.125 -> 取整为 2 页;total=8 -> (8+8-1)/8 = 15/8 = 1.875 -> 取整为 1 页。
+
+```json
+{
+  "took": 16,
+  "timed_out": false,
+  "_shards": {
+    "total": 1,
+    "successful": 1,
+    "skipped": 0,
+    "failed": 0
+  },
+  "hits": {
+    "total": {
+      "value": 22,
+      "relation": "eq"
+    }
+  }
+}
+```
+
+```java
+// 5. 分页信息
+searchResult.setPageNum(param.getPageNum());
+if (hits.getTotalHits() != null) {
+    long total = hits.getTotalHits().value;
+    searchResult.setTotal(total);
+    // 向上取整，不满一页的时候也算作一页
+    int totalPages = (int) ((total + EsConstant.PRODUCT_PAGESIZE - 1) / EsConstant.PRODUCT_PAGESIZE);
+    searchResult.setTotalPages(totalPages);
+}
+```
+
+****
 
 
 
