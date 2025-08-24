@@ -8920,9 +8920,31 @@ if (hits.getHits() != null && hits.getHits().length > 0) {
         String sourceAsString = hit.getSourceAsString();
         SkuEsModel skuEsModel = JSON.parseObject(sourceAsString, SkuEsModel.class);
         skuEsModels.add(skuEsModel);
+        if (StringUtils.isNotBlank(param.getKeyword())) {
+            HighlightField skuTitle = hit.getHighlightFields().get("skuTitle");
+            String string = skuTitle.getFragments()[0].string();
+            skuEsModel.setSkuTitle(string);
+        }
     }
 }
 searchResult.setProducts(skuEsModels);
+```
+
+在这里还需要对检索的关键词进行高亮处理，es 在返回搜索结果时，hits 里每个文档都会多一个 highlight 字段，在 Java 中这个高亮部分会被解析成：
+
+```java
+Map<String, HighlightField> highlightFields = hit.getHighlightFields();
+```
+
+highlightFields.get("skuTitle") 得到的是一个 HighlightField 对象，而 HighlightField 里面保存了多个片段（Text[] fragments）。
+每个 Text 对象就是一段高亮后的字符串，[0]：取第一个片段（通常 ES 高亮结果只有一个片段，如果字段内容很长可能会被拆成多个），但要拿真正的字符串，要调用 string() 方法。
+
+```json
+"highlight": {
+  "fields": {
+    "skuTitle": {}
+  }
+}
 ```
 
 2、品牌聚合处理
@@ -9101,11 +9123,538 @@ if (hits.getTotalHits() != null) {
 ```
 
 ****
+## 3. 检索页面渲染
+
+### 3.1 页面基本数据渲染
+
+当前的检索界面是写死的，所以需要对其进行改造，让它动态获取存储在 es 中的数据，而上面的记录中已经完成了查询的基本逻辑，并且把解析后的 es 的响应结果以 "result" 存储在 域中，
+
+```java
+@GetMapping({"/", "/list.html"})
+public String indexPage(SearchParam param, Model model) {
+    // 1. 根据传递来的页面的查询参数去 es 中检索商品
+    SearchResult result = mallSearchService.search(param);
+    model.addAttribute("result", result);
+    return "list";
+}
+```
+
+所以前端页面只需要从域中获取到 result 便可以获取到所有封装好的数据。先在前端获取到封装好的 SkuEsModel 模型数据，它作为 result 的 products 字段，所以在域中获取后，
+便可以获取到 products 字段中的所有属性，例如标题 skuTitle、skuImg、skuPrice 等数据：
+
+```html
+<div class="rig_tab">
+    <div th:each="product:${result.getProducts()}">
+        <div class="ico">
+            <i class="iconfont icon-weiguanzhu"></i>
+            <a href="/static/search#">关注</a>
+        </div>
+        <p class="da">
+            <a href="/static/search#">
+                <img th:src="${product.getSkuImg()}" class="dim">
+            </a>
+        </p>
+        <ul class="tab_im">
+            <li><a href="/static/search#" title="黑色">
+                <img th:src="${product.getSkuImg()}"></a></li>
+        </ul>
+        <p class="tab_R">
+            <span th:text="'¥' + ${product.getSkuPrice()}">¥5199.00</span>
+        </p>
+        <p class="tab_JE">
+            <a href="/static/search#" th:utext="${product.skuTitle}">
+                Apple iPhone 7 Plus (A1661) 32G 黑色 移动联通电信4G手机
+            </a>
+        </p>
+        <p class="tab_PI">已有<span>11万+</span>热门评价
+            <a href="/static/search#">二手有售</a>
+        </p>
+        <p class="tab_CP"><a href="/static/search#" title="谷粒商城Apple产品专营店">谷粒商城Apple产品...</a>
+            <a href='#' title="联系供应商进行咨询">
+                <img src="/static/search/img/xcxc.png">
+            </a>
+        </p>
+        <div class="tab_FO">
+            <div class="FO_one">
+                <p>自营
+                    <span>谷粒商城自营,品质保证</span>
+                </p>
+                <p>满赠
+                    <span>该商品参加满赠活动</span>
+                </p>
+            </div>
+        </div>
+    </div>
+</div>
+```
+
+而响应结果中的其它属性也可以这样获取，在 result 中获取对应的字段拿到已经封装好的属性，然后依次渲染即可。
+
+```html
+<div class="JD_nav_logo">
+    <!--品牌-->
+    <div class="JD_nav_wrap">
+        <div class="sl_key">
+            <span><b>品牌：</b></span>
+        </div>
+        <div class="sl_value">
+            <div class="sl_value_logo">
+                <ul>
+                    <li th:each="brand:${result.brands}">
+                        <a href="/static/search#">
+                            <img th:src="${brand.brandImg}" alt="">
+                            <div th:text="${brand.brandName}">
+                                华为(HUAWEI)
+                            </div>
+                        </a>
+                    </li>
+                </ul>
+            </div>
+        </div>
+        <div class="sl_ext">
+            <a href="/static/search#">
+                更多
+                <i style='background: url("image/searchele.png")no-repeat 3px 7px'></i>
+                <b style='background: url("image/searchele.png")no-repeat 3px -44px'></b>
+            </a>
+            <a href="/static/search#">
+                多选
+                <i>+</i>
+                <span>+</span>
+            </a>
+        </div>
+    </div>
+    <!--分类-->
+    <div class="JD_pre">
+        <div class="sl_key">
+            <span><b>分类：</b></span>
+        </div>
+        <div class="sl_value">
+            <ul>
+                <li th:each="catalog:${result.catalogs}"><a href="/static/search#" th:text="${catalog.catalogName}">5.56英寸及以上</a></li>
+            </ul>
+        </div>
+        <div class="sl_ext">
+            <a href="/static/search#">
+                更多
+                <i style='background: url("image/searchele.png")no-repeat 3px 7px'></i>
+                <b style='background: url("image/searchele.png")no-repeat 3px -44px'></b>
+            </a>
+            <a href="/static/search#">
+                多选
+                <i>+</i>
+                <span>+</span>
+            </a>
+        </div>
+    </div>
+    <!--其它需要展示的属性-->
+    <div class="JD_pre" th:each="attr:${result.attrs}">
+        <div class="sl_key">
+            <span th:text="${attr.attrName}">屏幕尺寸：</span>
+        </div>
+        <div class="sl_value">
+            <ul>
+                <li th:each="val:${attr.attrValue}"><a href="/static/search#" th:text="${val}">5.56英寸及以上</a></li>
+            </ul>
+        </div>
+    </div>
+</div>
+```
+
+****
+### 3.2 页面筛选条件渲染
+
+上面有记录过，在电商检索页面会提供除全文检索外的一些其它检索条件，而这里主要为品牌、三级分类以及其它属性的检索，这些检索都是通过聚合动态获取的，现在想要实现的是：
+点击这些动态显示的东西，让它作为检索条件显示相关内容。而实现原理则是在原有的浏览器 url 上拼接点击的那些东西的属性。例如原始的首页 url 为：http://search.gulimall.com/list.html，
+此时想要拼接其它查询条件就应该为：http://search.gulimall.com/list.html?catalog3Id=225， 也就是在后面拼接了一个 "?" 和之前约定的分类查询的请求路径格式，
+如果再查询一个，那 url 应该为：http://search.gulimall.com/list.html?catalog3Id=225&brandId=16， 也就是在后面拼接了一个 "&" 和约定的品牌查询的请求路径格式，
+那么现在就很明确了，应该写一个方法，在用户点击这些地方的时候实现同台拼接条件，如果原始路径中没有 "?" 那就需要拼接上，否则直接拼接 "&"，所以方法可以写为：
+
+```html
+function searchProducts( name , val ) {
+  // 获取原来页面的 url
+  if (location.href.indexOf("?") != -1) {
+    location.href = location.href + "&" + name + "=" + val;
+  } else {
+    location.href = location.href + "?" + name + "=" + val;
+  }
+}
+```
+
+这里利用 indexOf 方法判断路径中的 "?" 在那个位置，如果返回值不为 -1 那就证明存在 "?"（无需具体判断在哪个位置）。
+
+方法写完，接着就得在前端页面展示相关过滤条件的地方写上能够调用该方法的语句了，先从品牌开始：
+
+```html
+<div class="sl_value">
+    <div class="sl_value_logo">
+        <ul>
+            <li th:each="brand:${result.brands}">
+                <a href="javascript:void(0);"  th:onclick="|searchProducts('brandId', ${brand.brandId})|">
+                    <img th:src="${brand.brandImg}" alt="">
+                    <div th:text="${brand.brandName}">
+                        华为(HUAWEI)
+                    </div>
+                </a>
+            </li>
+        </ul>
+    </div>
+</div>
+```
+
+品牌的信息是通过 th:each 从域中的 result 中获取的，可以包含多个品牌，所以每一次的点击查询也应该包含在里面。这里的品牌信息用的是一个 `<a>` 标签，
+通常该标签默认会跳转到 href 指定的 url，所以为了避免他进行跳转并正确执行 js 代码中的方法，就使用了 `javascript:void(0);`，它是一个 JS 表达式：
+
+- void(0) 的意思是返回 undefined
+- 结合 javascript: 前缀，就变成了执行 JS 表达式，但不跳转任何页面
+
+这样写的好处是可以让 `<a>` 标签像按钮一样使用，用 onclick 执行 JS 方法，并阻止 `<a>` 的默认跳转行为避免点击后页面刷新。
+
+```html
+<div class="sl_value">
+    <ul>
+        <li th:each="catalog:${result.catalogs}">
+            <a href="javascript:void(0);"
+               th:onclick="|searchProducts('catalog3Id', ${catalog.catalogId})|"
+               th:text="${catalog.catalogName}">5.56英寸及以上</a>
+        </li>
+    </ul>
+</div>
+```
+
+不过在 attr 属性这里就不能像上面那样写 th:onclick 了，因为这里的查询拼接是这样的：http://search.gulimall.com/list.html?catalog3Id=225&brandId=16&attrs=16_骁龙665 。
+所以需要把获取到的 attrId 和 attrValue 用 "_" 拼接起来，而 Thymeleaf 3.0 默认不允许直接把字符串表达式放在 onclick 这种事件属性里，因此换了一种写法，
+用 th:attr="onclick=|...|" 替代 th:onclick，让内部可以直接使用字符串表达式。
+
+```html
+<div class="sl_value">
+    <ul>
+        <li th:each="val:${attr.attrValue}">
+            <a href="javascript:void(0);"
+               th:attr="onclick=|searchProducts('attrs','${attr.attrId}_${val}')|"
+               th:text="${val}">5.56英寸及以上</a>
+        </li>
+    </ul>
+</div>
+```
+
+关于检索页面的全文搜索框，这个其实也可以直接调用上面写的 searchProducts() 方法，因为本质上还是在浏览器的 url 后面拼接 keyword=华为..：
+
+```html
+<div class="header_form">
+    <input id="keyword_input" type="text" placeholder="手机" th:value="${param.keyword}"/>
+    <a href="javascript:void(0);"
+       th:onclick="|searchByKeyword()|">搜索</a>
+</div>
+```
+
+在全文搜索框那里添加一下 id，后续可以通过 id 获取到这个搜索框中输入的值，然后直接进行拼接：
+
+```html
+function searchByKeyword() {
+    searchProducts("keyword", $("#keyword_input").val())
+}
+```
+
+****
+### 3.3 页面分页数据渲染
+
+```html
+<a class="page_a"
+   th:attr="pn=${result.pageNum - 1}"
+   th:if="${result.pageNum > 1}">
+    < 上一页
+</a>
+```
+
+只有当当前页 result.pageNum > 1 时才渲染上一页按钮，避免在第 1 页还出现上一页的无效按钮，所以应该添加 th:if 进行判断，
+而 th:attr 则是给 `<a>` 添加一个自定义属性 pn（pageNum 的缩写），值是目标页码 -1，以此达到跳转上一页的目的。这么做的好处是：
+所有分页按钮（上一页/下一页/数字页）都用同一个 click 逻辑，前端可以统一从 pn 里取目标页码。
+
+```html
+<a class="page_a"
+   th:attr="pn=${nav}, style=${nav == result.pageNum ? 'border: 0;color:#ee2222;background: #fff' : ''}"
+   th:each="nav:${result.pageNavs}">
+    [[${nav}]]
+</a>
+```
+
+这段的逻辑就是遍历获取所有页码，不过原始的后端并没有添加这个 pageNavs 字段，所以需要增加一下，通过分页总数来获取，定义为一个页码数组，以此来为为每个页码渲染一个 `<a>`。
+
+```java
+List<Integer> pageNavs = new ArrayList<>();
+for (int i = 1; i <= searchResult.getTotalPages(); i++) {
+    pageNavs.add(i);
+}
+searchResult.setPageNavs(pageNavs);
+```
+
+这里同样写入 pn=${nav}，点击就能跳到该页，同时根据 nav == result.pageNum 决定是否内联样式渲染当前页的按钮。
+
+关于点击的处理方法，所有分页 `<a>` 都没直接写 href="pageNum=..."，而是只标记一个 pn，因为给每个 `<a>` 添加了 class="page_a" 标识，只要点击了该标识所在地，
+就会触发方法，点击后由 js 读取当前 url：
+
+- 如果已有 pageNum，就把它的值替换掉（避免一直拼接 &pageNum 导致丢失其它查询条件，比如关键字、分类、排序等）
+- 如果没有 pageNum，就追加一个 pageNum=pn 参数
+
+```html
+$(".page_a").click(function () {
+    var pn = $(this).attr("pn"); // 当前被点击元素
+    var href = location.href;
+    if (href.indexOf("pageNum") !== -1) {
+        // 替换 pageNum 的值
+        location.href = replaceParamVal(href, "pageNum", pn);
+    } else {
+        location.href = location.href + "&pageNum=" + pn;
+    }
+    return false;
+})
+
+function replaceParamVal(url, paramName, replaceVal) {
+    var oUrl = url.toString();
+    var re = eval('/(' + paramName + '=)([^&]*)/gi');
+    var nUrl = oUrl.replace(re, paramName + '=' + replaceVal);
+    return nUrl;
+}
+```
+
+****
+### 3.4 页面排序功能
+
+排序功能的核心逻辑就是点击排序按钮时，前端给 URL 增加或替换 sort=xxx 参数，带上新的参数去后端查询，同时改变按钮样式，让当前点击的按钮显示选中状态，如：背景变红，
+文字加箭头 ⬆/⬇ 表示升降序。
+
+```html
+function replaceAndAddParamVal(url, paramName, replaceVal) {
+    var oUrl = url.toString();
+    if (oUrl.indexOf(paramName) !== -1) {
+        var re = eval('/(' + paramName + '=)([^&]*)/gi');
+        var nUrl = oUrl.replace(re, paramName + '=' + replaceVal);
+        return nUrl;
+    } else {
+        var nUrl = "";
+        if (oUrl.indexOf("?") !== -1) {
+            nUrl = oUrl + "&" + paramName + '=' + replaceVal;
+        } else {
+            nUrl = oUrl + "?" + paramName + '=' + replaceVal;
+        }
+        return nUrl;
+    }
+}
+```
+
+这里修改了一下原来的 replaceParamVal 方法，让它能够同时实现新增与修改，通过调用它检查 url 里是否已经有当前传入的 paramName 参数，如果有就替换成新值（replaceVal），
+否则根据是否有 "?" 拼接上新的参数。这样就能做到：
+
+```text
+http://xxx.com/search?keyword=手机
+-> 点击价格按钮后
+http://xxx.com/search?keyword=手机&sort=skuPrice_asc
+-> 再点一次（切换降序）
+http://xxx.com/search?keyword=手机&sort=skuPrice_desc
+```
+
+关于点击事件，则是和分页处理时类似，也是在 `<a>` 标签中定义一个标识，点击时先改样式，确定当前是升序还是降序，然后根据样式拼出 sort=xxx_asc/desc，
+最后用 replaceAndAddParamVal 更新 url 并刷新。
+
+```html
+<a class="sort_a" sort="hotScore" href="/static/search#">综合排序</a>
+<a class="sort_a" sort="saleCount" href="/static/search#">销量</a>
+<a class="sort_a" sort="skuPrice" href="/static/search#">价格</a>
+```
+
+这里是动态的拼接 "_desc" 与 "_asc"，通过当前点击按钮的 sort 获取参与排序的字段，然后根据是否携带 desc 字段拼接为升降序，最后将条件拼接上 url。
+
+```html
+$(".sort_a").click(function () {
+    // 1. 当前被点击的元素变为选中状态，也就是添加渲染样式
+    // 改变当前元素以及兄弟元素的样式
+    changeStyle(this);
+    // 跳转到指定位置 sort=skuPrice_desc/asc
+    var sort = $(this).attr("sort");
+    sort = $(this).hasClass("desc") ? sort + "_desc" : sort + "_asc";
+    location.href = replaceAndAddParamVal(location.href, "sort", sort)
+    // 禁用默认行为
+    return false;
+})
+```
+
+这里把更新样式抽取为一个方法，在修改某个按钮的样式前，先把原有的 "⬇"/"⬆" 清空，保证每次点击都只显示一个，然后再用 toggleClass("desc") 来切换升降状态。
+toggleClass 方法是在当前元素没有 desc 时给它加上，如果当前元素有 desc 则会给它去掉，也就是说它会在点击时在有与没有这两种状态之间反复切换。
+然后进行判断并加上符号。
+
+```html
+function changeStyle(element) {
+    $(".sort_a").css({"color":"#333", "border-color":"#CCC", "background":"#FFF"});
+    $(".sort_a").each(function () {
+        var text = $(this).text().replace("⬇", "").replace("⬆", "");
+        $(this).text(text);
+    });
+    $(element).css({"color":"#FFF", "border-color":"#e4393c", "background":"#e4393c"});
+    // 改变升降序
+    $(element).toggleClass("desc");// 加上就是降序，不加就是升序
+    if ($(element).hasClass("desc")) {
+        // 降序
+        var text = $(element).text().replace("⬇", "").replace("⬆", "");
+        text = text + "⬇";
+        $(element).text(text);
+    } else {
+        // 升序
+        var text = $(element).text().replace("⬇", "").replace("⬆", "");
+        text = text + "⬆";
+        $(element).text(text);
+    }
+}
+```
+
+****
+### 3.5 页面排序的字段回显
+
+上面记录的页面排序存在一个问题，那就是虽然点击排序按钮后可以拼接排序字段，但是并不会把排序按钮渲染的状态显示出来，因为它会进行以此刷新，就导致渲染白写了。
+所以这些渲染应该由 Thymeleaf 进行，点击按钮时只让 js 携带排序字段跳转 url，因为 Thymeleaf 不会因为刷新就丢失渲染数据，因此可以根据 param.sort 动态判断，给对应的按钮加样式、箭头。
+
+```html
+<div class="filter_top_left" th:with="p = ${param.sort}">
+    <a th:class="${(!#strings.isEmpty(p) && #strings.startsWith(p, 'hotScore') && #strings.endsWith(p, 'desc')) ? 'sort_a desc' : 'sort_a'}"
+       th:attr="style=${(#strings.isEmpty(p) || #strings.startsWith(p, 'hotScore')) ?
+       'color:#FFF; border-color:#e4393c; background:#e4393c' :
+       'color:#333; border-color:#CCC; background:#fff'}"
+       sort="hotScore" href="/static/search#">综合排序 [[${(!#strings.isEmpty(p) && #strings.startsWith(p, 'hotScore') && #strings.endsWith(p, 'desc')) ? '⬇' : '⬆'}]]</a>
+    <a th:class="${(!#strings.isEmpty(p) && #strings.startsWith(p, 'saleCount') && #strings.endsWith(p, 'desc')) ? 'sort_a desc' : 'sort_a'}"
+       th:attr="style=${(!#strings.isEmpty(p) && #strings.startsWith(p, 'saleCount')) ?
+       'color:#FFF; border-color:#e4393c; background:#e4393c' :
+       'color:#333; border-color:#CCC; background:#fff'}"
+       sort="saleCount" href="/static/search#">销量 [[${(!#strings.isEmpty(p) && #strings.startsWith(p, 'saleCount') && #strings.endsWith(p, 'desc')) ? '⬇' : '⬆'}]]</a>
+    <a th:class="${(!#strings.isEmpty(p) && #strings.startsWith(p, 'skuPrice') && #strings.endsWith(p, 'desc')) ? 'sort_a desc' : 'sort_a'}"
+       th:attr="style=${(!#strings.isEmpty(p) && #strings.startsWith(p, 'skuPrice')) ?
+       'color:#FFF; border-color:#e4393c; background:#e4393c' :
+       'color:#333; border-color:#CCC; background:#fff'}"
+       sort="skuPrice" href="/static/search#">价格 [[${(!#strings.isEmpty(p) && #strings.startsWith(p, 'skuPrice') && #strings.endsWith(p, 'desc')) ? '⬇' : '⬆'}]]</a>
+</div>
+```
+
+首先在包裹排序按钮的 div 中添加 th:with="p = ${param.sort}"，它可以把请求参数 sort（例如：hotScore_desc、saleCount_asc）存到局部变量 p，供下面多处复用。
+每个 `<a>` 标签中都有 th:class=" ... ? 'sort_a desc' : 'sort_a'" 这个代码，它是用来判断 class 是否包含 desc，如果包含就把它动态拼接到 class 中，
+在 js 的方法中就是通过判断当前点击的按钮的 class 是否包含 desc 字段，来拼 xxx_desc / xxx_asc 的，所以 Thymeleaf 渲染时把这个状态还原，刷新后前端还能当前是升还是降。
+
+接着就是处理当前被选中的按钮的高亮（给当前被选中的排序字段上红色高亮样式，其他是灰色边黑字白底），对综合排序（hotScore）：#strings.isEmpty(p) || #strings.startsWith(p, 'hotScore')，
+只有当没有选择排序字段或 sort 以它开头时才高亮，其余按钮同理，在选择了排序并且以对应的 sort 开头时就进行高亮处理，否则渲染成灰色边黑字白底。
+
+最后给按钮重新弄上上下箭头，[[${(!#strings.isEmpty(p) && #strings.startsWith(p, 'hotScore') && #strings.endsWith(p, 'desc')) ? '⬇' : '⬆'}]]，
+对当前按钮的开头与是否携带 desc 字段进行判断，如果都满足那就是降序，则拼接 "⬇"，否则拼接 "⬆"。
+
+既然所有的渲染都交给 Thymeleaf 了，那之前写的渲染的方法就不需要用到了，在点击的方法中直接进行 url 字段的处理与拼接即可，
+
+```html
+$(".sort_a").click(function () {
+    var sort = $(this).attr("sort"); // 读取 sort="hotScore/saleCount/skuPrice"
+    // 如果当前是 desc，就拼 asc，否则拼 desc
+    var isDesc = $(this).hasClass("desc");
+    sort = isDesc ? sort + "_asc" : sort + "_desc";
+    location.href = replaceAndAddParamVal(location.href, "sort", sort);
+    return false;
+});
+```
+
+****
+### 3.6 页面价格区间搜索与是否有库存搜索
+
+同样的，这里页面价格区间的回显操作也由 Thymeleaf 进行管理，这里设置了前置价格与后置价格，通过这个可以很方便的就进行 "_" 的拼接：
+
+```html
+<div class="filter_top_left" th:with="p = ${param.sort}, priceRange = ${param.skuPrice}">
+  <input id="skuPriceFrom" type="number" style="width: 100px; margin-left: 30px"
+      th:value="${#strings.isEmpty(priceRange) ? '' : #strings.substringBefore(priceRange, '_') }"
+  > ~
+  <input id="skuPriceTo" type="number" style="width: 100px"
+      th:value="${#strings.isEmpty(priceRange) ? '' : #strings.substringAfter(priceRange, '_') }"
+  >
+  <button id="skuPriceSearchBtn">确定</button>
+</div>
+```
+
+```html
+$("#skuPriceSearchBtn").click(function () {
+    // 拼接上两个价格的区间
+    var from = $("#skuPriceFrom").val();
+    var to = $("#skuPriceTo").val();
+    var query = from + "_" + to;
+    location.href = replaceAndAddParamVal(location.href, "skuPrice", query);
+})
+```
+
+对于是否有库存的过滤条件，把它做成一个勾选框的形式，用 id 绑定监听事件，触发方法后根据勾选框的值为 true 还是 false 动态拼接 1 或者 ''，
+拼接 1 代表查询有库存的 hasStock=1，拼接 '' 代表查询所有。不过由于这个拼接比较特殊，从查询有库存到全部的情况时需要清空 &hasStock=1 这个字段，所以需要编写额外的去除逻辑。
+
+```html
+<li>
+  <a href="/static/search#" th:with="check=${param.hasStock}">
+    <input id="showHasStock" type="checkbox" th:checked="${#strings.equals(check, '1')}">
+    仅显示有货
+  </a>
+</li>
+```
+
+```html
+$("#showHasStock").change(function () {
+    var url = location.href + "";
+    if ($(this).prop('checked')) {
+        url = replaceAndAddParamVal(url, "hasStock", 1);
+    } else {
+        var re = /(hasStock=)([^&]*)/gi;
+        url = url.replace(re, '');
+        // 额外清理可能出现的多余符号
+        url = url.replace(/[&]{2,}/g, "&"); // 把多个 && 合并成一个 &
+        url = url.replace(/\?&/, ""); // 把 ?& 去掉
+        url = url.replace(/&$/, ""); // 去掉末尾的 &
+    }
+    location.href = url;
+    return false;
+})
+```
+
+****
+### 3.7 面包屑导航
 
 
+```java
+// 6. 构建面包屑 NavVo
+List<SearchResult.NavVo> navVos = new ArrayList<>();
+if (param.getAttrs() != null) { // 通过传递的参数获取所有属性
+    for (String attr : param.getAttrs()) { // attr=16_A13仿生
+        String[] split = attr.split("_", 2); // 只拆分成 2 个部分
+        if (split.length != 2) continue;
+        // 获取 attrId
+        String attrId = split[0];
+        // 获取 attrValue
+        String attrValue = split[1];
+        // 封装为 NavVo 对象
+        SearchResult.NavVo navVo = new SearchResult.NavVo();
+        navVo.setNavValue(attrValue);
+        // 获取属性名称
+        attrVos.stream()
+                .filter(attrVo -> attrVo.getAttrId().toString().equals(attrId))
+                .findFirst()
+                .ifPresent(attrVo -> navVo.setNavName(attrVo.getAttrName()));
+        // 生成取消面包屑的链接
+        String queryString = Optional.ofNullable(param.getQueryString()).orElse("");
+        String encodedAttr = URLEncoder.encode(attr, StandardCharsets.UTF_8);
+        String attrParam1 = "&attrs=" + encodedAttr;
+        String attrParam2 = "?attrs=" + encodedAttr;
+        queryString = queryString.replace(attrParam1, "").replace(attrParam2, "");
+        // 如果获取到的请求参数以 & 开头，就需要把 & 去掉
+        if (queryString.startsWith("&")) {
+            queryString = queryString.substring(1);
+        }
+        // 对原始的请求条件进行判断，如果为空，那么取消面包屑后直接拼接空值；否则拼接原有的 queryString
+        navVo.setLink("http://search.gulimall.com/list.html" + (queryString.isEmpty() ? "" : "?" + queryString));
+        navVos.add(navVo);
+    }
+}
+searchResult.setNavs(navVos);
 
-
-
+return searchResult;
+```
 
 
 

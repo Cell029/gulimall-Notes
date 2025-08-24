@@ -7,6 +7,8 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Controller;
 import org.springframework.ui.Model;
 import org.springframework.web.bind.annotation.GetMapping;
+import javax.servlet.http.HttpServletRequest;
+
 
 @Controller
 public class SearchController {
@@ -17,8 +19,10 @@ public class SearchController {
     /**
      * 携带检索参数跳转到页面
      */
-    @GetMapping({"/list.html"})
-    public String indexPage(SearchParam param, Model model) {
+    @GetMapping({"/", "/list.html"})
+    public String indexPage(SearchParam param, Model model, HttpServletRequest request) {
+        // 传递 queryString
+        param.setQueryString(request.getQueryString() == null ? "" : request.getQueryString());
         // 1. 根据传递来的页面的查询参数去 es 中检索商品
         SearchResult result = mallSearchService.search(param);
         model.addAttribute("result", result);

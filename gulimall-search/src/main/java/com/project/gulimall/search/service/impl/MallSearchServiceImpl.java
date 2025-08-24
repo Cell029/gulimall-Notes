@@ -28,14 +28,18 @@ import org.elasticsearch.search.aggregations.bucket.terms.Terms;
 import org.elasticsearch.search.aggregations.bucket.terms.TermsAggregationBuilder;
 import org.elasticsearch.search.builder.SearchSourceBuilder;
 import org.elasticsearch.search.fetch.subphase.highlight.HighlightBuilder;
+import org.elasticsearch.search.fetch.subphase.highlight.HighlightField;
 import org.elasticsearch.search.sort.SortOrder;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
-
 import java.io.IOException;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.stream.Collectors;
+
 
 @Slf4j
 @Service("mallSearchService")
@@ -62,6 +66,7 @@ public class MallSearchServiceImpl implements MallSearchService {
         return result;
     }
 
+
     /**
      * 构建结果数据
      * @param searchResponse
@@ -76,6 +81,12 @@ public class MallSearchServiceImpl implements MallSearchService {
             for (SearchHit hit : hits.getHits()) {
                 String sourceAsString = hit.getSourceAsString();
                 SkuEsModel skuEsModel = JSON.parseObject(sourceAsString, SkuEsModel.class);
+                if (StringUtils.isNotBlank(param.getKeyword())) {
+                    HighlightField skuTitle = hit.getHighlightFields().get("skuTitle");
+                    if (skuTitle != null && skuTitle.getFragments() != null && skuTitle.getFragments().length > 0) {
+                        skuEsModel.setSkuTitle(skuTitle.getFragments()[0].string());
+                    }
+                }
                 skuEsModels.add(skuEsModel);
             }
         }
@@ -146,8 +157,8 @@ public class MallSearchServiceImpl implements MallSearchService {
                     }
                     attrVos.add(attrVo);
                 });
+                searchResult.setAttrs(attrVos);
             }
-            searchResult.setAttrs(attrVos);
         }
 
         // 5. 分页信息
@@ -159,8 +170,50 @@ public class MallSearchServiceImpl implements MallSearchService {
             int totalPages = (int) ((total + EsConstant.PRODUCT_PAGESIZE - 1) / EsConstant.PRODUCT_PAGESIZE);
             searchResult.setTotalPages(totalPages);
         }
+        // 展示分页数组，一个属性对应一页，便于统计
+        List<Integer> pageNavs = new ArrayList<>();
+        for (int i = 1; i <= searchResult.getTotalPages(); i++) {
+            pageNavs.add(i);
+        }
+        searchResult.setPageNavs(pageNavs);
+
+        // 6. 构建面包屑 NavVo TODO 存在bug
+        List<SearchResult.NavVo> navVos = new ArrayList<>();
+        if (param.getAttrs() != null) { // 通过传递的参数获取所有属性
+            for (String attr : param.getAttrs()) { // attr=16_A13仿生
+                String[] split = attr.split("_", 2); // 只拆分成 2 个部分
+                if (split.length != 2) continue;
+                // 获取 attrId
+                String attrId = split[0];
+                // 获取 attrValue
+                String attrValue = split[1];
+                // 封装为 NavVo 对象
+                SearchResult.NavVo navVo = new SearchResult.NavVo();
+                navVo.setNavValue(attrValue);
+                // 获取属性名称
+                attrVos.stream()
+                        .filter(attrVo -> attrVo.getAttrId().toString().equals(attrId))
+                        .findFirst()
+                        .ifPresent(attrVo -> navVo.setNavName(attrVo.getAttrName()));
+                // 生成取消面包屑的链接
+                String queryString = Optional.ofNullable(param.getQueryString()).orElse("");
+                String encodedAttr = URLEncoder.encode(attr, StandardCharsets.UTF_8);
+                String attrParam1 = "&attrs=" + encodedAttr;
+                String attrParam2 = "?attrs=" + encodedAttr;
+                queryString = queryString.replace(attrParam1, "").replace(attrParam2, "");
+                // 如果获取到的请求参数以 & 开头，就需要把 & 去掉
+                if (queryString.startsWith("&")) {
+                    queryString = queryString.substring(1);
+                }
+                // 对原始的请求条件进行判断，如果为空，那么取消面包屑后直接拼接空值；否则拼接原有的 queryString
+                navVo.setLink("http://search.gulimall.com/list.html" + (queryString.isEmpty() ? "" : "?" + queryString));
+                navVos.add(navVo);
+            }
+        }
+        searchResult.setNavs(navVos);
 
         return searchResult;
+
     }
 
 
