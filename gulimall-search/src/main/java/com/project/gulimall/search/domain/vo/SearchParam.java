@@ -31,7 +31,7 @@ public class SearchParam {
     private List<String> attrs; // 按属性筛选
     private Integer pageNum = 1; // 页码
 
-    // 前端查询的 url 中的所有查询条件
+    // 前端查询的 url 中 "?" 后的所有查询条件
     private String queryString;
 
 }

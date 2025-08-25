@@ -177,14 +177,16 @@ public class MallSearchServiceImpl implements MallSearchService {
         }
         searchResult.setPageNavs(pageNavs);
 
-        // 6. 构建面包屑 NavVo TODO 存在bug
+        // 6. 构建面包屑 NavVo
         List<SearchResult.NavVo> navVos = new ArrayList<>();
+        List<Long> blankAttrIds = new ArrayList<>();
         if (param.getAttrs() != null) { // 通过传递的参数获取所有属性
             for (String attr : param.getAttrs()) { // attr=16_A13仿生
                 String[] split = attr.split("_", 2); // 只拆分成 2 个部分
                 if (split.length != 2) continue;
                 // 获取 attrId
                 String attrId = split[0];
+                blankAttrIds.add(Long.valueOf(attrId));
                 // 获取 attrValue
                 String attrValue = split[1];
                 // 封装为 NavVo 对象
@@ -197,21 +199,39 @@ public class MallSearchServiceImpl implements MallSearchService {
                         .ifPresent(attrVo -> navVo.setNavName(attrVo.getAttrName()));
                 // 生成取消面包屑的链接
                 String queryString = Optional.ofNullable(param.getQueryString()).orElse("");
-                String encodedAttr = URLEncoder.encode(attr, StandardCharsets.UTF_8);
-                String attrParam1 = "&attrs=" + encodedAttr;
-                String attrParam2 = "?attrs=" + encodedAttr;
-                queryString = queryString.replace(attrParam1, "").replace(attrParam2, "");
-                // 如果获取到的请求参数以 & 开头，就需要把 & 去掉
-                if (queryString.startsWith("&")) {
-                    queryString = queryString.substring(1);
+                List<String> queryAttrParams = new ArrayList<>();
+                // 根据 & 进行分割
+                for (String p : queryString.split("&")) {
+                    if (!p.isEmpty()) queryAttrParams.add(p);
                 }
+                String targetAttr = attr; // 原始 attr，例如 "15_高通(Qualcomm)"
+                // 从 queryString 里删除目标属性参数
+                queryAttrParams.removeIf(p -> {
+                    String[] kv = p.split("=", 2); // limit=2 的作用：即便 value 里还有 "="，也只切一次，避免被继续拆开
+                    if (kv.length != 2) {
+                        return false;
+                    }
+                    // 只处理 key 为 "attrs" 的参数；其他参数（如 catalog3Id、brandId）一律保留
+                    if (!kv[0].equals("attrs")) {
+                        return false;
+                    }
+                    try {
+                        // 对 value 做 URL 解码（把 %E4%BB%A5… 还原成中文；把 '+' 按表单规则解码成空格）
+                        String value = java.net.URLDecoder.decode(kv[1], StandardCharsets.UTF_8);
+                        // 如果解码后的值正好等于要移除的那个 attr（未编码的原始字符串），就返回 true -> 删除
+                        return value.equals(targetAttr);
+                    } catch (Exception e) {
+                        return false;
+                    }
+                });
+                String newQuery = String.join("&", queryAttrParams);
                 // 对原始的请求条件进行判断，如果为空，那么取消面包屑后直接拼接空值；否则拼接原有的 queryString
-                navVo.setLink("http://search.gulimall.com/list.html" + (queryString.isEmpty() ? "" : "?" + queryString));
+                navVo.setLink("http://search.gulimall.com/list.html" + (newQuery.isEmpty() ? "" : "?" + newQuery));
                 navVos.add(navVo);
             }
         }
         searchResult.setNavs(navVos);
-
+        searchResult.setBlankAttrIds(blankAttrIds);
         return searchResult;
 
     }

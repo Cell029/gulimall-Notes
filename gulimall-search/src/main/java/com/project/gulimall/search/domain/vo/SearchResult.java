@@ -26,6 +26,8 @@ public class SearchResult {
 
     private List<CatalogVo> catalogs; // 当前查询到的结果，所涉及到的所有分类
 
+    private List<Long> blankAttrIds; // 添加某个属性值后，该属性所属的那个 name 不显示
+
     // 面包屑导航数据
     private List<NavVo> navs;
 

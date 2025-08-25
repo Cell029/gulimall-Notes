@@ -9616,6 +9616,38 @@ $("#showHasStock").change(function () {
 ****
 ### 3.7 面包屑导航
 
+关于面包屑导航功能，它是一种能让使用者更直观地看见自己勾选了哪些属性条件，在用户点击了某个属性后，它会在三级分类的边上进行展示，展示的内容为属性名和其对应的值，并且支持删除功能，
+也就是点击这个展示的属性的叉号后，本页面的检索条件就会取消掉刚刚叉掉的那个值，也就是进行一次类似页面回退的操作。所以目的很明确，需要构建一个新的对象属性用来管理属性名、属性值、
+以及记录点击某个属性值前的查询 url。
+
+因为这是展示给前端页面的数据，所以直接把它封装进解析 es 响应数据的对象内：
+
+```java
+public class SearchResult {
+    // 面包屑导航数据
+    private List<NavVo> navs;
+    @Data
+    public static class NavVo {
+      private String navName;
+      private String navValue;
+      private String link;
+    }
+}
+```
+ 
+当然，如果要获取点击某个属性值前的查询 url，那就需要用到 HttpServletRequest 了，通过 HttpServletRequest 的 getQueryString() 方法可以直接获取浏览器中 url 的 "?" 后的所有数据，
+所以可以在 Controller 层进行接收后，封装进 SearchParam 对象中，这样可以较为方便地传递给 Service 层。
+
+```java
+public class SearchParam {
+    // 前端查询的 url 中 "?" 后的所有查询条件
+    private String queryString;
+}
+```
+
+条件准备完毕，进行数据的封装。在前端点击某个属性值后，它就会作为请求参数被封装进 SearchParam 对象中，所以关于 attr 的数据都可以通过该对象获取，不需要再次远程调用别的服务查询数据库。
+通过 SearchParam 获取所有的 attr 数据，然后依次遍历它们获取它们的 id 和 value。这里的数据可以不用 es 中的，因为 es 中的数据是还没封装好的，并且 es 的 attr 聚合的 value 值是所有值，
+它没有对其进行区分，而 SearchParam 在封装时就对这些数据进行了详细的区分，通过前端的点击可以获取某个 attrId 对应的唯一的那个 value。
 
 ```java
 // 6. 构建面包屑 NavVo
@@ -9632,6 +9664,7 @@ if (param.getAttrs() != null) { // 通过传递的参数获取所有属性
         SearchResult.NavVo navVo = new SearchResult.NavVo();
         navVo.setNavValue(attrValue);
         // 获取属性名称
+        // attrVos 是上面处理 es 的聚合时创建的对象，主要是用来通过 attrId 获取对应的 attrName，避免调用别的服务查询数据库
         attrVos.stream()
                 .filter(attrVo -> attrVo.getAttrId().toString().equals(attrId))
                 .findFirst()
@@ -9656,6 +9689,1031 @@ searchResult.setNavs(navVos);
 return searchResult;
 ```
 
+面包屑的 attrName 和 attrValue 封装完毕，就需要处理返回连接了，这里的逻辑就是先接收当前的 queryString，然后让本次请求点击的那个属性的请求参数与其进行对比，
+如果有一致的，就把它替换成 ""，以此达到回退的效果。例如：当前 queryString：attrs=15_高通(Qualcomm)&attrs=16_骁龙665，本次前端点击的属性条件为 attrs=16_骁龙665，
+那么就需要让 attrs=16_骁龙665 与 queryString 进行匹配，找到 attrs=16_骁龙665 并把它删除或置空，所以最初的逻辑就是直接调用字符串的 replace() 方法，
+把匹配到的数据替换为 ""，不过当时忽略了浏览器的 url 会自动使用 UTF-8 对中文进行编码，所以后端接收到的 queryString 其实为 attrs=15_%E9%AB%98%E9%80%9A(Qualcomm)&attrs=16_%E9%AA%81%E9%BE%99665。
+而 SearchParam 中封装的 attr 对象存储的是字符串，这就会导致匹配过程无法达到效果，总是匹配失败，因此要对 attr 的 attrName 和 attrValue 进行 UTF-8 的编码。
+其次，replace() 只能做字面替换， 
+
+```java
+// 生成取消面包屑的链接
+String queryString = Optional.ofNullable(param.getQueryString()).orElse("");
+String encodedAttr = URLEncoder.encode(attr, StandardCharsets.UTF_8);
+String attrParam1 = "&attrs=" + encodedAttr;
+String attrParam2 = "?attrs=" + encodedAttr;
+queryString = queryString.replace(attrParam1, "").replace(attrParam2, "");
+// 如果获取到的请求参数以 & 开头，就需要把 & 去掉
+if (queryString.startsWith("&")) {
+    queryString = queryString.substring(1);
+}
+```
+
+但最初的这种写法还是无法达到去除掉效果，经过 debug 发现进行替换后的 queryString 仍为前端传递来的 queryString。首先，URLEncoder.encode 的编码规则和浏览器实际传输的 query string 编码规则不完全一样，
+浏览器会对空格编码为 %20，而 URLEncoder.encode 会转成 "+"，如果参数里有 `()`、`-`、`_` 等符号，编码结果也可能不一致。而 replace() 是完全依赖字符串的匹配，
+如果匹配值有点不一样都会匹配失败。而对 queryString 里的 url 参数做解码时，不管浏览器怎么编码的 %28、+、中文 %E9%AB%98 等，解码后得到的值就是原始字符串，也就是在代码里写的 attr。
+所以原来的写法是不行的，必须把 queryString 解码成字符串后再比较。
+
+```java
+List<SearchResult.NavVo> navVos = new ArrayList<>();
+if (param.getAttrs() != null) { // 通过传递的参数获取所有属性
+    for (String attr : param.getAttrs()) { // attr=16_A13仿生
+        String[] split = attr.split("_", 2); // 只拆分成 2 个部分
+        if (split.length != 2) continue;
+        // 获取 attrId
+        String attrId = split[0];
+        // 获取 attrValue
+        String attrValue = split[1];
+        // 封装为 NavVo 对象
+        SearchResult.NavVo navVo = new SearchResult.NavVo();
+        navVo.setNavValue(attrValue);
+        // 获取属性名称
+        // attrVos 是上面处理 es 的聚合时创建的对象，主要是用来通过 attrId 获取对应的 attrName，避免调用别的服务查询数据库
+        attrVos.stream()
+                .filter(attrVo -> attrVo.getAttrId().toString().equals(attrId))
+                .findFirst()
+                .ifPresent(attrVo -> navVo.setNavName(attrVo.getAttrName()));
+        // 生成取消面包屑的链接
+        String queryString = Optional.ofNullable(param.getQueryString()).orElse("");
+        List<String> queryAttrParams = new ArrayList<>();
+        // 根据 & 进行分割
+        for (String p : queryString.split("&")) {
+            if (!p.isEmpty()) queryAttrParams.add(p);
+        }
+        String targetAttr = attr; // 原始 attr，例如 "15_高通(Qualcomm)"
+        // 从 queryString 里删除目标属性参数
+        queryAttrParams.removeIf(p -> {
+            String[] kv = p.split("=", 2); // limit=2 的作用：即便 value 里还有 "="，也只切一次，避免被继续拆开
+            if (kv.length != 2) {
+                return false;
+            }
+            // 只处理 key 为 "attrs" 的参数；其他参数（如 catalog3Id、brandId）一律保留
+            if (!kv[0].equals("attrs")) {
+                return false;
+            }
+            try {
+                // 对 value 做 URL 解码（把 %E4%BB%A5… 还原成中文；把 '+' 按表单规则解码成空格）
+                String value = java.net.URLDecoder.decode(kv[1], StandardCharsets.UTF_8);
+                // 如果解码后的值正好等于要移除的那个 attr（未编码的原始字符串），就返回 true -> 删除
+                return value.equals(targetAttr);
+            } catch (Exception e) {
+                return false;
+            }
+        });
+        String newQuery = String.join("&", queryAttrParams);
+        // 对原始的请求条件进行判断，如果为空，那么取消面包屑后直接拼接空值；否则拼接原有的 queryString
+        navVo.setLink("http://search.gulimall.com/list.html" + (newQuery.isEmpty() ? "" : "?" + newQuery));
+        navVos.add(navVo);
+    }
+}
+searchResult.setNavs(navVos);
+```
+
+新的写法则是先对 queryString 的 & 进行分割，拿到每个 attr 数据（需要进行对比是否为 attrs），然后获取 attrs 等号后面的数据，例如：15_%E9%AB%98%E9%80%9A(Qualcomm)。
+接着对其进行解码成字符串，再用字符串进行对比，如果一致则从 queryString 中删除，删除后则为前端添加某个属性前的原始请求路径，把它作为 navVo 的 link 参数。
+
+```html
+<div class="JD_ipone_one c">
+    <!--面包屑导航-->
+    <a th:href="${nav.link}" th:each="nav : ${result.navs}"><span th:text="${nav.navName}"></span>:<span th:text="${nav.navValue}"></span> × </a>
+</div>
+```
+
+前端的跳转逻辑较为简单，直接把 navVo 对象的 link 属性作为原始路径进行跳转即可。处理完回退功能后，发现点击某个属性值后，属于该属性值的那个 name 仍然存在，例如：
+高通(Qualcomm) 属于 CPU 品牌，在选中高通(Qualcomm) 时，CPU 品牌这一行的所有数据都不应该再显示了，因为它们是互斥的，所以需要在前端页面进行数据显示的管理。
+而后端这里可以选则再响应返回结果对象 SearchResult 中添加一个字段，专门统计那些已经被选中的属性的 id，前端再判断哪些属性属于这个 id，然后取消显示即可。
+
+```java
+public class SearchResult {
+    private List<Long> blankAttrIds; // 添加某个属性值后，该属性所属的那个 name 不显
+}
+```
+
+在处理面包屑的代码中可以把获取到的 attrId 添加进 blankAttrIds，但需要注意它的类型必须和原来封装的 attrId 类型一致，也就是都用 Long 类型，否则前端进行判断时会判断错误。
+
+```java
+private SearchResult buildSearchResult(SearchResponse searchResponse, SearchParam param) {
+    ...
+    // 6. 构建面包屑 NavVo
+    List<SearchResult.NavVo> navVos = new ArrayList<>();
+    List<Long> blankAttrIds = new ArrayList<>();
+    if (param.getAttrs() != null) { // 通过传递的参数获取所有属性
+        for (String attr : param.getAttrs()) { // attr=16_A13仿生
+            String[] split = attr.split("_", 2); // 只拆分成 2 个部分
+            if (split.length != 2) continue;
+            // 获取 attrId
+            String attrId = split[0];
+            blankAttrIds.add(Long.valueOf(attrId));
+            ...
+        }
+    }
+    searchResult.setNavs(navVos);
+    searchResult.setBlankAttrIds(blankAttrIds);
+}
+```
+
+前端则通过域获取 result 中的 blankAttrIds，用它和当前 div 中的 attrId 对比，如果该 attrId 在 blankAttrIds 存在，证明这个属性是已经添加过的，则不显示。
+
+```html
+<div class="JD_pre" th:each="attr:${result.attrs}" th:if="${!#lists.contains(result.blankAttrIds, attr.attrId)}">
+    ...
+</div>
+```
+
+****
+# 七、商品详情
+
+## 1. 异步
+
+### 1.1 概述
+
+为什么需要异步？这里以服务员在餐厅服务为例：
+
+- 同步（Synchronous）：服务员接到顾客 A 点单后，亲自去后厨炒菜，炒好后再端给 A。在这期间，他无法为顾客 B 服务，整个餐厅效率极低，如果顾客多起来，那他们就需要等待很久
+- 异步（Asynchronous）：服务员接到顾客 A 点单后，将菜单交给后厨（另一个线程），然后立即去为顾客 B 服务，当后厨做好菜后，通过某种方式（比如摇铃）通知服务员，服务员再去取菜。这样服务员（主线程）的时间得到了充分利用，餐厅吞吐量大大提升
+
+异步的核心思想就是：避免让主线程（通常是处理用户请求或UI操作的线程）等待那些耗时的操作（如 IO 操作、网络请求、复杂计算），主线程只需发起任务，然后立刻返回去处理其他工作。
+耗时任务在后台执行，执行完成后通过回调、通知等方式告知主线程结果。以此提高响应速度与吞吐量，能更好的资源利用，如在等待 IO 时，CPU 可以做别的事情。
+
+****
+### 1.2 线程的基本创建方式
+
+1、继承 Thread 类
+
+这是最基础的方式，通过继承 Thread 类并重写其 run() 方法再调用实例的 start() 方法来启动新线程。
+
+```java
+public class MyThread extends Thread {
+    private String threadName;
+    public MyThread(String name) {
+        this.threadName = name;
+    }
+
+    @Override
+    public void run() {
+        // 在新线程中执行的代码
+        for (int i = 0; i < 5; i++) {
+            System.out.println(threadName + " is running: " + i);
+            try {
+                Thread.sleep(500); // 模拟耗时操作，让效果更明显
+            } catch (InterruptedException e) {
+                System.out.println(threadName + " was interrupted.");
+            }
+        }
+        System.out.println(threadName + " exiting.");
+    }
+}
+
+public class Main {
+    public static void main(String[] args) {
+        System.out.println("Main thread started.");
+        // 创建线程对象
+        MyThread threadA = new MyThread("Thread-A");
+        MyThread threadB = new MyThread("Thread-B");
+        // 启动线程
+        threadA.start();
+        threadB.start();
+        // 主线程继续执行自己的代码
+        for (int i = 0; i < 3; i++) {
+            System.out.println("Main thread is doing other work: " + i);
+        }
+        System.out.println("Main thread finished. (但程序不会结束，要等待所有线程结束)");
+    }
+}
+```
+
+输出顺序是不可预测的（交错执行），每次运行都可能不同：
+
+```text
+Main thread started.
+Main thread is doing other work: 0
+Thread-A is running: 0
+Main thread is doing other work: 1
+Thread-B is running: 0
+Main thread is doing other work: 2
+Main thread finished.
+Thread-A is running: 1
+Thread-B is running: 1
+...
+```
+
+2、实现 Runnable 接口
+
+创建一个实现 Runnable 接口的类并重写 run() 方法，然后创建该实现类的实例（这是一个任务对象）与 Thread 对象，并将 Runnable 实例作为参数传递给 Thread 的构造函数，
+最后调用 Thread 对象的 start() 方法。
+
+```java
+public class MyRunnable implements Runnable {
+    private String taskName;
+    public MyRunnable(String name) {
+        this.taskName = name;
+    }
+    @Override
+    public void run() {
+        for (int i = 0; i < 5; i++) {
+            System.out.println(taskName + " is executing: " + i + " on " + Thread.currentThread().getName());
+            try {
+                Thread.sleep(500);
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+        }
+    }
+}
+
+public class Main {
+    public static void main(String[] args) {
+        System.out.println("Main thread: " + Thread.currentThread().getName());
+        // 创建任务对象（而不是线程对象）
+        Runnable task1 = new MyRunnable("Task-1");
+        Runnable task2 = new MyRunnable("Task-2");
+        // 创建线程对象并传入任务，然后启动
+        Thread thread1 = new Thread(task1, "MyThread-1"); // 第二个参数可指定线程名
+        Thread thread2 = new Thread(task2);
+        thread2.setName("MyThread-2"); // 也可以通过 setName 方法设置线程名
+        thread1.start();
+        thread2.start();
+        Thread thread3 = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                System.out.println("running");
+            }
+        });
+        thread3.start();
+    }
+}
+```
+
+因为是实现接口的缘故，实现了 Runnable 接口的类仍然可以继承其他类，所以灵活性更高，并且 run() 与线程分离，同一个任务可以被多个线程执行。
+
+3、实现 Callable 接口 + FutureTask
+
+Runnable 的 run() 方法返回类型是 void，且不能抛出异常，如果需要异步任务有返回值或能抛出异常，就需要使用 Callable 接口。但 Callable<V> 接口其实类似于 Runnable，
+只不过它的 call() 方法可以返回泛型类型 V 的值，并且可以抛出异常。而 FutureTask<V> 实现了 RunnableFuture 接口，它既是一个 Runnable（可以传给 Thread），
+又可以用来在将来获取 Callable 的计算结果（通过 Future 接口的方法）。
+
+具体步骤为：创建一个实现 Callable 接口的类并实现 call() 方法与返回结果，接着创建 FutureTask 对象，封装 Callable 实例，传入 FutureTask 给 Thread 并启动线程。
+
+```java
+public class MyCallable implements Callable<String> {
+    private int taskId;
+    public MyCallable(int taskId) {
+        this.taskId = taskId;
+    }
+    @Override
+    public String call() throws Exception { // 可以返回 String，也可以抛出异常
+        Thread.sleep(2000);
+        return "Result:" + taskId; // 返回计算结果
+    }
+}
+
+public class Main {
+    public static void main(String[] args) {
+        // 创建 Callable
+        Callable<String> callableTask = new MyCallable(100);
+        // 用 FutureTask 包装 Callable
+        FutureTask<String> futureTask = new FutureTask<>(callableTask);
+        // 创建线程并启动
+        Thread thread = new Thread(futureTask);
+        thread.start();
+        System.out.println("主线程空闲中...");
+        try {
+            // 获取异步任务的结果（这是一个阻塞调用）
+            String result = futureTask.get(); // 会等待 call() 方法执行完毕
+            System.out.println("Got " + result);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+}
+```
+
+****
+### 1.3 线程池
+
+线程池就是预先创建一定数量线程的容器，用于执行大量任务，核心目的是复用线程，降低线程创建和销毁的开销，提高系统吞吐量。像上面的哪三种创建线程的方法不存在约束，
+只要有调用某个方法来创建线程的话，那就会无止境地创建线程，直到系统内存爆满崩溃。而线程池可以可以复用线程来控制线程的创建与销毁次数，减少系统开销，
+并且可以限制同时运行线程数量，避免因为线程过多导致系统资源耗尽。Java 提供了 java.util.concurrent 包来实现线程池，核心类是 ThreadPoolExecutor，其相关接口与类：
+
+- Executor：最顶层的执行接口，只有一个 execute(Runnable command) 方法，所以只负责执行任务，不提供线程管理、任务状态获取等功能。当只需要把任务提交给某种执行机制，而不关心线程池内部管理时，可以使用。
+- ExecutorService：继承了 Executor，是真正的线程池接口，提供了更强大的功能，如提交 Callable 任务、关闭线程池、获取任务执行状态（Future）等
+- ScheduledExecutorService：继承了 ExecutorService，支持定时或周期性任务的线程池接口
+- ThreadPoolExecutor：这是最核心、最标准的线程池实现类，是 Java 线程池的标准实现，通常通过工厂类配置它。Java 线程池的 标准实现，是真正控制线程池行为的核心类，所有线程池工厂（Executors）创建的线程池，内部最终都是这个类。
+- Executors：线程池的工厂工具类，提供了许多静态方法来创建配置好的 ExecutorService 实例（内部仍然是 ThreadPoolExecutor）
+
+```text
+Executor (接口)
+  └─ ExecutorService (接口)
+        └─ ScheduledExecutorService (接口)
+  └─ ThreadPoolExecutor (类，实现 ExecutorService)
+Executors (工具类) --> 创建 ThreadPoolExecutor
+```
+
+ThreadPoolExecutor 核心构造参数（七参数）：
+
+```java
+public ThreadPoolExecutor(
+    int corePoolSize,
+    int maximumPoolSize,
+    long keepAliveTime,
+    TimeUnit unit,
+    BlockingQueue<Runnable> workQueue,
+    ThreadFactory threadFactory,
+    RejectedExecutionHandler handler
+)
+```
+
+1、corePoolSize (核心线程数)
+
+线程池中长期维持的线程数量，即使它们是空闲的也不会被销毁（除非设置了 allowCoreThreadTimeOut）
+
+2、maximumPoolSize (最大线程数)
+
+线程池中允许存在的最大线程数量，包括核心线程数
+
+3、keepAliveTime + unit (线程空闲存活时间)
+
+当线程数超过 corePoolSize 时，多余的空闲线程在等待新任务时的最长时间，超过这个时间就会被终止销毁。
+
+4、workQueue (工作队列)
+
+用于保存等待执行的任务的阻塞队列，这是一个非常重要的参数，不同类型的队列决定了线程池的排队策略。常用队列类型：
+
+| 队列类型                    | 特点           | 适用场景          |
+| ----------------------- | ------------ | ------------- |
+| `ArrayBlockingQueue`    | 有界队列，先进先出    | 限流场景，防止任务无限积压 |
+| `LinkedBlockingQueue`   | 可有界也可无界，FIFO | 任务生产速度快、线程数固定 |
+| `SynchronousQueue`      | 不存储元素，直接交给线程 | 高并发短任务，缓存最少   |
+| `PriorityBlockingQueue` | 优先级队列        | 需要任务优先级控制     |
+| `DelayQueue`            | 延迟队列         | 定时或延迟任务       |
+
+
+5、threadFactory (线程工厂)
+
+用于创建新线程的工厂，可以用于设置线程名、优先级、守护线程状态等，便于监控和调试。默认使用 Executors.defaultThreadFactory() 创建非守护线程（JVM 会等待线程执行完毕才会退出）
+
+6、handler (拒绝策略)
+
+当线程池和队列都已满，无法处理新提交任务时，采取的拒绝策略。默认是 AbortPolicy 拒绝策略：
+
+| 策略类                   | 说明                                      |
+| --------------------- | --------------------------------------- |
+| `AbortPolicy`         | 默认策略，直接抛异常 `RejectedExecutionException` |
+| `CallerRunsPolicy`    | 调用线程自己执行任务，降低提交速度                       |
+| `DiscardPolicy`       | 直接丢弃任务，不抛异常                             |
+| `DiscardOldestPolicy` | 丢弃队列中最老的任务，腾出空间执行新任务                    |
+
+Executors 工厂类提供了几种预设的配置：
+
+1、newFixedThreadPool(int nThreads) 固定大小线程池
+
+默认配置为 corePoolSize = maximumPoolSize = nThreads，workQueue 为 LinkedBlockingQueue，线程数固定且为无界队列，适用于负载较重、需要限制线程数量的服务器场景。
+
+2、newCachedThreadPool() 可缓存线程池
+
+默认配置为 corePoolSize = 0，maximumPoolSize = Integer.MAX_VALUE（int 类型的最大值，2^31 - 1），keepAliveTime = 60s，
+workQueue 为 SynchronousQueue（不存储元素的队列）。理论上可无限创建线程，但可能创建过多线程导致 CPU 和内存耗尽。
+
+3、newSingleThreadExecutor() 单线程线程池
+
+默认配置为 corePoolSize = maximumPoolSize = 1，workQueue 为 LinkedBlockingQueue（无界队列）。用于保证所有任务按提交顺序串行执行，当需要保证任务顺序执行，并且同时有后台线程异步处理时使用。
+
+4、newScheduledThreadPool(int corePoolSize) 定时任务线程池
+
+默认配置为 maximumPoolSize = Integer.MAX_VALUE，使用 DelayedWorkQueue，常用于执行定时或周期性任务
+
+```java
+public class ThreadPoolDemo {
+    public static void main(String[] args) {
+        // 1. 手动创建线程池
+        ThreadPoolExecutor executor = new ThreadPoolExecutor(
+                2, // corePoolSize: 常驻核心线程数
+                5, // maximumPoolSize: 最大线程数
+                60, // keepAliveTime: 临时线程空闲存活时间
+                TimeUnit.SECONDS, // unit: 时间单位
+                new ArrayBlockingQueue<>(10), // workQueue: 有界队列，容量为10
+                Executors.defaultThreadFactory(), // threadFactory: 使用默认工厂
+                new ThreadPoolExecutor.AbortPolicy() // handler: 默认拒绝策略，直接抛出异常
+        );
+        // 2. 提交任务 (20 个任务，测试线程池行为)
+        for (int i = 0; i < 20; i++) {
+            final int taskId = i;
+            try {
+                executor.execute(() -> {
+                    System.out.println("Task " + taskId + " is running on " + Thread.currentThread().getName());
+                    try {
+                        Thread.sleep(2000);
+                    } catch (InterruptedException e) {
+                        e.printStackTrace();
+                    }
+                });
+            } catch (RejectedExecutionException e) {
+                System.err.println("Task " + taskId + " was rejected! (队列和线程池已满)");
+            }
+        }
+        // 3. 关闭线程池
+        executor.shutdown(); // 平滑关闭，不再接受新任务，等待已提交任务执行完成
+        // executor.shutdownNow(); // 立即尝试停止所有正在执行的任务，并返回等待执行的任务列表
+    }
+}
+```
+
+```text
+Task 15 was rejected! (队列和线程池已满)
+Task 16 was rejected! (队列和线程池已满)
+Task 17 was rejected! (队列和线程池已满)
+Task 18 was rejected! (队列和线程池已满)
+Task 19 was rejected! (队列和线程池已满)
+Task 0 is running on pool-1-thread-1
+Task 14 is running on pool-1-thread-5
+Task 1 is running on pool-1-thread-2
+Task 12 is running on pool-1-thread-3
+Task 13 is running on pool-1-thread-4
+Task 2 is running on pool-1-thread-1
+Task 3 is running on pool-1-thread-5
+Task 4 is running on pool-1-thread-4
+Task 6 is running on pool-1-thread-3
+Task 5 is running on pool-1-thread-2
+Task 7 is running on pool-1-thread-1
+Task 8 is running on pool-1-thread-5
+Task 9 is running on pool-1-thread-4
+Task 10 is running on pool-1-thread-3
+Task 11 is running on pool-1-thread-2
+```
+
+使用强制关闭：
+
+```text
+Task 15 was rejected! (队列和线程池已满)
+Task 16 was rejected! (队列和线程池已满)
+Task 17 was rejected! (队列和线程池已满)
+Task 18 was rejected! (队列和线程池已满)
+Task 19 was rejected! (队列和线程池已满)
+java.lang.InterruptedException: sleep interrupted
+	at java.base/java.lang.Thread.sleep(Native Method)
+	at MyThreadPool.lambda$main$0(MyThreadPool.java:22)
+	at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1136)
+	at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:635)
+	at java.base/java.lang.Thread.run(Thread.java:833)
+...
+Task 13 is running on pool-1-thread-4
+Task 14 is running on pool-1-thread-5
+Task 12 is running on pool-1-thread-3
+Task 1 is running on pool-1-thread-2
+Task 0 is running on pool-1-thread-1
+```
+
+****
+### 1.4 CompletableFuture 异步编排
+
+异步编排指的是管理和协调多个异步任务的执行流程，包括串行化、并行化、聚合、异常处理等操作，传统的线程返回值需要通过 Future 获取结果且需要阻塞调用 get()，
+而 CompletableFuture 提供了大量的 API 将多个异步任务以各种方式组合拼接起来，形成一个完整的、非阻塞的异步工作流。
+
+#### 1.4.1 启动异步任务
+
+CompletableFuture 提供了两个静态方法来启动异步任务：supplyAsync 和 runAsync，它们的区别在于任务是否有返回值。
+
+1、supplyAsync：启动有返回值的异步任务，它接收一个 Supplier 函数式接口，该接口的定义是 () -> T，即一个不接受参数但返回结果的函数。
+
+```java
+// 使用默认的 ForkJoinPool.commonPool() 作为线程池
+static <U> CompletableFuture<U> supplyAsync(Supplier<U> supplier)
+
+// 使用自定义的 Executor 作为线程池
+static <U> CompletableFuture<U> supplyAsync(Supplier<U> supplier, Executor executor)
+```
+
+```java
+public class SupplyAsyncDemo {
+    public static void main(String[] args) throws ExecutionException, InterruptedException {
+        // 使用默认线程池
+        CompletableFuture<String> future1 = CompletableFuture.supplyAsync(() -> {
+            // 在新的线程中执行的耗时任务
+            System.out.println("Task 1 : " + Thread.currentThread().getName());
+            simulateLongRunningTask(2); // 模拟耗时 2 秒的操作
+            return "Result from Task 1";
+        });
+
+        // 使用 Lambda 表达式引用已有方法
+        CompletableFuture<Integer> future2 = CompletableFuture.supplyAsync(SupplyAsyncDemo::calculateSomething);
+
+        // 使用自定义线程池
+        // 创建一个固定大小的自定义线程池
+        ExecutorService customExecutor = Executors.newFixedThreadPool(3, r -> {
+            Thread thread = new Thread(r);
+            thread.setName("自定义线程：" + thread.getId());
+            return thread;
+        });
+
+        CompletableFuture<Double> future3 = CompletableFuture.supplyAsync(() -> {
+            System.out.println("Task 3 : " + Thread.currentThread().getName());
+            simulateLongRunningTask(1);
+            return 42.0;
+        }, customExecutor); // 显式指定自定义线程池
+
+        // 主线程继续执行，不会被阻塞
+        System.out.println("主线程可以执行其它任务: " + Thread.currentThread().getName());
+
+        // 如果需要获取结果，可以调用 get()（这会阻塞主线程）
+        String result1 = future1.get(); // 阻塞，直到 future1 完成
+        Integer result2 = future2.get();
+        Double result3 = future3.get();
+
+        System.out.println("Result 1: " + result1);
+        System.out.println("Result 2: " + result2);
+        System.out.println("Result 3: " + result3);
+
+        // 关闭自定义线程池，CompletableFuture 中的默认线程池由 JVM 管理生命周期，所以不用手动关闭
+        customExecutor.shutdown();
+    }
+
+    // 模拟耗时操作
+    private static void simulateLongRunningTask(int seconds) {
+        try {
+            TimeUnit.SECONDS.sleep(seconds);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException(e);
+        }
+    }
+
+    private static Integer calculateSomething() {
+        System.out.println("线程计算中: " + Thread.currentThread().getName());
+        simulateLongRunningTask(3);
+        return 100 * 2;
+    }
+}
+```
+
+supplyAsync 调用会立即返回一个 CompletableFuture<String> 对象，而不会阻塞调用线程，传入的 Supplier 任务也会被提交到线程池中异步执行，而任务的返回值则会被自动设置到 CompletableFuture 对象中。
+如果不指定 Executor，默认使用 ForkJoinPool.commonPool()，其生命周期由 JVM 管理，被整个 JVM 共享且配置固定，随 JVM 一起消逝。
+
+```text
+线程计算中: ForkJoinPool.commonPool-worker-2
+Task 1 : ForkJoinPool.commonPool-worker-1
+主线程可以执行其它任务: main
+Task 3 : 自定义线程：18
+Result 1: Result from Task 1
+Result 2: 200
+Result 3: 42.0
+```
+
+2、runAsync：启动无返回值的异步任务，它接收一个 Runnable 接口，定义是 () -> void
+
+```java
+// 使用默认的 ForkJoinPool.commonPool()
+static CompletableFuture<Void> runAsync(Runnable runnable)
+
+// 使用自定义的 Executor
+static CompletableFuture<Void> runAsync(Runnable runnable, Executor executor)
+```
+
+```java
+public class RunAsyncDemo {
+    public static void main(String[] args) {
+        // 执行异步任务但不返回结果
+        CompletableFuture<Void> future1 = CompletableFuture.runAsync(() -> {
+            System.out.println(Thread.currentThread().getName() + " 执行无返回值的异步任务 2 s");
+            simulateLongRunningTask(2);
+            System.out.println(Thread.currentThread().getName() + " 执行完毕");
+            // 没有 return 语句
+        });
+
+        // 记录日志或发送通知等副作用操作
+        CompletableFuture<Void> logFuture = CompletableFuture.runAsync(() -> {
+            System.out.println(Thread.currentThread().getName() + " [INFO] 开始记录日志");
+        });
+
+        // 使用自定义线程池执行资源释放任务
+        ExecutorService ioBoundExecutor = Executors.newCachedThreadPool();
+        CompletableFuture<Void> fileOperationFuture = CompletableFuture.runAsync(() -> {
+            System.out.println("执行 IO 操作: " + Thread.currentThread().getName());
+            // 模拟文件I/O操作
+            simulateLongRunningTask(1);
+        }, ioBoundExecutor);
+
+        // 虽然不需要结果，但可以等待任务完成（例如，在主程序退出前）
+        future1.join(); // join() 与 get() 类似，阻塞当前线程，直到对应的异步任务执行完成，但不抛出受检异常
+        fileOperationFuture.join();
+
+        System.out.println("主线程执行完毕");
+        ioBoundExecutor.shutdown();
+    }
+
+    private static void simulateLongRunningTask(int seconds) {
+        try {
+            Thread.sleep(seconds * 1000L);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+}
+```
+
+runAsync 返回 CompletableFuture<Void>，因为 Runnable 没有返回值，它非常适合执行无需返回结果的操作，如日志记录、发送通知、清理临时资源等。这里返回的 Future 对象是泛型 Void，
+它的 get() 方法总是返回 null，它主要用于表示任务完成的状态，而不是携带数据。
+
+****
+#### 1.4.2 完成回调和异常感知
+
+1、回调
+
+传统的 Future.get() 是主动拉取返回数据，需要主动调用一个阻塞的方法去询问结果。CompletableFuture 的完成回调是被动通知，需要先告诉 Future 完成后该做什么，
+它就会在任务结束时自动通知并执行相应操作，调用线程完全不会被阻塞。回调方法：
+
+- thenApply(Function<T,U>)：接收上一个任务的结果 T，进行转换，返回新结果 U
+- thenAccept(Consumer<T>)：接收上一个任务的结果 T，进行消费（如打印），无返回值
+- thenRun(Runnable)：不关心上一个任务的结果，只在它完成后执行一个 Runnable 接口
+
+```java
+CompletableFuture<Void> voidCompletableFuture = CompletableFuture.supplyAsync(() -> {
+            System.out.println("第一阶段：获取用户ID");
+            try {
+                Thread.sleep(2000);
+            } catch (InterruptedException e) {
+                throw new RuntimeException(e);
+            }
+            return 123;
+        })
+        .thenApply(userId -> { // 转换：userId -> userObject
+            System.out.println("第二阶段：根据ID(" + userId + ")查询用户详情");
+            try {
+                Thread.sleep(2000);
+            } catch (InterruptedException e) {
+                throw new RuntimeException(e);
+            }
+            return "User_" + userId; // 模拟返回用户对象
+        })
+        .thenAccept(user -> { // 消费：使用用户对象
+            System.out.println("第三阶段：发送欢迎邮件给 " + user);
+            try {
+                Thread.sleep(2000);
+            } catch (InterruptedException e) {
+                throw new RuntimeException(e);
+            }
+        })
+        .thenRun(() -> { // 最终回调：不依赖任何结果
+            System.out.println("第四阶段：所有流程完成，记录日志");
+            try {
+                Thread.sleep(2000);
+            } catch (InterruptedException e) {
+                throw new RuntimeException(e);
+            }
+        });
+// 主线程立即继续，不会被上面的任何操作阻塞
+System.out.println("主线程已启动异步流水线，现在继续处理其他请求...");
+// 等待一段时间让异步任务执行
+voidCompletableFuture.get();
+```
+
+```text
+第一阶段：获取用户ID
+主线程已启动异步流水线，现在继续处理其他请求...
+第二阶段：根据ID(123)查询用户详情
+第三阶段：发送欢迎邮件给 User_123
+第四阶段：所有流程完成，记录日志
+```
+
+需要注意的是，同步回调和异步回调是有区别的，thenApply / thenAccept / thenRun 为同步执行，回调函数会在完成上一个任务的同一个线程中立即执行，
+而 thenApplyAsync / thenAcceptAsync / thenRunAsync 为异步执行，回调函数会被提交到线程池（默认或指定的），在另一个线程中执行。
+
+```java
+ExecutorService customExecutor = Executors.newFixedThreadPool(2);
+CompletableFuture.supplyAsync(() -> {
+    System.out.println("SupplyAsync in: " + Thread.currentThread().getName());
+    return "data";
+}, customExecutor)
+.thenApply(data -> { // 同步回调：在 supplyAsync 的同一个线程执行
+    System.out.println("thenApply (sync) in: " + Thread.currentThread().getName());
+    return data.toUpperCase();
+})
+.thenApplyAsync(data -> { // 异步回调：提交到线程池，可能换另一个线程执行
+    System.out.println("thenApplyAsync (async) in: " + Thread.currentThread().getName());
+    return data + "!";
+}, customExecutor)
+.thenAcceptAsync(result -> {
+    System.out.println("最终结果: " + result + " in: " + Thread.currentThread().getName());
+}, customExecutor);
+```
+
+2、异常感知与处理
+
+CompletableFuture 的异常不会立即抛出，而是会沿着异步链传播，直到遇到一个异常处理方法，这类似于 try-catch 的工作方式。
+
+1) exceptionally：捕获异常并提供降级结果，类似于 catch 块，它允许在发生异常时提供一个备用的默认值，使流程能够继续
+
+```java
+CompletableFuture.supplyAsync(() -> {
+                    if (Math.random() > 0.5) {
+                        throw new RuntimeException("查询数据库失败！");
+                    }
+                    return "Data from DB";
+                })
+                .thenApply(data -> data.toUpperCase()) // 如果上一步异常，此步不会执行
+                .exceptionally(ex -> { // 捕获任何阶段的异常
+                    System.err.println("Exception occurred: " + ex.getMessage());
+                    return "Default Data"; // 提供降级结果，类型必须与正常结果一致(String)
+                })
+                .thenAccept(data -> System.out.println("Processing: " + data)); // 会接收到正常数据或降级数据
+```
+
+异常结果：
+
+```text
+Exception occurred: java.lang.RuntimeException: 查询数据库失败！
+Processing: Default Data
+```
+
+正常结果：
+
+```text
+Processing: DATA FROM DB
+```
+
+2) handle：统一处理成功和失败，该方法无论前一阶段是成功完成还是异常完成，都会被调用，它接收两个参数：结果和异常
+
+```java
+CompletableFuture.supplyAsync(() -> {
+                    if (Math.random() > 0.5) {
+                        throw new RuntimeException("网络错误!");
+                    }
+                    return 100;
+                })
+                .handle((result, ex) -> { // 处理正常结果和异常
+                    if (ex != null) {
+                        System.out.println("操作失败，错误原因: " + ex.getMessage());
+                        return 0; // 异常时返回降级值
+                    } else {
+                        System.out.println("操作成功！");
+                        return result * 0.9; // 成功时转换结果
+                    }
+                })
+                .thenAccept(finalPrice -> System.out.println("最终结果: $" + finalPrice));
+```
+
+正常结果：
+
+```text
+操作成功！
+最终结果: $90.0
+```
+
+异常结果：
+
+```text
+操作失败，错误原因: java.lang.RuntimeException: 网络错误!
+最终结果: $0
+```
+
+3) whenComplete：感知完成状态但不改变结果，whenComplete 与 handle 类似，总能被执行，但关键区别在于它不改变最终结果
+
+```java
+CompletableFuture.supplyAsync(() -> "Result")
+        .whenComplete((result, ex) -> {
+            if (ex != null) {
+                // 只能记录日志或执行副作用，无法恢复或改变结果
+                System.out.println("任务失败，返回结果: " + result); // 返回 null
+            } else {
+                System.out.println("任务成功: " + result);
+            }
+        });
+// whenComplete 返回的 Future 结果与原始 Future 相同（成功则相同，失败则相同异常）
+```
+
+****
+#### 1.4.3 线程串行化
+
+线程串行化指的是将多个异步任务按照特定的顺序连接起来，形成一个任务流水线，前一个任务的输出是后一个任务的输入，而后一个任务必须等待前一个任务完成才能开始。
+它与并行化（多个任务同时执行）相对，强调的是任务之间的依赖关系和执行顺序。在 CompletableFuture 中，串行化通过 thenApply、thenAccept、thenRun 等方法实现，
+并返回一个新的 CompletableFuture，从而支持无限的链式调用。
+
+串行化主要分为四类，转换结果、消费结果、单纯回调和异步展开，前三个也就是分别调用 thenApply/thenApplyAsync、thenAccept/thenAcceptAsync、thenRun/thenRunAsync 方法，
+而异步展开则是用于解决嵌套的 CompletableFuture，当你有一个返回 CompletableFuture<U> 的任务，如果直接在 thenApply 中使用，则会得到嵌套对象 CompletableFuture<CompletableFuture<U>>，
+而 thenCompose 方法它接收一个函数，该函数根据前一个结果返回一个新的 CompletableFuture<U>，最终返回 CompletableFuture<U>
+
+```java
+public static void main(String[] args) throws ExecutionException, InterruptedException {
+
+    // 错误用法: 会产生 CompletableFuture<CompletableFuture<String>>
+    CompletableFuture<CompletableFuture<String>> badFuture =
+            CompletableFuture.supplyAsync(() -> "123")
+                    .thenApply(id -> fetchNameAsync(id)); // 返回 Future<String>
+  
+    // 正确用法: 使用 thenCompose 展开嵌套的 CompletableFuture
+    CompletableFuture<String> goodFuture =
+            CompletableFuture.supplyAsync(() -> "123")
+                    .thenCompose(id -> fetchNameAsync(id)); // 返回的是 Future<String>
+  
+    System.out.println(badFuture.get()); // java.util.concurrent.CompletableFuture@1cf4f579[Completed normally]
+    System.out.println(goodFuture.get()); // User_123
+}
+
+private static CompletableFuture<String> fetchNameAsync(String id) {
+    return CompletableFuture.supplyAsync(() -> "User_" + id);
+}
+```
+
+而在串行化中又分为同步执行（默认行为）与异步执行，它们调用的方法区别就是异步执行后面带有 ...Async。同步回调方法（thenApply, thenAccept, thenRun）会由完成前一个任务的同一个线程来立即执行；
+异步回调方法（thenApplyAsync, thenAcceptAsync 等）会将回调任务提交到线程池中执行，可能与上一个任务不在同一个线程。
+
+****
+#### 1.4.4 组合任务
+
+CompletableFuture 提供了两大类任务组合方法，这类方法强调两个任务的结果之间的关系，需要把它们结合在一起使用：
+
+1) 并行组合:两个任务独立运行，等它们都完成后再处理结果
+
+- thenCombine()：两个任务都完成后，把它们的结果合并
+- thenAcceptBoth()：两个任务都完成后，消费它们的结果，不返回新值
+- runAfterBoth()：两个任务都完成后，执行一个新的 Runnable，不关心结果
+
+2) 竞争组合:谁先完成就用谁的结果
+
+- applyToEither()：任意一个任务先完成，就用它的结果做转换
+- acceptEither()：任意一个任务先完成，就消费它的结果
+- runAfterEither()：任意一个任务先完成，就运行一个新的 Runnable，不关心结果
+
+1、thenCombine，两个任务并行执行，等它们都完成后，把结果合并成一个新的结果
+
+```java
+CompletableFuture<String> future1 = CompletableFuture.supplyAsync(() -> "Hello");
+CompletableFuture<String> future2 = CompletableFuture.supplyAsync(() -> "World");
+
+CompletableFuture<String> result =
+        future1.thenCombine(future2, (s1, s2) -> s1 + " " + s2);
+System.out.println(result.get()); // Hello World
+```
+
+2、thenAcceptBoth，两个任务都完成后，消费它们的结果，不返回值
+
+```java
+future1.thenAcceptBoth(future2, (s1, s2) -> {
+    System.out.println(s1 + " & " + s2); // Hello & World
+});
+```
+
+3、runAfterBoth，两个任务完成后，只执行一个 Runnable，不关心结果
+
+```java
+future1.runAfterBoth(future2, () -> {
+        System.out.println("Both done!");
+});
+```
+
+4、applyToEither，任意一个任务先完成，就用它的结果做转换
+
+```java
+CompletableFuture<String> fast = CompletableFuture.supplyAsync(() -> "Fast");
+CompletableFuture<String> slow = CompletableFuture.supplyAsync(() -> {
+    try {
+        Thread.sleep(1000);
+    } catch (Exception e) {
+        e.printStackTrace();
+    }
+    return "Slow";
+});
+// 使用任意一个 CompletableFuture 对象调用 applyToEither 方法
+CompletableFuture<String> result = fast.applyToEither(slow, s -> "Winner: " + s);
+System.out.println(result.get()); // Winner: Fast
+```
+
+5、acceptEither，任意一个任务先完成，就消费它的结
+
+```java
+fast.acceptEither(slow, s -> {
+    System.out.println("First result: " + s); // First result: Fast
+});
+```
+
+6、runAfterEither，任意一个任务完成，就执行一个 Runnable
+
+```java
+fast.runAfterEither(slow, () -> {
+    System.out.println("一个任务完成");
+});
+```
+
+CompletableFuture 还提供了两个方法用于多任务的聚合等待，这类方法更像是并发任务的协调器，主要作用是等待多个任务完成，并不关心它们结果的组合逻辑：
+
+1、allOf，等待所有任务完成
+
+用于等待一组 CompletableFuture 全部完成，它返回一个新的 CompletableFuture<Void>，它只关心所有任务是否完成，不关心它们的结果，它返回的 Future 没有聚合结果，需要手动从每个原始的 Future 中获取结果，
+如果任何一个任务异常完成，返回的 Future 也会异常完成。
+
+```java
+public class AllOfDemo {
+    public static void main(String[] args) throws ExecutionException, InterruptedException {
+        // 模拟三个独立的异步任务
+        CompletableFuture<String> future1 = CompletableFuture.supplyAsync(() -> fetchUserInfo("user123"));
+        CompletableFuture<String> future2 = CompletableFuture.supplyAsync(() -> fetchProductInfo("prod456"));
+        CompletableFuture<Integer> future3 = CompletableFuture.supplyAsync(() -> checkStock("prod456"));
+        // 组合它们，等待所有完成
+        CompletableFuture<Void> allFutures = CompletableFuture.allOf(future1, future2, future3);
+        // 当所有任务完成后，thenRun() 或 thenAccept() 会被触发
+        CompletableFuture<Void> finalFuture = allFutures.thenRun(() -> {
+            // 在这里安全地获取每个任务的结果（因为它们肯定完成了），所以调用 get() 不会阻塞
+            try {
+                String userInfo = future1.get();
+                String productInfo = future2.get();
+                Integer stock = future3.get();
+
+                System.out.println("整合所有数据:");
+                System.out.println(" - " + userInfo);
+                System.out.println(" - " + productInfo);
+                System.out.println(" - 库存: " + stock);
+            } catch (InterruptedException | ExecutionException e) {
+                e.printStackTrace();
+            }
+        });
+        // 等待最终结果
+        finalFuture.get();
+    }
+
+    // 模拟异步服务调用
+    static String fetchUserInfo(String userId) {
+        sleep(1000);
+        return "用户信息 " + userId;
+    }
+
+    static String fetchProductInfo(String prodId) {
+        sleep(1500);
+        return "商品信息 " + prodId;
+    }
+
+    static Integer checkStock(String prodId) {
+        sleep(800);
+        return 42;
+    }
+
+    static void sleep(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        }
+    }
+}
+```
+
+```text
+整合所有数据:
+ - 用户信息 user123
+ - 商品信息 prod456
+ - 库存: 42
+```
+
+2、anyOf()，等待任意任务完成
+
+用于等待一组 CompletableFuture 中的任意一个完成，它返回一个新的 CompletableFuture<Object>，注意返回的 Future 的结果是第一个完成的任务的结果（类型为 Object），
+其他未完成的任务会继续在后台执行，但它们的結果会被忽略。
+
+```java
+public class AnyOfDemo {
+    public static void main(String[] args) throws ExecutionException, InterruptedException {
+        // 模拟向三个不同的镜像源请求同一个数据
+        CompletableFuture<String> mirror1 = CompletableFuture.supplyAsync(() -> {
+            try {
+                return fetchFromMirror("Mirror1", 2000);
+            } catch (InterruptedException e) {
+                throw new RuntimeException(e);
+            }
+        });
+        CompletableFuture<String> mirror2 = CompletableFuture.supplyAsync(() -> {
+            try {
+                return fetchFromMirror("Mirror2", 1000);
+            } catch (InterruptedException e) {
+                throw new RuntimeException(e);
+            }
+        }); // 这个最快
+        CompletableFuture<String> mirror3 = CompletableFuture.supplyAsync(() -> {
+            try {
+                return fetchFromMirror("Mirror3", 3000);
+            } catch (InterruptedException e) {
+                throw new RuntimeException(e);
+            }
+        });
+
+        // 组合它们，等待任意一个完成
+        CompletableFuture<Object> anyFuture = CompletableFuture.anyOf(mirror1, mirror2, mirror3);
+
+        // 处理第一个返回的结果
+        anyFuture.thenAccept(result -> {
+            System.out.println("第一个响应被接收: " + result);
+        });
+
+        // 等待并获取结果（结果是Object类型，需要强转）
+        String firstResult = (String) anyFuture.get();
+        System.out.println("镜像: " + firstResult);
+    }
+
+    static String fetchFromMirror(String mirrorName, int delay) throws InterruptedException {
+        sleep(delay);
+        return "数据来自 " + mirrorName;
+    }
+}
+```
+
+****
 
 
 
