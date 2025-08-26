@@ -10714,6 +10714,778 @@ public class AnyOfDemo {
 ```
 
 ****
+## 2. 商品详情页的环境搭建
+
+搭建一个新的 html 页面就需要创建新的自定义域名，这里取名为 item.gulimall.com，在 hosts 文件中添加即可：
+
+```text
+192.168.0.110 item.gulimall.com
+```
+
+接着把静态资源都添加进 nginx，并修改 html 页面的访问路径为 nginx 中的路径：
+
+```shell
+cp -r /mnt/d/docker_dataMountDirectory/gmall-static-resource/item/. /nginx/html/static/item
+```
+
+接着便是修改网关的路径转发，因为商品详情是归为 product 服务的，所以直接在原有的网关配置下新增一个 Host 的要求即可：
+
+```yaml
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: nginx_host_route
+          uri: lb://gulimall-product
+          predicates:
+            - Host=gulimall.com,item.gulimall.com
+```
+
+成功后便需要新增一个 Controller 来处理页面跳转请求，让请求转发到对应的 html 页面：
+
+```java
+@GetMapping("/{skuId}.html")
+public String item(@PathVariable("skuId") Long skuId, Model model) {
+    System.out.println("准备查询的 skuId:" + skuId);
+    return "item";
+}
+```
+
+因为商品详情页是针对某个具体的商品的，所以需要接收它的 skuId，后端处理完毕，则需要修改前端的跳转路径了，在前端的检索页面，点击某个商品后应该携带它的 skuId 进行跳转，
+并且跳转到当前自定义的域名 item.gulimall.com，所以需要修改 search 服务下的 list.html 页面：
+
+```html
+<div class="rig_tab">
+    <div th:each="product:${result.getProducts()}">
+        <p class="da">
+            <a th:href="|http://item.gulimall.com/${product.skuId}.html|">
+                <img th:src="${product.getSkuImg()}" class="dim">
+            </a>
+        </p>
+    </div>
+</div>
+```
+
+这里的 skuId 是动态获取的，因为检索页的商品也是根据后端查询 es 得到的数据，所以这些数据都存在了域中，因此可以较为方便的动态获取 skuId。
+
+****
+## 3. 商品详情页的模型设计
+
+商品详情页需要展示商品的完整信息，包括SKU基本信息、图片、销售属性、SPU描述和规格参数等。这个模型设计采用分层结构，将不同类型的信息组织在不同的子对象中，
+确保数据结构的清晰性和可维护性。
+
+在电商系统里，一个商品详情页（用户点击某个 sku 进入的商品详情页面），要展示的信息非常多，来源也很分散，比如：
+
+- sku 基本信息来自 sku_info 表 
+- 图片来自 sku_images 表 
+- 销售属性（比如颜色、内存大小组合）来自 sku_sale_attr_value 表 
+- 商品介绍来自 spu_info_desc 表 
+- 规格参数来自 attr/attr_group/product_attr_value 表
+
+如果每个部分都让前端去调接口，那就需要多次请求，所以在后端就需要聚合这些分散的信息，打包成一个 VO 对象，一次性返回给前端：
+
+```java
+@Data
+public class SkuItemVo {
+
+    // sku 基本信息
+    private SkuInfoEntity skuInfo;
+
+    // sku 图片信息
+    private List<SkuImagesEntity> images;
+
+    // 获取 spu 的销售属性组合
+    private List<SkuItemSaleAttrVo> saleAttr;
+
+    // 获取 spu 的介绍
+    private SpuInfoDescEntity spuInfoDesc;
+
+    // 获取 spu 规格参数信息
+    List<SpuItemAttrGroupVo> groupAttrs;
+
+    @Data
+    public static class SkuItemSaleAttrVo {
+        private Long attrId;
+        private String attrName;
+        private List<String> attrValues;
+    }
+
+    @Data
+    public static class SpuItemAttrGroupVo {
+        private String groupName;
+        private List<SpuBaseAttrVo> attrs;
+    }
+
+    @Data
+    public static class SpuBaseAttrVo {
+        private String attrName;
+        private String attrValue;
+    }
+
+}
+```
+
+该 Vo 对象封装了商品详情页的一些常见属性：
+
+1、skuInfo：SKU 基本信息
+
+该属性对应数据库中的 sku_info 表，它用于展示某个具体 sku 的基础信息，如价格、重量、标题、副标题、默认图片等，而前端页面的商品标题、价格等就是直接从这里获取的。
+
+2、images：SKU 图片信息
+
+用于封装当前 sku 对应的图片集。
+
+3、saleAttr：SPU 层面的销售属性组合
+
+该属性是 spuId 下所有 sku 的销售属性值组合，同一个 spu 比如 "iPhone 14 Pro Max" 下，会有多个 sku（比如不同颜色、不同内存），销售属性则是用来描述该商品有哪些可选的销售属性，
+以及每个属性有哪些值。前端详情页的可选规格如手机颜色、版本、内存、套餐等就是从这里获取的。SkuItemSaleAttrVo 内部结构：
+
+```java
+@Data
+public static class SkuItemSaleAttrVo {
+    private Long attrId; 
+    private String attrName; // 属性名，比如 "颜色"
+    private List<String> attrValues; // 属性可选值，比如 ["黑色", "紫色", "银色"]
+}
+```
+
+4、spuInfoDesc：商品描述
+
+该数据从 spu_info_desc 表获取，它并不是普通的文本描述，而是一组图片描述，是对 spu 的图文描述，通常是后台商家录入的商品介绍（图片版），
+前端详情页的商品详情板块（文字描述 + 图文详情）就是从这获取的。
+
+5、groupAttrs：商品规格参数
+
+该属性是用来将商品的参数信息例如 CPU 型号、电池容量、尺寸重量等按照分组整理展示，它与 skuInfo 是有区别的，它通常是作为前端详情页的某个商品下的总体信息。内部结构：
+
+```java
+@Data
+public static class SpuItemAttrGroupVo {
+    private String groupName; // 参数组名称，比如 "主体参数"
+    private List<SpuBaseAttrVo> attrs; // 该组下的参数项
+}
+
+@Data
+public static class SpuBaseAttrVo {
+    private String attrName; // 参数名，比如 "机身颜色"
+    private String attrValue; // 参数值，比如 "深空黑"
+}
+```
+
+****
+## 4. SkuItemVo 对象的数据封装
+
+Controller 层：
+
+因为是前端点击某个具体的商品后再显示该商品的详情页面，所以直接在这个 Controller 的控制方法中进行该商品的展示数据的封装。
+
+```java
+@GetMapping("/{skuId}.html")
+public String item(@PathVariable("skuId") Long skuId, Model model) {
+    System.out.println("准备查询的 skuId:" + skuId);
+    SkuItemVo skuItemVo = skuInfoService.item(skuId);
+    model.addAttribute("item", skuItemVo);
+    return "item";
+}
+```
+
+Service 层：
+
+在创建 SkuItemVo 模型时有记录总共创建了五个关键字段用于展示数据，所以在封装时要获取这五个字段所需的信息：
+
+```java
+@Override
+public SkuItemVo item(Long skuId) {
+    SkuItemVo skuItemVo = new SkuItemVo();
+    Long spuId = 0L;
+    Long catalogId = 0L;
+    // 1. sku 基本信息获取
+    SkuInfoEntity skuInfoEntity = getById(skuId);
+    if (skuInfoEntity != null) {
+        skuItemVo.setSkuInfo(skuInfoEntity);
+        spuId = skuInfoEntity.getSpuId();
+        catalogId = skuInfoEntity.getCatalogId();
+    }
+
+    // 2. sku 图片信息
+    List<SkuImagesEntity> SkuImagesEntities =  skuImagesService.getImagesBySkuId(skuId);
+    if (SkuImagesEntities != null && !SkuImagesEntities.isEmpty()) {
+        skuItemVo.setImages(SkuImagesEntities);
+    }
+    // 3. 获取 spu 销售属性组合
+    List<SkuItemSaleAttrVo> skuItemSaleAttrVos = skuSaleAttrValueService.getSaleAttrsBySpuId(spuId);
+    if (skuItemSaleAttrVos != null && !skuItemSaleAttrVos.isEmpty()) {
+        skuItemVo.setSaleAttr(skuItemSaleAttrVos);
+    }
+
+    // 4. 获取 spu 描述属性
+    SpuInfoDescEntity spuInfoDescEntity = spuInfoDescService.getById(spuId);
+    if (spuInfoDescEntity != null) {
+        skuItemVo.setSpuInfoDesc(spuInfoDescEntity);
+    }
+    // 5. 获取 spu 规格参数
+    List<SpuItemAttrGroupVo> spuItemAttrGroupVos = attrGroupService.getAttrGroupWithAttrsBySpuId(spuId, catalogId);
+    if (spuItemAttrGroupVos != null && !spuItemAttrGroupVos.isEmpty()) {
+        skuItemVo.setGroupAttrs(spuItemAttrGroupVos);
+    }
+    return skuItemVo;
+}
+```
+
+1、sku 基本信息获取
+
+该数据的获取较为简单，因为前端会传递一个 skuId 过来，可以直接利用它查询出一个 SkuInfoEntity 对象，然后把该对象赋值给 SkuItemVo 对象的 skuInfo 字段。
+
+2、sku 图片信息获取
+
+这个同理，直接通过 skuId 查询对应的数据库即可。
+
+3、spu 销售属性组合获取
+
+因为时获取 spu 的相关信息，所以肯定要用到 spuId，而 spuId 可以通过查询出的 SkuInfoEntity 获取（通过 spuId 关联），所以此时创建一个方法，通过 spuId 查询出销售属性。
+
+```java
+@Override
+public List<SkuItemSaleAttrVo> getSaleAttrsBySpuId(Long spuId) {
+    return skuSaleAttrValueDao.getSaleAttrsBySpuId(spuId);
+}
+```
+
+```xml
+<select id="getSaleAttrsBySpuId" resultType="com.project.gulimall.product.domain.vo.SkuItemSaleAttrVo">
+    SELECT
+        psav.attr_id,
+        psav.attr_name,
+        GROUP_CONCAT(DISTINCT psav.attr_value ORDER BY psav.attr_value SEPARATOR ',') AS attr_values
+    FROM
+        pms_sku_sale_attr_value psav
+            LEFt JOIN
+        pms_sku_info psi ON psav.sku_id = psi.sku_id
+    WHERE
+        psi.spu_id = #{spuId}
+    GROUP BY
+        psav.attr_id, psav.attr_name;
+</select>
+```
+
+数据库中关于销售属性的表为 pms_sku_sale_attr_value：
+
+| 名称      | 类型    | 长度 | 小数点 | 不是 null | 虚拟 | 键 | 注释         |
+| --------- | ------- | ---- | ------ | --------- | ---- | ---- | ------------ |
+| id        | bigint  |      |        | √         |      | 1    | id           |
+| sku_id    | bigint  |      |        |           |      |      | sku_id       |
+| attr_id   | bigint  |      |        |           |      |      | attr_id      |
+| attr_name | varchar | 200  |        |           |      |      | 销售属性名   |
+| attr_value| varchar | 200  |        |           |      |      | 销售属性值   |
+| attr_sort | int     |      |        |           |      |      | 顺序         |
+
+可以看到它并没有关联 spu，所以只能通过查询 pms_sku_info 表来获取对应的 skuId 然后再查询此表获取所有的 attr_name 和对应的 attr_value。不过这张表中的数据展示为：
+
+| id  | sku_id | attr_id | attr_name | attr_value   | attr_sort |
+| --- | ------ | ------- | --------- | ------------ | --------- |
+| 1   | 1      | 9       | 颜色      | 星河银       | (Null)    |
+| 2   | 1      | 12      | 版本      | 8GB+256GB    | (Null)    |
+| 3   | 2      | 9       | 颜色      | 星河银       | (Null)    |
+| 4   | 2      | 12      | 版本      | 8GB+128GB    | (Null)    |
+| 5   | 3      | 9       | 颜色      | 亮黑色       | (Null)    |
+| 6   | 3      | 12      | 版本      | 8GB+256GB    | (Null)    |
+| 7   | 4      | 9       | 颜色      | 亮黑色       | (Null)    |
+| 8   | 4      | 12      | 版本      | 8GB+128GB    | (Null)    |
+| 9   | 5      | 9       | 颜色      | 翡冷翠       | (Null)    |
+| 10  | 5      | 12      | 版本      | 8GB+256GB    | (Null)    |
+| 11  | 6      | 9       | 颜色      | 翡冷翠       | (Null)    |
+| 12  | 6      | 12      | 版本      | 8GB+128GB    | (Null)    |
+| 13  | 7      | 9       | 颜色      | 罗兰紫       | (Null)    |
+| 14  | 7      | 12      | 版本      | 8GB+256GB    | (Null)    |
+| 15  | 8      | 9       | 颜色      | 罗兰紫       | (Null)    |
+| 16  | 8      | 12      | 版本      | 8GB+128GB    | (Null)    |
+| 17  | 9      | 9       | 颜色      | 黑色         | (Null)    |
+| 18  | 9      | 12      | 版本      | 128GB        | (Null)    |
+| 19  | 10     | 9       | 颜色      | 黑色         | (Null)    |
+| 20  | 10     | 12      | 版本      | 256GB        | (Null)    |
+| 21  | 11     | 9       | 颜色      | 黑色         | (Null)    |
+| 22  | 11     | 12      | 版本      | 64GB         | (Null)    |
+| 23  | 12     | 9       | 颜色      | 白色         | (Null)    |
+| 24  | 12     | 12      | 版本      | 128GB        | (Null)    |
+
+可以发现，如果直接通过 skuId 查询的话就会获取到许多重复的数据，因此得对这些数据进行分组与去重，一个 skuId 对应属性名以及该属性名下的非重复的属性值。所以需要对 attrId 和 attrName 进行分组，
+但是光分组还是会存在重复的值，而 GROUP_CONCAT(DISTINCT psav.attr_value ORDER BY psav.attr_value SEPARATOR ',') 函数就是对分组的值进行去重的，并且对这些值进行 "," 拼接。
+
+GROUP_CONCAT(...) AS attr_values：
+
+- GROUP_CONCAT：MySQL 的字符串聚合函数，把多行的值拼接成一个字符串
+- DISTINCT：去重，避免重复的属性值（比如有多个 SKU 都是“黑色”）
+- ORDER BY psav.attr_value：让拼接结果有序，比如值是 128G,256G,512G
+- SEPARATOR ','：用逗号分隔
+
+不过最终查询出的 attr_values 是一个字符串，并不能直接封装进 SkuItemSaleAttrVo 中，所以这里直接将 SkuItemSaleAttrVo 的 attrValues 字段修改为 String 类型，
+后续再通过 Java 代码对 "," 进行分割取值即可。
+
+```java
+@Data
+public class SkuItemSaleAttrVo {
+    private Long attrId;
+    private String attrName;
+    private String attrValues;
+}
+```
+
+拼接结果：
+
+| attr_id | attr name | attr values                  |
+| ------- | --------- | ---------------------------- |
+| 9       | 颜色      | 白色,紫色,红色,绿色,黄色,黑色 |
+| 12      | 版本      | 128GB,256GB,64GB             | 
+
+测试：
+
+```java
+@Test
+void testGetSaleAttrsBySpuId() {
+    List<SkuItemSaleAttrVo> saleAttrsBySpuId = skuSaleAttrValueService.getSaleAttrsBySpuId(16L);
+    System.out.println(saleAttrsBySpuId);
+}
+```
+
+```text
+[
+  SkuItemSaleAttrVo(attrId=7, attrName=入网型号, attrValues=A2217), 
+  SkuItemSaleAttrVo(attrId=9, attrName=颜色, attrValues=白色,黑色), 
+  SkuItemSaleAttrVo(attrId=10, attrName=内存, attrValues=12GB,8GB)
+]
+```
+
+4、spu 描述属性获取
+
+同理，直接通过 spuId 查询 pms_spu_info_desc 表即可。
+
+5、spu 规格参数获取
+
+```java
+@Override
+public List<SpuItemAttrGroupVo> getAttrGroupWithAttrsBySpuId(Long spuId, Long catalogId) {
+    return attrGroupDao.getAttrGroupWithAttrsBySpuId(spuId, catalogId);
+}
+```
+
+```xml
+<select id="getAttrGroupWithAttrsBySpuId" resultMap="SpuItemAttrGroupVo">
+    SELECT pav.spu_id,
+           ag.attr_group_name,
+           ag.attr_group_id,
+           aar.attr_id,
+           attr.attr_name,
+           pav.attr_value
+    FROM pms_attr_group ag
+             LEFT JOIN
+         pms_attr_attrgroup_relation aar ON aar.attr_group_id = ag.attr_group_id
+             LEFT JOIN
+         pms_attr attr ON attr.attr_id = aar.attr_id
+             LEFT JOIN
+         pms_product_attr_value pav ON pav.attr_id = attr.attr_id AND pav.spu_id = #{spuId}
+    WHERE ag.catelog_id = #{catalogId};
+</select>
+```
+
+关于 spu 的规格参数，首先需要先从 pms_attr_group 表中获取到分组信息的 id 和 name（通过三级分类 id 可以查询到），name 是用于封装进 SpuItemAttrGroupo 的 groupName 字段的，
+而 id 则是用于查询 pms_attr_attrgroup_relation 表的，这样才能拿到每个分组下的对应的 attrId，再通过 attrId 查询 pms_attr 表获取到分组下的每个 attrId 对应的名称，
+当然除了获取到 attrName，还需要获取到 attrValue，而 attrValue 则需要通过 pms_product_attr_value 表查询，再通过 spuId 和 attrId 准确查询 pms_product_attr_value 表中的数据，
+最终再将联合的表数据通过分类 id 进行筛选。
+
+| spu_id | attr_group_name | attr_group_id | attr_id | attr_name | attr_value |
+| ------ | --------------- | ------------- | ------- | --------- | ---------- |
+| 1001   | 主体参数            | 101           | 201     | 颜色        | 黑色         |
+| 1001   | 主体参数            | 101           | 201     | 颜色        | 白色         |
+| 1001   | 主体参数            | 101           | 202     | 重量        | 180g       |
+| 1001   | 屏幕参数            | 102           | 203     | 屏幕尺寸      | 6.7英寸      |
+
+不过这里封装的 SpuItemAttrGroupVo 对象的结构为：
+
+```java
+@Data
+public class SpuItemAttrGroupVo {
+    private String groupName;
+    private List<Attr> attrs;
+}
+```
+
+也就是说它是一个嵌套对象类型，从数据库中查询出的数据是无法直接封装进去的，所以得使用自定义类型映射，将查询出的字段准确的映射到某个字段或者内置对象中的某个字段：
+
+```xml
+<resultMap id="SpuItemAttrGroupVo" type="com.project.gulimall.product.domain.vo.SpuItemAttrGroupVo">
+    <result property="groupName" column="attr_group_name"></result>
+    <collection property="attrs" ofType="com.project.gulimall.product.domain.vo.Attr">
+        <result property="attrName" column="attr_name"></result>
+        <result property="attrValue" column="attr_value"></result>
+    </collection>
+</resultMap>
+```
+
+测试：
+
+```java
+@Test
+void testGetAttrGroupWithAttrsBySpuId() {
+    List<SpuItemAttrGroupVo> attrGroupWithAttrsBySpuId = attrGroupService.getAttrGroupWithAttrsBySpuId(16L, 225L);
+    System.out.println(attrGroupWithAttrsBySpuId);
+}
+```
+
+```text
+[SpuItemAttrGroupVo(groupName=基本信息, attrs=[
+Attr(attrId=null, attrName=上市年份, attrValue=2018),
+Attr(attrId=null, attrName=颜色, attrValue=黑色), 
+Attr(attrId=null, attrName=上市年份, attrValue=2001), 
+Attr(attrId=null, attrName=机身材质工艺, attrValue=陶瓷;玻璃), 
+Attr(attrId=null, attrName=机身长度（mm）, attrValue=158.3), 
+Attr(attrId=null, attrName=机身颜色, attrValue=黑色), 
+Attr(attrId=null, attrName=入网型号, attrValue=A2217)]),
+SpuItemAttrGroupVo(groupName=主芯片, attrs=[
+Attr(attrId=null, attrName=内存, attrValue=12GB), 
+Attr(attrId=null, attrName=CPU型号, attrValue=骁龙665), 
+Attr(attrId=null, attrName=CPU品牌, attrValue=高通(Qualcomm))
+])]
+```
+
+****
+## 5. 详情页渲染
+
+### 5.1 基本数据展示
+
+从上面封装的 SkuItemVo 对象中可以获取到商品的基本信息，这里只需要动态的从域中获取并显示在页面即可，这里展示的是商品的标题和副标题：
+
+```html
+<div class="box-name" th:text="${item.skuInfo.skuTitle}">
+    华为 HUAWEI Mate 10 6GB+128GB 亮黑色 移动联通电信4G手机 双卡双待
+</div>
+<div class="box-hide" th:text="${item.skuInfo.skuSubtitle}">预订用户预计11月30日左右陆续发货！麒麟970芯片！AI智能拍照！
+    <a href="/static/item/"><u></u></a>
+</div>
+```
+
+动态显示价格：
+
+```html
+<span th:text="${#numbers.formatDecimal(item.skuInfo.price, 3, 2)}">4499.00</span>
+```
+
+商品详情页一般会直接展示商品的默认图片，所以这里直接获取封装的 SkuItemVo 的 SkuInfoEntity 对象的默认图片数据即可：
+
+```html
+<div class="probox">
+    <img class="img1" alt="" th:src="${item.skuInfo.skuDefaultImg}">
+    <div class="hoverbox"></div>
+</div>
+```
+
+既然有展示默认图片，那也要展示其它可看的图片，也就是默认图片下面的那一栏小图片，这些在上架商品时进行过添加，是一些图片集，同样的，封装时是一个 SkuImagesEntity 对象，
+所以需要从它里面获取图片集的 url，当时封装该对象时并不是直接把所有图片拼接成字符串再存储，而是一张图片就是一个对象，所以这里遍历获取对象即可获取到所有图片，
+但当时为了测试添加过多个空值，所以这里需要对图片的 url 是否为空进行判断：
+
+```html
+<div class="box-lh-one">
+  <ul>
+    <li th:each="img : ${item.images}" th:if="${!#strings.isEmpty(img.imgUrl)}"><img th:src="${img.imgUrl}" /></li>
+  </ul>
+</div>
+```
+
+这里则是动态的展示商品的销售属性，也就是商品详情页选择某个商品的具体参数时的展示效果，从数据库中查到了几个属于该商品的销售属性，那就展示它们与对应的值。
+上面有记录，封装的销售属性的值是 String 类型的字符串，而详情页需要展示对应的值，所以这里要把字符串通过 "," 分割为集合，一个元素对应一个具体的销售属性的值：
+
+```html
+<div class="box-attr-3">
+    <div class="box-attr clear" th:each="attr : ${item.saleAttr}">
+        <dl>
+            <dt>选择[[${attr.attrName}]]</dt>
+            <dd th:each="val : ${#strings.listSplit(attr.attrValues, ',')}">
+                <a href="/static/item/#">
+                    <!--<img src="/static/item/img/59ddfcb1Nc3edb8f1.jpg" />-->
+                    [[${val}]]
+                </a>
+            </dd>
+        </dl>
+    </div>
+</div>
+```
+
+商品 spu 的描述图也是通过封装的 SkuItemVo 动态获取，不过封装的是一个 SkuImagesEntity 对象，所以需要从该对象中获取图片的 url，而当时存储也是直接把多个 url 拼接成字符串，
+所以这里的操作和上面一样：
+
+```html
+<img class="xiaoguo" th:src="${describe}" th:each="describe : ${#strings.listSplit(item.spuInfoDesc.decript, ',')}"/>
+```
+
+这里展示的就是 spu 的规格参数了，它是在商品详情页下滑，在描述图片后面的信息，因为后端已经封装好了，这里直接获取即可：
+
+```html
+<div class="guiGe" th:each="group : ${item.groupAttrs}">
+    <h3 th:text="${group.groupName}">主体</h3>
+    <dl>
+        <div th:each="attr : ${group.attrs}">
+            <dt th:text="${attr.attrName}">品牌</dt>
+            <dd th:text="${attr.attrValue}">华为(HUAWEI)</dd>
+        </div>
+    </dl>
+</div>
+```
+
+****
+### 5.2 销售属性渲染
+
+在商品详情页面的销售属性通常有多个属性名与其对应的多个属性值，而用户需要购买或者查看某个具体的产品时，后端就需要获取其具体的 skuId 才能查询数据库获取信息。
+例如一部手机的销售参数有两个，分别为颜色和内存，而这两个有多个属性值：
+
+- 颜色：白色、黑色
+- 内存：8 GB、12 GB
+
+此时就会有 2 x 2 = 4 种选择，而后端的操作就是在用户选定某个颜色与内存时感知到其 skuId。在查询商品的销售属性时查询的表为 pms_sku_sale_attr_value 和 pms_sku_info，
+通过 pms_sku_info 获取 spu 对应的 skuId 再去查询其对应的销售属性，但是当时拼接查询的结果为：
 
 
+| attr_id | attr name | attr values                  |
+| ------- | --------- | ---------------------------- |
+| 9       | 颜色      | 白色,紫色,红色,绿色,黄色,黑色 |
+| 12      | 版本      | 128GB,256GB,64GB             | 
+
+这种结果虽然可以较为直观并方便的获取具体的数据展示在前端，但是无法体现出某个颜色和版本的组合为哪个 skuId，所以此时应该考虑如何在查询销售属性时带上 skuId，
+例如颜色属性带上其对应的 skuId，版本属性也带上其对应的 skuId，当用户选择的颜色和版本号对应的 skuId 出现重复时，证明当前 skuId 为真正的 skuId。例如：
+
+| attr_id | attr_name | attr_value | sku_ids |
+| ------- | --------- | ---------- | ------- |
+| 9       | 颜色        | 白色         | 1,2     |
+| 9       | 颜色        | 黑色         | 3,4     |
+| 12      | 内存        | 8GB        | 1,3     |
+| 12      | 内存        | 12GB       | 2,4     |
+ 
+此时如果选中 "白色8GB"，那么 skuId 就有 "1、2、1、3"，其中重复的为 1，那么 "白色8GB" 这个商品的 skuId 就是 1，后续查询该 sku 的信息即可。那么就需要修改原来写的 sql，
+不应该直接把每个属性名对应的属性值进行分组与去重，而是应该再加上属性值进行分组：
+
+```xml
+<select id="getSaleAttrsBySpuId" resultMap="SkuItemSaleAttrVo">
+    SELECT
+        ssav.`attr_id` attr_id,
+        ssav.`attr_name` attr_name,
+        ssav.`attr_value`,
+        GROUP_CONCAT(DISTINCT info.`sku_id`) sku_ids
+    FROM
+        `pms_sku_info` info
+            LEFT JOIN
+        `pms_sku_sale_attr_value` ssav ON ssav.`sku_id` = info.`sku_id`
+    WHERE
+        info.`spu_id` = #{spuId}
+    GROUP BY
+        ssav.`attr_id`, ssav.`attr_name`, ssav.`attr_value`;
+</select>
+```
+
+新的 sql 查询语句就是再分组的基础上新增了属性值，并且不再使用 GROUP_CONCAT 把多行的不同的值拼接成一个字符串（如果还拼接就没法区分某个具体的颜色有哪些 skuId 了），
+而是把查询出的 skuId 拼接在一起，因为参与分组的为属性名和属性值，所以每个 "颜色：白色"... 就会有其对应的 skuId 存在，"内存:8GB"... 同理，这样就达到了目的。
+既然修改了 sql 查询结果的返回值，那么就需要修改对应的进行封装的对象：
+
+```java
+@Data
+@ToString
+public class SkuItemSaleAttrVo {
+    private Long attrId;
+    private String attrName;
+    private List<AttrValueWithSkuIdVo> attrValues;
+}
+```
+
+```java
+@Data
+public class AttrValueWithSkuIdVo {
+    private String attrValue;
+    private String skuIds;
+}
+```
+
+用 AttrValueWithSkuIdVo 接收属性名和 skuId，因为一个属性名下会有多个对应的属性值和 skuId，所以把它作为 SkuItemSaleAttrVo 的一个字段的集合类型。同理，修改了接收返回结果的对象，
+并且这里还使用了嵌套对象，所以在 Mapper 层还需要自定义返回结果集映射：
+
+```xml
+<resultMap id="SkuItemSaleAttrVo" type="com.project.gulimall.product.domain.vo.SkuItemSaleAttrVo">
+    <result column="attr_id" property="attrId"></result>
+    <result column="attr_name" property="attrName"></result>
+    <collection property="attrValues" ofType="com.project.gulimall.product.domain.vo.AttrValueWithSkuIdVo">
+        <result column="attr_value" property="attrValue"></result>
+        <result column="sku_ids" property="skuIds"></result>
+    </collection>
+</resultMap>
+```
+
+测试：
+
+```text
+[
+  SkuItemSaleAttrVo(attrId=7, attrName=入网型号, 
+    attrValues=[AttrValueWithSkuIdVo(attrValue=A2217, skuIds=29,30,31,32)]
+  ), 
+  SkuItemSaleAttrVo(attrId=9, attrName=颜色, 
+    attrValues=[AttrValueWithSkuIdVo(attrValue=白色, skuIds=31,32), AttrValueWithSkuIdVo(attrValue=黑色, skuIds=29,30)]
+  ), 
+  SkuItemSaleAttrVo(attrId=10, attrName=内存, 
+    attrValues=[AttrValueWithSkuIdVo(attrValue=12GB, skuIds=30,32), AttrValueWithSkuIdVo(attrValue=8GB, skuIds=29,31)]
+  )
+]
+```
+
+因为修改了封装的对象结构，所以前端动态展示销售属性的地方也要进行修改：
+
+```html
+<div class="box-attr clear" th:each="attr : ${item.saleAttr}">
+    <dl>
+        <dt>选择[[${attr.attrName}]]</dt>
+        <dd th:each="vals : ${attr.attrValues}">
+            <a href="/static/item/#">
+                <!--<img src="/static/item/img/59ddfcb1Nc3edb8f1.jpg" />-->
+                [[${vals.attrValue}]]
+            </a>
+        </dd>
+    </dl>
+</div>
+```
+
+因为上面把销售属性的属性值封装进了另一个对象，所以它是嵌套对象，因此需要从获取到的 saleAttr 中获取到 List<AttrValueWithSkuIdVo> 字段，
+然后再通过它获取到 AttrValueWithSkuIdVo 中的 attrValue 字段。
+
+目前关于从检索页面点击某个商品进入详情页后只展示了部分内容，而关于销售属性，应该实时显示当前点击进详情页的那个商品对应的具体销售属性，例如在检索页面点击的商品为 “华为白色8GB”，
+那在销售属性那个地方就应该标志出当前的选择为 “白色8GB”，需要这样动态显示，就要在销售属性上面进行判断，判断点击的商品的 skuId 是否包含在某个属性值里。因为这里是一个循环，
+所以每一次的遍历都会进行一次判断，即判断 "颜色：白色：1、2、3..." 中是否包含从检索页面点击的商品的 skuId：
+
+```html
+<dd th:each="vals : ${attr.attrValues}">
+    <a th:attr="class=${#lists.contains(#strings.listSplit(vals.skuIds, ','), item.skuInfo.skuId.toString()) ? 'sku_attr_value checked' : 'sku_attr_value'}">
+          <!--<img src="/static/item/img/59ddfcb1Nc3edb8f1.jpg" />-->
+          [[${vals.attrValue}]]
+    </a>
+</dd>
+```
+
+如果包含，就让该标签携带一个 checked 标识，用于 js 判断是否需要给它添加渲染：
+
+```html
+$(function () {
+    $(".sku_attr_value").parent().css({"border":"solid 1px #CCC"});
+    $("a[class='sku_attr_value checked']").css({"border":"solid 1px red"});
+})
+```
+
+****
+### 5.3 sku 组合切换与跳转
+
+在上面记录了从商品检索页面进入某个商品详情页时动态显示当前商品的销售属性值为哪些，而现在需要完成的是根据当前选择的销售属性，获取唯一的商品 skuId，然后通过该 skuId 挑战到对应的详情页面。
+而在获取唯一 skuId 前，需要完成点击销售属性时取消上次对某个销售属性进行的标记：
+
+```js
+$(".sku_attr_value").click(function () {
+    // 1. 找到当前属性分组（颜色、版本等）
+    var currentAttrGroup = $(this).closest('.box-attr');
+    // 2. 只移除当前分组内的 checked 类
+    currentAttrGroup.find(".sku_attr_value").removeClass("checked");
+    // 3. 只移除当前分组内的内联样式
+    currentAttrGroup.find(".sku_attr_value").css("border", "");
+    // 4. 给当前点击的元素添加checked类
+    $(this).addClass("checked");
+});
+```
+
+在点击某个销售属性后，需要先找到当前销售属性值对应的销售属性名，因为页面里有多个属性分组（颜色、内存、版本等），每个分组下面都有很多 `<a>` 元素，
+所以需要先找到当前属性值的所属分组，再在这个分组内部操作移除 checked，.closest(...) 的作用就是从当前元素开始向上查找，找到第一个符合条件的祖先元素，
+而 .box-attr 就是当前 HTML 中定义的分组容器类，例如：
+
+```html
+<div class="box-attr">
+  <a class="sku_attr_value">白色</a>
+  <a class="sku_attr_value">黑色</a>
+</div>
+<div class="box-attr">
+  <a class="sku_attr_value">8GB</a>
+  <a class="sku_attr_value">12GB</a>
+</div>
+```
+
+如果点击 “白色”，$(this).closest('.box-attr') 就会返回第一个 <div class="box-attr">，也就是白色和黑色所在的颜色分组，然后移除当前销售属性名内的所有带有 checked 的 class。
+接着同样遍历当前分组内的所有属性值，利用 .css("border", "") 移除之前设置的边框样式，以此去掉红色边框，使得点击前的状态被重置。因为之前写了个方法，给带有 checked 添加样式：
+
+
+```js
+$(function () {
+    $(".sku_attr_value").parent().css({"border":"solid 1px #CCC"});
+    $("a[class='sku_attr_value checked']").css({"border":"solid 1px red"});
+})
+```
+
+点击逻辑完成后，还需要对 skuId 进行筛选合并。首先就是需要获取到每个属性名对应的属性值的 skuIds，所以需要遍历每个分组，然后在分组中找到携带 checked 的元素，找到该元素后，
+把它携带的 skuIds 添加进一个数组，后续对数组中的值进行判断。所以这里需要在 `<a>` 中添加一个 skuIds 集合，取名为 skus，用来存放当前属性值对应的 sukIds：
+
+```html
+<a th:attr="class=${#lists.contains(#strings.listSplit(vals.skuIds, ','), item.skuInfo.skuId.toString()) ? 'sku_attr_value checked' : 'sku_attr_value'}"
+   th:attrappend="skus=${vals.skuIds}"
+>
+```
+
+```js
+$(".sku_attr_value").click(function () {
+    // 5. 获取 skuId
+    var checkedSkuArrays = [];
+    $(".box-attr").each(function () {
+        var checked = $(this).find(".sku_attr_value.checked");
+        if (checked.length > 0) {
+            var skuIds = checked.attr("skus").split(",");
+            checkedSkuArrays.push(skuIds);
+        }
+    });
+
+    // 计算交集
+    var result = checkedSkuArrays.reduce(function(a, b){
+        return a.filter(v => b.includes(v));
+    });
+    console.log("选中的 SKUS:", checkedSkuArrays);
+    console.log("选中的 SKU:", result);
+
+    // 6. 跳转到该 skuId 的详情页面
+    location.href = "http://item.gulimall.com./" + result + ".html"
+});
+```
+
+获取到 skuIds 数组后，就要计算每个分组的这些数组的交集，reduce 就是对数组进行归约操作，这里是计算多个数组的交集，通过添加一个过滤来保留只在另一个数组中存在的值。
+通过上面的方法，可以知道 checkedSkuArrays 其实是一个二维数组，例如：
+
+```text
+checkedSkuArrays = [
+    ["31","32"], // 颜色分组选中的 SKU
+    ["31","33"], // 内存分组选中的 SKU
+    ["31","34"] // 网络类型分组选中的 SKU
+]
+```
+
+而 reduce 的本质是循环遍历数组，并通过回调函数把数组缩减成一个值：
+
+```js
+var result = checkedSkuArrays.reduce(function(a, b){
+    return a.filter(v => b.includes(v));
+});
+```
+
+这里的 a 是累积值，也就是上一轮计算出来的交集，b 则是当前处理的小数组（当前分组的 SKU），reduce 循环步骤：
+
+1、第一轮
+
+- a = ["31","32"]（默认取数组第一个元素） 
+- b = ["31","33"]
+- 计算 a.filter(v => b.includes(v)) -> ["31"]
+
+2、第二轮
+
+- a = ["31"]（上一轮结果） 
+- b = ["31","34"]
+- 计算 a.filter(v => b.includes(v)) -> ["31"]
+
+3、如果还有更多小数组，会继续处理直到最后一个小数组
+
+当获取到唯一的 skuId 后就可以拼接成该商品的详细路径了。
+
+****
 

@@ -5,6 +5,8 @@ import com.project.common.utils.PageUtils;
 import com.project.gulimall.product.domain.entity.AttrGroupEntity;
 import com.project.gulimall.product.domain.vo.AttrGroupWithAttrsVo;
 import com.project.gulimall.product.domain.vo.AttrVo;
+import com.project.gulimall.product.domain.vo.SkuItemVo;
+import com.project.gulimall.product.domain.vo.SpuItemAttrGroupVo;
 
 import java.util.List;
 import java.util.Map;
@@ -19,5 +21,8 @@ public interface AttrGroupService extends IService<AttrGroupEntity> {
     PageUtils queryPage(Map<String, Object> params, Long catelogId);
 
     List<AttrGroupWithAttrsVo> getAttrGroupWithAttrsByCatelogId(Long catelogId);
+
+    List<SpuItemAttrGroupVo> getAttrGroupWithAttrsBySpuId(Long spuId, Long catalogId);
+
 }
 

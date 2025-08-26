@@ -1,6 +1,12 @@
 package com.project.gulimall.product.service.impl;
 
 import com.alibaba.cloud.commons.lang.StringUtils;
+import com.project.gulimall.product.domain.entity.SkuImagesEntity;
+import com.project.gulimall.product.domain.entity.SpuInfoDescEntity;
+import com.project.gulimall.product.domain.vo.SkuItemSaleAttrVo;
+import com.project.gulimall.product.domain.vo.SkuItemVo;
+import com.project.gulimall.product.domain.vo.SpuItemAttrGroupVo;
+import com.project.gulimall.product.service.*;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
@@ -14,7 +20,6 @@ import com.project.common.utils.PageUtils;
 import com.project.common.utils.Query;
 import com.project.gulimall.product.dao.SkuInfoDao;
 import com.project.gulimall.product.domain.entity.SkuInfoEntity;
-import com.project.gulimall.product.service.SkuInfoService;
 
 
 @Service("skuInfoService")
@@ -22,6 +27,14 @@ public class SkuInfoServiceImpl extends ServiceImpl<SkuInfoDao, SkuInfoEntity> i
 
     @Autowired
     private SkuInfoDao skuInfoDao;
+    @Autowired
+    private SkuImagesService skuImagesService;
+    @Autowired
+    private SpuInfoDescService spuInfoDescService;
+    @Autowired
+    private AttrGroupService attrGroupService;
+    @Autowired
+    private SkuSaleAttrValueService skuSaleAttrValueService;
 
     @Override
     public PageUtils queryPage(Map<String, Object> params) {
@@ -81,6 +94,46 @@ public class SkuInfoServiceImpl extends ServiceImpl<SkuInfoDao, SkuInfoEntity> i
     @Override
     public List<SkuInfoEntity> getSkusBySpuId(Long spuId) {
         return this.list(new QueryWrapper<SkuInfoEntity>().eq("spu_id", spuId));
+    }
+
+    /**
+     * 商品详情页 sku 基本信息获取
+     */
+    @Override
+    public SkuItemVo item(Long skuId) {
+        SkuItemVo skuItemVo = new SkuItemVo();
+        Long spuId = 0L;
+        Long catalogId = 0L;
+        // 1. sku 基本信息获取
+        SkuInfoEntity skuInfoEntity = getById(skuId);
+        if (skuInfoEntity != null) {
+            skuItemVo.setSkuInfo(skuInfoEntity);
+            spuId = skuInfoEntity.getSpuId();
+            catalogId = skuInfoEntity.getCatalogId();
+        }
+
+        // 2. sku 图片信息
+        List<SkuImagesEntity> SkuImagesEntities =  skuImagesService.getImagesBySkuId(skuId);
+        if (SkuImagesEntities != null && !SkuImagesEntities.isEmpty()) {
+            skuItemVo.setImages(SkuImagesEntities);
+        }
+        // 3. 获取 spu 销售属性组合
+        List<SkuItemSaleAttrVo> skuItemSaleAttrVos = skuSaleAttrValueService.getSaleAttrsBySpuId(spuId);
+        if (skuItemSaleAttrVos != null && !skuItemSaleAttrVos.isEmpty()) {
+            skuItemVo.setSaleAttr(skuItemSaleAttrVos);
+        }
+
+        // 4. 获取 spu 描述属性
+        SpuInfoDescEntity spuInfoDescEntity = spuInfoDescService.getById(spuId);
+        if (spuInfoDescEntity != null) {
+            skuItemVo.setSpuInfoDesc(spuInfoDescEntity);
+        }
+        // 5. 获取 spu 规格参数
+        List<SpuItemAttrGroupVo> spuItemAttrGroupVos = attrGroupService.getAttrGroupWithAttrsBySpuId(spuId, catalogId);
+        if (spuItemAttrGroupVos != null && !spuItemAttrGroupVos.isEmpty()) {
+            skuItemVo.setGroupAttrs(spuItemAttrGroupVos);
+        }
+        return skuItemVo;
     }
 
 }

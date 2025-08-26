@@ -5,6 +5,8 @@ import com.project.gulimall.product.dao.AttrDao;
 import com.project.gulimall.product.domain.entity.AttrEntity;
 import com.project.gulimall.product.domain.vo.AttrGroupWithAttrsVo;
 import com.project.gulimall.product.domain.vo.AttrVo;
+import com.project.gulimall.product.domain.vo.SkuItemVo;
+import com.project.gulimall.product.domain.vo.SpuItemAttrGroupVo;
 import com.project.gulimall.product.service.AttrService;
 import org.springframework.beans.BeanUtils;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -29,6 +31,8 @@ public class AttrGroupServiceImpl extends ServiceImpl<AttrGroupDao, AttrGroupEnt
 
     @Autowired
     private AttrService attrService;
+    @Autowired
+    private AttrGroupDao attrGroupDao;
 
     @Override
     public PageUtils queryPage(Map<String, Object> params) {
@@ -79,6 +83,11 @@ public class AttrGroupServiceImpl extends ServiceImpl<AttrGroupDao, AttrGroupEnt
             return attrsVo;
         }).collect(Collectors.toList());
         return AttrGroupWithAttrsVoList;
+    }
+
+    @Override
+    public List<SpuItemAttrGroupVo> getAttrGroupWithAttrsBySpuId(Long spuId, Long catalogId) {
+        return attrGroupDao.getAttrGroupWithAttrsBySpuId(spuId, catalogId);
     }
 
 

@@ -4,8 +4,12 @@ package com.project.gulimall.product;
 import com.aliyun.oss.OSSClient;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.project.gulimall.product.domain.entity.BrandEntity;
+import com.project.gulimall.product.domain.vo.SkuItemSaleAttrVo;
+import com.project.gulimall.product.domain.vo.SpuItemAttrGroupVo;
+import com.project.gulimall.product.service.AttrGroupService;
 import com.project.gulimall.product.service.BrandService;
 import com.project.gulimall.product.service.CategoryService;
+import com.project.gulimall.product.service.SkuSaleAttrValueService;
 import lombok.extern.slf4j.Slf4j;
 import org.junit.jupiter.api.Test;
 import org.redisson.api.RedissonClient;
@@ -33,6 +37,10 @@ class GulimallProductApplicationTests {
 	private StringRedisTemplate stringRedisTemplate;
 	@Autowired
 	private RedissonClient redissonClient;
+	@Autowired
+	private AttrGroupService attrGroupService;
+	@Autowired
+	private SkuSaleAttrValueService skuSaleAttrValueService;
 
 	@Test
 	void contextLoads() {
@@ -80,6 +88,18 @@ class GulimallProductApplicationTests {
 	@Test
 	void testRedissonClient() {
 		System.out.println(redissonClient);
+	}
+
+	@Test
+	void testGetAttrGroupWithAttrsBySpuId() {
+		List<SpuItemAttrGroupVo> attrGroupWithAttrsBySpuId = attrGroupService.getAttrGroupWithAttrsBySpuId(16L, 225L);
+		System.out.println(attrGroupWithAttrsBySpuId);
+	}
+
+	@Test
+	void testGetSaleAttrsBySpuId() {
+		List<SkuItemSaleAttrVo> saleAttrsBySpuId = skuSaleAttrValueService.getSaleAttrsBySpuId(16L);
+		System.out.println(saleAttrsBySpuId);
 	}
 
 }
