@@ -11488,4 +11488,733 @@ var result = checkedSkuArrays.reduce(function(a, b){
 当获取到唯一的 skuId 后就可以拼接成该商品的详细路径了。
 
 ****
+## 6. 异步编排优化
+
+Java 自带的 Executors 工厂方法（如 newFixedThreadPool、newCachedThreadPool）虽然简单，但存在一些风险:
+FixedThreadPool 和 SingleThreadExecutor 使用 LinkedBlockingQueue（无界队列），在任务过多时可能导致内存溢出；CachedThreadPool 最大线程数是 Integer.MAX_VALUE，
+并发过大时可能创建过多线程，压垮系统。并且这些线程池没有统一的配置入口，难以根据不同环境灵活调整参数。所以可以自定义一个线程池，根据自己的开发过程进行配置。
+
+```java
+@Data
+@Component
+@ConfigurationProperties(prefix = "gulimall.thread")
+public class ThreadPoolConfigProperties {
+    private Integer corePoolSize;
+    private Integer maxPoolSize;
+    private Integer keepAliveTime;
+}
+```
+
+一般自定义一个线程池的时候都顺便定义一个配置属性类，用它来达到在配置文件中动态绑定自定义线程池中的一些属性参数，这里就是定义了核心线程数、最大线程数和存活时间作为绑定外部配置文件中的属性。
+所以需要在类上面使用 @ConfigurationProperties 从配置文件里读取 gulimall.thread（自定义的前缀）前缀下的参数，例如：
+
+```yaml
+gulimall:
+  thread:
+    core-pool-size: 20
+    max-pool-size: 200
+    keep-alive-time: 10
+```
+
+而在自定义的线程池配置类中则可以使用上面定义好的配置属性，这里要使用 @EnableConfigurationProperties(ThreadPoolConfigProperties.class) 来确保 ThreadPoolConfigProperties 类被启用为一个配置属性类，
+然后就可以在 threadPoolExecutor 方法中直接通过方法参数注入的方式（因为 ThreadPoolConfigProperties 会被 Spring 自动注入，所以可以直接使用）。
+
+```java
+@Configuration
+@EnableConfigurationProperties(ThreadPoolConfigProperties.class)
+public class MyThreadConfig {
+    @Bean
+    public ThreadPoolExecutor threadPoolExecutor(ThreadPoolConfigProperties threadPoolConfigProperties) {
+        return new ThreadPoolExecutor(
+                threadPoolConfigProperties.getCorePoolSize(), // 20
+                threadPoolConfigProperties.getMaxPoolSize(), // 200
+                threadPoolConfigProperties.getKeepAliveTime(), // 10
+                TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(100000),
+                Executors.defaultThreadFactory(),
+                new ThreadPoolExecutor.AbortPolicy()
+        );
+    }
+}
+```
+
+SkuItemVo 是商品详情页的数据对象，要组装这个对象，需要查询很多不同的来源：
+
+1. SKU 基本信息：getById(skuId)
+2. SKU 图片：skuImagesService.getImagesBySkuId(skuId)
+3. SPU 销售属性组合：skuSaleAttrValueService.getSaleAttrsBySpuId(spuId)
+4. SPU 描述：spuInfoDescService.getById(spuId)
+5. SPU 规格参数：attrGroupService.getAttrGroupWithAttrsBySpuId(spuId, catalogId)
+
+如果按照原来的写法：
+
+```java
+SkuInfoEntity skuInfo = getById(skuId);
+List<SkuImagesEntity> images = skuImagesService.getImagesBySkuId(skuId);
+List<SkuItemSaleAttrVo> saleAttrs = skuSaleAttrValueService.getSaleAttrsBySpuId(skuInfo.getSpuId());
+SpuInfoDescEntity desc = spuInfoDescService.getById(skuInfo.getSpuId());
+List<SpuItemAttrGroupVo> groups = attrGroupService.getAttrGroupWithAttrsBySpuId(skuInfo.getSpuId(), skuInfo.getCatalogId());
+```
+
+那么这几次调用都会串行执行，每个 IO 调用都要等前一个结束才能去执行，所以点击一次商品，需要使用五个 IO 的时间，所以为了减少串行带来的时间开销，应该让它们并行执行 IO。
+不过这里需要注意的是，skuInfoEntity 对象的获取对于后面的查询具有强依赖性，因为需要通过查询 sku_info 表来获取 spuId 和 catalogId，这样后面的 IO 才能正常执行，
+因此 infoFuture 是基础，后续多个任务（3,4,5 步）都依赖于这个查询结果。不过 spu 销售属性、spu 描述性息和 spu 规格参数的获取之间并没有依赖关系，所以它们可以并行执行。
+
+```java
+@Override
+public SkuItemVo item(Long skuId) {
+    SkuItemVo skuItemVo = new SkuItemVo();
+
+    CompletableFuture<SkuInfoEntity> infoFuture = CompletableFuture.supplyAsync(() -> {
+        // 1. sku 基本信息获取
+        SkuInfoEntity skuInfoEntity = getById(skuId);
+        if (skuInfoEntity != null) {
+            skuItemVo.setSkuInfo(skuInfoEntity);
+        }
+        return skuInfoEntity;
+    }, threadPoolExecutor);
+
+    CompletableFuture<Void> saleAttrFuture = infoFuture.thenAcceptAsync(info -> {
+        // 3. 获取 spu 销售属性组合
+        List<SkuItemSaleAttrVo> skuItemSaleAttrVos = skuSaleAttrValueService.getSaleAttrsBySpuId(info.getSpuId());
+        if (skuItemSaleAttrVos != null && !skuItemSaleAttrVos.isEmpty()) {
+            skuItemVo.setSaleAttr(skuItemSaleAttrVos);
+        }
+    }, threadPoolExecutor);
+
+    CompletableFuture<Void> spuDescribeFuture = infoFuture.thenAcceptAsync(info -> {
+        // 4. 获取 spu 描述属性
+        SpuInfoDescEntity spuInfoDescEntity = spuInfoDescService.getById(info.getSpuId());
+        if (spuInfoDescEntity != null) {
+            skuItemVo.setSpuInfoDesc(spuInfoDescEntity);
+        }
+    }, threadPoolExecutor);
+
+    CompletableFuture<Void> baseAttrFuture = infoFuture.thenAcceptAsync(info -> {
+        // 5. 获取 spu 规格参数
+        List<SpuItemAttrGroupVo> spuItemAttrGroupVos = attrGroupService.getAttrGroupWithAttrsBySpuId(info.getSpuId(), info.getCatalogId());
+        if (spuItemAttrGroupVos != null && !spuItemAttrGroupVos.isEmpty()) {
+            skuItemVo.setGroupAttrs(spuItemAttrGroupVos);
+        }
+    }, threadPoolExecutor);
+
+    CompletableFuture<Void> imageFuture = CompletableFuture.runAsync(() -> {
+        // 2. sku 图片信息
+        List<SkuImagesEntity> SkuImagesEntities =  skuImagesService.getImagesBySkuId(skuId);
+        if (SkuImagesEntities != null && !SkuImagesEntities.isEmpty()) {
+            skuItemVo.setImages(SkuImagesEntities);
+        }
+    }, threadPoolExecutor);
+
+    // 等待所有任务都完成
+    try {
+        CompletableFuture.allOf(saleAttrFuture, spuDescribeFuture, baseAttrFuture, imageFuture).get();
+    } catch (InterruptedException | ExecutionException e) {
+        throw new RuntimeException(e);
+    }
+    return skuItemVo;
+}
+```
+
+而查询 sku 的图片信息则和上面的所有 IO 都没有依赖关系，它只依赖 skuId，而 skuId 又是前端传递过来的，所以它完全可以和 sku 基本信息获取的任务并行执行，并且它不需要像 infoFuture 一样需要返回值，
+所以直接调用 runAsync() 执行一个异步任务即可。最后创建一个新的 Future（CompletableFuture.allOf(...)），它会在所有传入的 Future 都完成时才完成，而调用 get() 方法则是让主线程阻塞等待，
+不过这里并没有等待 infoFuture，因为后面的那三个任务是依赖它的，所以只要它们三完成了，那代表 infoFuture 也完成了。
+
+需要注意的是：不要在方法里关闭线程池，在方法里只需要注入线程池即可，因为自定义的线程池已经纳入 Spring 容器管理了，Spring 容器在关闭时会自动关闭它，如果在业务代码中手动关闭，
+这就会导致第一次调用后线程池就被关闭，后续所有请求都无法使用线程池并抛出 RejectedExecutionException 异常，最后整个服务不可用。所以，是 Spring 管理的，那就不用手动关。
+
+****
+# 八、认证服务
+
+## 1. 环境搭配
+
+创建新的模块取名为 gulimall-auth-server，引入相关依赖以及注入 nacos：
+
+```xml
+<dependencies>
+    <!--引入 common 服务-->
+    <dependency>
+        <groupId>com.project</groupId>
+        <artifactId>gulimall-common</artifactId>
+        <version>0.0.1-SNAPSHOT</version>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-test</artifactId>
+        <scope>test</scope>
+        <exclusions>
+            <exclusion>
+                <groupId>com.vaadin.external.google</groupId>
+                <artifactId>android-json</artifactId>
+            </exclusion>
+        </exclusions>
+    </dependency>
+    <!--thymeleaf-->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-thymeleaf</artifactId>
+    </dependency>
+    <!--devtools-->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-devtools</artifactId>
+        <optional>true</optional>
+    </dependency>
+</dependencies>
+```
+
+因为引入的 common 中带有数据库的依赖，而目前的初始项目用不到数据库，所以需要在启动类上排除数据库的使用：
+
+```java
+@SpringBootApplication(exclude = {DataSourceAutoConfiguration.class})
+public class GulimallAuthServerApplication {
+    ...
+}
+```
+
+```yaml
+spring:
+  application:
+    name: gulimall-auth-server
+  cloud:
+    nacos:
+      discovery:
+        server-addr: 127.0.0.1:8848
+
+server:
+  port: 20000
+```
+
+```yaml
+spring:
+  application:
+    name: gulimall-auth-server
+
+  cloud:
+    nacos:
+      config:
+        server-addr: 127.0.0.1:8848
+        file-extension: yaml # 文件后缀名
+        namespace: 00f674fd-e07b-4f78-b4ea-136f0bcc5184 # auth-server
+```
+
+接着就是把静态资源放进 nginx 容器，并部署本地 hosts 与网关：
+
+```shell
+cp -r /mnt/d/docker_dataMountDirectory/gmall-static-resource/reg/. /nginx/html/static/reg
+cp -r /mnt/d/docker_dataMountDirectory/gmall-static-resource/login/. /nginx/html/static/login
+```
+
+```xml
+192.168.1.110 auth.gulimall.com
+```
+
+```yaml
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: nginx_auth_route
+          uri: lb://gulimall-auth-server
+          predicates:
+            - Host=auth.gulimall.com
+```
+
+然后就是配置页面跳转：
+
+```java
+@Controller
+public class LoginController {
+
+    @GetMapping("/login.html")
+    public String loginPage() {
+        return "login";
+    }
+
+    @GetMapping("/reg.html")
+    public String regPage() {
+        return "reg";
+    }
+}
+```
+
+配置好后即可正常访问，如果需要在其它前端页面点击相关的登录或者注册按钮也能正常跳转，那就需要在它们的 href 处讲请求路径修改为：
+
+```http request
+http://auth.gulimall.com/reg.html
+http://auth.gulimall.com/login.html
+```
+
+不过只在控制层做页面跳转的话就太麻烦了，这里就可以把这些请求跳转写进视图控制器，让 Spring MVC 进行管理：
+
+```java
+@Configuration
+public class GulimallWebConfig implements WebMvcConfigurer {
+    @Override
+    public void addViewControllers(ViewControllerRegistry registry) {
+        registry.addViewController("/login.html").setViewName("login");
+        registry.addViewController("/reg.html").setViewName("reg");
+    }
+}
+```
+
+****
+## 2. 验证码
+
+### 2.1 验证码倒计时
+
+```html
+<a id="sendCode">发送验证码</a>
+```
+
+在用户注册页面有个发送验证码的功能，该功能由前端完成，在 `<a>` 标签里写一个 id="sendCode" 用来在 js 中获取这个元素，后续的验证码的相关功能就能绑定到它。
+在用户点击发送验证码的按钮后就会进入倒计时的状态，而这个状态则是依次调用该方法实现的。setTimeout("timeoutChangeStyle()", 1000) 方法就是在 1s 后执行 timeoutChangeStyle() 方法，
+只要让它循环执行 60 次即可，也就是需要设置一个全局变量，每次执行让该变量减一，直到为 0 后便不再执行 setTimeout 方法，而为了防止用户可以多次点击发送验证码按钮让多个方法同时执行加快倒计时，
+就需要给按钮增加一个标识，当具有该标识时则再次点击不会触发倒计时功能。因此在第一次触发时会给该 `<a>` 标签添加一个 class 为 disable，只有在倒计时结束时才清除，
+依次达到只能点击一次的目的。
+
+```js
+$(function(){
+    $("#sendCode").click(function(){
+        // 1. 给指定的手机发送验证码
+
+        // 2. 倒计时
+        if ($(this).hasClass("disable")) {
+            // 正在倒计时
+        } else {
+            timeoutChangeStyle();
+        }
+
+    })
+});
+
+var num = 60;
+function timeoutChangeStyle() {
+    $("#sendCode").attr("class", "disable");
+    if (num === 0) {
+        $("#sendCode").text("发送验证码");
+        num = 60;
+        $("#sendCode").attr("class", "");
+    } else {
+        var str = num + " 秒后再次发送验证码";
+        $("#sendCode").text(str);
+        setTimeout(timeoutChangeStyle, 1000)
+    }
+    num --;
+}
+```
+
+****
+### 2.2 验证短信
+
+这里使用 redis 来存储验证码，因为 redis 可以设置过期时间，所以对于存储验证码来说还是比较方便的。
+
+Controller 层：
+
+```java
+@GetMapping("/sms/sendcode")
+public R sendCode(@RequestParam("phone") String phone) {
+    boolean result = sendCodeService.sendCode(phone);
+    if (!result) {
+       return R.error(BizCodeEnum.SMS_CODE_EXCEPTION.getCode(), BizCodeEnum.SMS_CODE_EXCEPTION.getMsg());
+    }
+    return R.ok();
+}
+```
+
+Service 层：
+
+因为在前端页面刷新时就能重新点击一次发送验证码，如果不对此进行限制那么在 60s 内就可以被恶意发送多次验证码进行攻击，所以在生成随机验证码的时候添加上当前系统时间，
+从 redis 中获取验证码时拿当前时间和存入的时间进行对比，如果小于 60s，那就不允许再次生成验证码，并返回错误信息给前端。
+
+```java
+@Override
+public boolean sendCode(String phone) {
+    String redisCode = stringRedisTemplate.opsForValue().get(PhoneCodeConstant.LOGIN_CODE_KEY + phone);
+    if (redisCode != null) {
+        long time = Long.parseLong(redisCode.split("_")[1]);
+        if (System.currentTimeMillis() - time < 60 * 1000) {
+            return false;
+        }
+    }
+
+    String code = RandomUtil.randomNumbers(6) + "_" + System.currentTimeMillis();
+    // 保存验证码到 redis
+    stringRedisTemplate.opsForValue().set(PhoneCodeConstant.LOGIN_CODE_KEY + phone, code, PhoneCodeConstant.LOGIN_CODE_TTL, TimeUnit.MINUTES);
+    // 防止同一个 phone 在 60s 内再次返送验证码
+    log.debug("发送短信验证码成功，验证码：{}", code.split("_")[0]);
+    return true;
+}
+```
+
+而前端只需要在点击发送按钮时发送一个请求给 Controller 即可，然后根据后端返回的状态码是否成功来给出错误提示：
+
+```js
+$(function(){
+    $("#sendCode").click(function(){
+        // 倒计时
+        if ($(this).hasClass("disable")) {
+            // 正在倒计时
+        } else {
+            // 给指定的手机发送验证码
+            $.get("/sms/sendcode?phone=" + $("#phoneNum").val(), function (data) {
+                if (data.code != 0) {
+                    alert(data.msg)
+                }
+            })
+            timeoutChangeStyle();
+        }
+    })
+});
+```
+
+****
+### 2.3 注册页面填写信息的格式判断
+
+在前端的注册页面会有一个注册表单，通过在表单中填写数据并发送请求给后端进行处理，而填写的数据会一起发送给后端，所以后端需要封装一个对象来接收数据，在接收数据时顺便对这些数据进行格式的判断：
+
+```java
+@Data
+public class UserRegisterVo {
+    @NotEmpty(message = "用户名必须提交")
+    @Length(min = 6, max = 18, message = "用户名必须是 6 ~ 18 位字符")
+    private String username;
+    @NotEmpty(message = "密码必须提交")
+    @Length(min = 6, max = 18, message = "密码必须是 6 ~ 18 位字符")
+    private String password;
+    @NotEmpty(message = "手机号须提交")
+    @Pattern(regexp = "^1[3-9]\\d{9}$", message = "手机号格式不正确")
+    private String phone;
+    @NotEmpty(message = "验证码必须提交")
+    private String code;
+}
+```
+
+然后在控制层判断格式是否正确，如果发生格式错误则把错误信息存入域中并重新跳转到注册页面：
+
+```java
+@PostMapping("/register")
+public String register(@Valid UserRegisterVo userRegisterVo, BindingResult bindingResult, Model model) {
+    // 如果校验出错就跳转到注册页面
+    if (bindingResult.hasErrors()) {
+        Map<String, String> errors = bindingResult.getFieldErrors().stream().collect(Collectors.toMap(FieldError::getField, FieldError::getDefaultMessage));
+        model.addAttribute("errors", errors);
+        return "forward:/reg.html";
+    }
+    // 注册成功回到登录页
+    return "redirect:/login.html";
+}
+```
+
+此时前端再在表单处显示错误信息：
+
+```html
+<div class="tips" style="color:red" th:text="${errors != null ? errors.userName : ''}"></div>
+```
+
+但经过测试模式错误格式数据却发现无法重新进入注册页面，这是因为提交表单为 POST 请求，而在 Controller 用的是转发，并且当前配置了路径映射，虽然默认的转发请求并不会改变请求方式，
+可是路径映射的默认方式就是 GET，它就相当于在 Controller 里写了两个方法：
+
+```java
+@GetMapping("/login.html")
+public String loginPage() {
+    return "login";
+}
+
+@GetMapping("/reg.html")
+public String regPage() {
+    return "reg";
+}
+```
+
+这就会导致无法正确匹配到页面，所以此时就不适用路径映射，应该直接返回模板名，也就是 return "reg"。修改后页面能正常跳转，但是当填写的数据并没有全部错误时，
+例如 errors 集合中只存储了用户名和密码的错误信息，那么此时程序又会报错，因为在前端进行判断时只对 errors 集合是否为空进行了判断，然后直接取值，并没有对每个详细的键值对进行非空判断，
+所以这里应该修改一下它的判断逻辑，在取值时应该对该键值对进行判断：
+
+```html
+<div class="tips" style="color:red" th:text="${errors != null ? (#maps.containsKeys(errors, 'userName') ? errors.userName : '') : ''}"></div>
+```
+
+这里用的方法就是对集合中是否存在该 key 进行判断。不过，在刷新注册页面时并没有达到刷新的效果，而是直接进行了一次表单提交，因为上面直接返回了模板名，浏览器地址栏仍然是 /register，
+而且请求方法还是 POST，此时就会再次进入该页面，浏览器金牛会重新发起 POST /register 然后触发表单重复提交。而最好的解决办法就是重定向 return "redirect:/reg.html"，
+让浏览器再自动去请求 /reg.html，此时地址栏就是 /reg.html 而不是 /register，如果用户刷新页面就只会重新发起 GET /reg.html，不会重复提交表单。但重定向不能共享数据，
+也就是说产生错误信息后，页面重定向到了注册页，但此时存入域中的 errors 数据就丢失了，那就失去了这么编写代码的意义了，所以这里不能再适用 Model 将数据存入域中，
+而是使用 RedirectAttributes，让它携带数据进行重定向。但重定向是默认适用当前服务器的 IP + 端口的形式进行重定向，并没有使用之前自定义域名，所以不能直接重定向，
+应该重定向一个完整的路径：return "redirect:http://auth.gulimall.com/reg.html" 。不过 addFlashAttribute 的数据只会暂存在 session，仅在下一次请求中可用，
+一旦 /reg.html 渲染完，数据就会从 session 中移除。而分布式的项目中 session 通常不共享，因为每个请求可能被网关负载均衡到不同端口的服务，而这些服务的 session 不共享，
+这就会导致 /reg.html 页面进行渲染时获取的 errors 数据为空，用户无法看到任何错误提示信息。但当前单服务的情况下没有问题，所以这个问题后续解决。
+
+```html
+<form th:action="/register" method="post" class="one">
+    <div class="register-box">
+        <label class="username_label">用 户 名
+            <input name="userName" maxlength="20" type="text" placeholder="您的用户名和登录名">
+        </label>
+        <div class="tips" style="color:red" th:text="${errors != null ? (#maps.containsKeys(errors, 'userName') ? errors.userName : '') : ''}"></div>
+    </div>
+    <div class="register-box">
+        <label class="other_label">设 置 密 码
+            <input name="password" maxlength="20" type="password" placeholder="建议至少使用两种字符组合">
+        </label>
+        <div class="tips" style="color:red" th:text="${errors != null ? (#maps.containsKeys(errors, 'password') ? errors.password : '') : ''}"></div>
+    </div>
+    <div class="register-box">
+        <label class="other_label">确 认 密 码
+            <input maxlength="20" type="password" placeholder="请再次输入密码">
+        </label>
+        <div class="tips"></div>
+    </div>
+    <div class="register-box">
+        <label class="other_label">
+            <span>中国 0086∨</span>
+            <input name="phone" maxlength="20" type="text" placeholder="建议使用常用手机">
+        </label>
+        <div class="tips" style="color:red" th:text="${errors != null ? (#maps.containsKeys(errors, 'phone') ? errors.phone : '') : ''}"></div>
+    </div>
+    <div class="register-box">
+        <label class="other_label">验 证 码
+            <input name="code" maxlength="20" type="text" placeholder="请输入验证码" class="caa">
+        </label>
+        <a id="sendCode">发送验证码</a>
+        <div class="tips" style="color:red" th:text="${errors != null ? (#maps.containsKeys(errors, 'code') ? errors.code : '') : ''}"></div>
+    </div>
+</form>
+```
+
+****
+## 3. 注册
+
+### 3.1 数据封装
+
+在 gulimall-auth-server 服务中，先对验证码进行判断是否正确，如果正确再远程调用 gulimall-member 服务进行注册。
+
+Controller 层：
+
+```java
+@PostMapping("/register")
+public String register(@Valid UserRegisterVo userRegisterVo, BindingResult bindingResult, RedirectAttributes redirectAttributes) {
+    // 如果校验出错就跳转到注册页面
+    if (bindingResult.hasErrors()) {
+        Map<String, String> errors = bindingResult.getFieldErrors().stream().collect(Collectors.toMap(FieldError::getField, FieldError::getDefaultMessage));
+        redirectAttributes.addFlashAttribute("errors", errors);
+        return "redirect:http://auth.gulimall.com/reg.html";
+    }
+    boolean result = sendCodeService.checkCode(userRegisterVo.getPhone(), userRegisterVo.getCode());
+    if (!result) {
+        Map<String, String> errors = new HashMap<>();
+        errors.put("code", "验证码错误");
+        redirectAttributes.addFlashAttribute("errors", errors);
+        // 校验出错，转发到注册页
+        return "redirect:http://auth.gulimall.com/reg.html";
+    }
+    // 注册成功回到登录页
+    return "redirect:/login.html";
+}
+```
+
+Service 层：
+
+该方法就是对前端传递的验证码与存入 redis 中的验证码进行比较，如果正确再进行远程调用，否则返回 false 告诉 Controller 层校验失败。
+
+```java
+@Override
+public boolean checkCode(String phone, String code) {
+    String redisCode = stringRedisTemplate.opsForValue().get(PhoneCodeConstant.LOGIN_CODE_KEY + phone);
+    if (redisCode == null) {
+        return false;
+    } else {
+        if (code.equals(redisCode.split("_")[0])) {
+            // 验证码正确则删除验证码，确保只能使用一次
+            stringRedisTemplate.delete(PhoneCodeConstant.LOGIN_CODE_KEY + phone);
+            // 进行注册
+            ...
+        } else {
+            return false;
+        }
+    }
+    return false;
+}
+```
+
+关于 gulimall-member 服务，则是需要进行注册功能的实现，所以需要对传过来的用户名、手机号和密码进行封装与唯一性的判断。
+
+Controller 层：
+
+因为在 Service 层会对用户名和手机号等数据进行唯一性的判断，如果查询数据库后发现存在相同的数据那就抛出异常，而 Service 层抛出的异常在 Controller 是可以捕获到的，
+如果捕获到了那就可以进行相关处理，这样写起来比较方便。
+
+```java
+@PostMapping("/register")
+public R register(@RequestBody MemberRegisterVo memberRegisterVo){
+    try {
+        memberService.regist(memberRegisterVo);
+    } catch (Exception e) {
+        ...
+    }
+    return R.ok();
+}
+```
+
+Service 层：
+
+在这里则需要定义两个异常类与两个方法，让它们用用户名和手机号作为条件进行查询数据库，如果存在则抛异常。
+
+```java
+@Override
+public void regist(MemberRegisterVo memberRegisterVo) {
+    MemberEntity memberEntity = new MemberEntity();
+    // 检查用户名和手机号是否唯一，为了让 Controller 感知，可以使用异常机制
+    checkPhoneUnique(memberRegisterVo.getPhone());
+    checkUserNameUnique(memberRegisterVo.getUsername());
+
+    memberEntity.setUsername(memberRegisterVo.getUsername());
+    memberEntity.setMobile(memberRegisterVo.getPhone());
+
+    // 获取会员等级对应的 id
+    MemberLevelEntity memberLevelEntity = memberLevelDao.getDefaultLevel();
+    memberEntity.setLevelId(memberLevelEntity.getId());
+    save(memberEntity);
+}
+
+@Override
+public void checkPhoneUnique(String phone) {
+    Long mobile = memberDao.selectCount(new LambdaQueryWrapper<MemberEntity>().eq(MemberEntity::getMobile, phone));
+    if (mobile > 0L) {
+        throw new PhoneExistException();
+    }
+}
+
+@Override
+public void checkUserNameUnique(String username) {
+    Long username1 = memberDao.selectCount(new LambdaQueryWrapper<MemberEntity>().eq(MemberEntity::getUsername, username));
+    if (username1 > 0L) {
+        throw new UserNameExistException();
+    }
+}
+```
+
+```java
+public class PhoneExistException extends RuntimeException {
+    public PhoneExistException() {
+        super("手机号已存在");
+    }
+}
+```
+
+```java
+public class UserNameExistException extends RuntimeException {
+    public UserNameExistException() {
+        super("用户名已存在");
+    }
+}
+```
+
+****
+### 3.2 密码加密
+
+#### 3.2.1 md5 加密
+
+md5 可以任意长度的数据（比如一个字符串、一个文件）转换为一个固定长度（128 位，即 16 字节） 的哈希值，通常用一个 32 位十六进制数字的字符串表示。例如：
+输入："hello world" 则会输出："5eb63bbbe01eeed093cb22bb8f5acdc3"。主要特点为：
+
+1、不可逆性（单向性）
+
+可以将任何数据转化为某个唯一的 md5 值，并且该值不会改变，除非原值发生变化才会改变。
+
+2、唯一性（抗碰撞性）
+
+理论上，不同的输入数据会产生不同的 md5 值，对于两个不同的数据，计算出相同 md5 值的概率极低（虽然已被证明存在碰撞，但对于绝大多数非安全敏感场景，仍可视为唯一）
+
+3、不可预测性
+
+只要加密值发生变化就会导致输出的 md5 值发生不可预测的变化。
+
+主要用途：
+
+1、数据完整性校验
+
+文件下载时网站会提供文件的 md5 值，下载后计算本地文件的 md5 与之对比，如果一样，则说明文件下载完整无误，未被篡改。
+
+2、数字签名
+
+对消息生成 md5 摘要，然后用私钥对摘要进行加密，形成签名；接收方用公钥解密签名得到摘要，再计算消息的 md5 进行对比，验证消息的真实性和完整性。
+
+3、口令加密 
+
+以前在用户注册时，系统不存储用户的明文密码，而是存储密码的 md5 值，在登录时，系统将用户输入的密码进行 md5 计算，因为其不可逆性的特征，可以与数据库存储的 md5 值对比。
+但由于 MD5 的快速计算和“彩虹表”的存在（暴力破解法，将大量的随机密码加密成 md5 然后进行对比），所以直接存储 md5 密码非常危险，并且现在也不推荐使用。
+
+```java
+public static String getMD5(String input) {
+    try {
+        // 1. 获取 md5 摘要器实例
+        MessageDigest md = MessageDigest.getInstance("MD5");
+        // 2. 将输入字符串转换为字节数组
+        byte[] messageDigest = md.digest(input.getBytes());
+        // 3. 将字节数组转换为字符串
+        BigInteger no = new BigInteger(1, messageDigest);
+        String hashtext = no.toString(16);
+        // 4. 确保生成的字符串是 32 位长（前面可能补0）
+        while (hashtext.length() < 32) {
+            hashtext = "0" + hashtext;
+        }
+        return hashtext;
+    } catch (NoSuchAlgorithmException e) {
+        throw new RuntimeException(e);
+    }
+}
+
+public static void main(String[] args) {
+    String s = "hello world";
+    System.out.println("Your HashCode for '" + s + "' is: " + getMD5(s));
+    // 输出: 5eb63bbbe01eeed093cb22bb8f5acdc3
+    String s2 = "hello world.";
+    System.out.println("Your HashCode for '" + s2 + "' is: " + getMD5(s2));
+    // 输出一个完全不同的值：3c4292ae95be58e0c58e4e5511f09647
+}
+```
+
+****
+#### 3.2.2 盐值加密
+
+如果用户 A 和用户 B 都使用密码 123456，那么直接使用 md5 加密会生成一样的随机数字，攻击者一旦破解一个密码，就等同于破解了所有使用相同密码的账户。而 “彩虹表” 的存在，
+让攻击者只需简单地在这个表中查找匹配的值就能立刻得到对应的明文密码。而 “盐” 就是为了解决这两个问题诞生的。
+
+盐是一段随机生成的、固定长度的、与用户相关联的字符串，核心特点：
+
+- 唯一性：每个用户的盐都应该是独一无二的，通常使用密码学安全的随机数生成器生成
+- 长度足够：盐的长度应足够长（例如 16 字节或更长），以确保其唯一性，增加暴力破解的难度
+- 明文存储：盐不需要保密，它可以明文形式存储在数据库的用户记录中
+
+在注册或设置密码时会为用户生成一个随机的盐，将用户输入的明文密码和盐拼接（password + salt 或 salt + password）在一起，将拼接后的字符串送入加密哈希函数进行计算并得到哈希值。
+最后将最终的哈希值和盐一起存入数据库的该用户记录中。而验证密码时从数据库中取出该用户的盐和存储的哈希值，将用户本次登录输入的明文密码与取出的盐进行拼接，
+然后使用相同的哈希函数计算拼接后字符串的哈希值，将计算出的新哈希值与数据库中存储的旧哈希值进行比对，如果一致，则密码正确，反之则错误。
+
+可以使用 BCrypt 加密器进行加密，它每次加密自带一个随机的盐，存储时直接包含在结果中，不需要额外字段。
+
+```java
+public static void main(String[] args) {
+    // cost = 12，安全性和性能的平衡
+    BCryptPasswordEncoder encoder = new BCryptPasswordEncoder(12);
+    // 注册时：加密密码
+    String rawPassword = "MySecurePassword123!";
+    String hashedPassword = encoder.encode(rawPassword);
+    System.out.println("原始密码: " + rawPassword);
+    System.out.println("BCrypt哈希: " + hashedPassword); // $2a$12$X9Im/C5nGc45G2BsOH6Cy./aR231gNIXy5sZJybshzJuEZV/a2dD2
+    // 登录时：验证密码是否正确
+    boolean matches = encoder.matches("MySecurePassword123!", hashedPassword); // true
+    System.out.println("密码是否匹配: " + matches);
+}
+```
+
+同一个密码每次 encode() 出来的值都不同，因为 salt 是随机的，但只要原密码一样，那么就能匹配成功。而在实例化 BCryptPasswordEncoder 传入的 12 为 cost 构造因子，
+它是用于平衡安全性和性能的东西，一般使用 10 或 12，如果不填写，默认是 10。
+
+****
+
+
 

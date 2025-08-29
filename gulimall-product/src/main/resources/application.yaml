@@ -28,6 +28,11 @@ spring:
       cache-null-values: true # 是否缓存空值
       null-value-ttl: 2m # null 占位 TTL
 
+#gulimall:
+#  thread:
+#    core-pool-size: 20
+#    max-pool-size: 200
+#    keep-alive-time: 10
 
 feign:
   client:

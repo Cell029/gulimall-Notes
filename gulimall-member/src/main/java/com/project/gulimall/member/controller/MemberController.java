@@ -2,12 +2,10 @@ package com.project.gulimall.member.controller;
 
 import java.util.Arrays;
 import java.util.Map;
+
+import com.project.gulimall.member.vo.MemberRegisterVo;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.web.bind.annotation.PathVariable;
-import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RequestParam;
-import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.bind.annotation.*;
 import com.project.gulimall.member.entity.MemberEntity;
 import com.project.gulimall.member.service.MemberService;
 import com.project.common.utils.PageUtils;
@@ -77,6 +75,16 @@ public class MemberController {
     public R delete(@RequestBody Long[] ids){
 		memberService.removeByIds(Arrays.asList(ids));
 
+        return R.ok();
+    }
+
+    @PostMapping("/register")
+    public R register(@RequestBody MemberRegisterVo memberRegisterVo){
+        try {
+            memberService.regist(memberRegisterVo);
+        } catch (Exception e) {
+
+        }
         return R.ok();
     }
 
