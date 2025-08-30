@@ -12215,6 +12215,493 @@ public static void main(String[] args) {
 它是用于平衡安全性和性能的东西，一般使用 10 或 12，如果不填写，默认是 10。
 
 ****
+### 3.3 注册完成
+
+在注册页面提交注册表单后会进入该控制器的方法，在完成注册前就会先进行输入数据的格式校验，如果有问题那就将错误信息保存在域中并展示给前端；若没有错误则对输入的验证码和存在 redis 的验证码进行对比，
+如果一致再进行注册，不一致则提交错误信息。
+
+Controller 层：
+
+```java
+@PostMapping("/register")
+public String register(@Valid UserRegisterVo userRegisterVo, BindingResult bindingResult, RedirectAttributes redirectAttributes) {
+    // 如果校验出错就跳转到注册页面
+    if (bindingResult.hasErrors()) {
+        Map<String, String> errors = bindingResult.getFieldErrors().stream().collect(Collectors.toMap(FieldError::getField, FieldError::getDefaultMessage));
+        redirectAttributes.addFlashAttribute("errors", errors);
+        return "redirect:http://auth.gulimall.com/reg.html";
+    } else {
+        boolean result = sendCodeService.checkCode(userRegisterVo.getPhone(), userRegisterVo.getCode());
+        if (!result) {
+            Map<String, String> errors = new HashMap<>();
+            errors.put("code", "验证码错误");
+            redirectAttributes.addFlashAttribute("errors", errors);
+            // 校验出错，转发到注册页
+            return "redirect:http://auth.gulimall.com/reg.html";
+        } else {
+            R r = memberFeignService.register(userRegisterVo);
+            log.debug("注册结果：{}", r);
+            if (r.getCode() == 0) {
+                // 注册成功回到登录页
+                return "redirect:http://auth.gulimall.com/login.html";
+            } else {
+                Map<String, String> errors = new HashMap<>();
+                errors.put("msg", r.getData(new TypeReference<String>() {}));
+                redirectAttributes.addFlashAttribute("errors", errors);
+                return "redirect:http://auth.gulimall.com/reg.html";
+            }
+        }
+    }
+}
+```
+
+这里的注册是远程调用的 gulimall-member 服务的方法，所以要利用到 OpenFeign 进行远程调用，然后就是对用户名和手机号的唯一性进行判断，不重复才能正确注册保存进数据库。
+
+```java
+@Override
+public void regist(MemberRegisterVo memberRegisterVo) {
+    MemberEntity memberEntity = new MemberEntity();
+    // 检查用户名和手机号是否唯一，为了让 Controller 感知，可以使用异常机制
+    checkPhoneUnique(memberRegisterVo.getPhone());
+    checkUserNameUnique(memberRegisterVo.getUsername());
+    memberEntity.setUsername(memberRegisterVo.getUsername());
+    memberEntity.setMobile(memberRegisterVo.getPhone());
+
+    // 密码进行加密存储
+    BCryptPasswordEncoder bCryptPasswordEncoder = new BCryptPasswordEncoder();
+    String encode = bCryptPasswordEncoder.encode(memberRegisterVo.getPassword());
+    memberEntity.setPassword(encode);
+
+    // 获取会员等级对应的 id
+    MemberLevelEntity memberLevelEntity = memberLevelDao.getDefaultLevel();
+    memberEntity.setLevelId(memberLevelEntity.getId());
+
+    save(memberEntity);
+}
+```
+
+****
+## 4. 登录功能
+
+登录功能就是在前端提交用户的登录账号和密码给后端，让后端进行验证，验证通过则跳转到商城首页，否则提示错误，而这一操作由前端提交表单，所以后端接收数据不需要用 @RequestBody。
+
+```html
+<form action="/login" method="post">
+    <div style="color: red" th:text="${errors != null and errors.containsKey('msg') ? errors['msg'] : ''}"></div>
+    <ul>
+        <li class="top_1">
+            <img src="/static/login/JD_img/user_03.png" class="err_img1" />
+            <input type="text" name="loginacct" placeholder=" 邮箱/用户名/已验证手机" class="user" />
+        </li>
+        <li>
+            <img src="/static/login/JD_img/user_06.png" class="err_img2" />
+            <input type="password" name="password" placeholder=" 密码" class="password" />
+        </li>
+        <li class="bri">
+            <a href="/static/login/">忘记密码</a>
+        </li>
+        <li class="ent"><button class="btn2" type="submit"><a>登 &nbsp; &nbsp;录</a></button></li>
+    </ul>
+</form>
+```
+
+Controller 层：
+
+这里封装了一个 UserLoginVo 来接收用户提交的账号和密码，然后远程调用 gulimall-member 服务进行查询数据库的操作。
+
+```java
+@PostMapping("/login")
+public String login(UserLoginVo userLoginVo, RedirectAttributes redirectAttributes) {
+    // 调用远程登录
+    R r = memberFeignService.login(userLoginVo);
+    if (r.getCode() == 0) {
+        // 成功
+        return "redirect:http://gulimall.com";
+    } else {
+        Map<String, String> errors = new HashMap<>();
+        errors.put("msg", r.getData("msg", new TypeReference<String>() {}));
+        redirectAttributes.addFlashAttribute("errors", errors);
+        return "redirect:http://auth.gulimall.com/login.html";
+    }
+}
+```
+
+Service 层：
+
+这里先查询数据库是否存在用户输入的登录账号，如果不存在就返回空值，那么 Controller 层就知道没有该账号，直接返回错误信息；如果查到了再验证密码的正确性，
+因为采用了加密，所以需要对存在数据库的加密密码和从前端获取到的密码进行加密比对，一致再返回查到的 MemberEntity 对象。
+
+```java
+@Override
+public MemberEntity login(MemberLoginVo memberLoginVo) {
+    String loginacct = memberLoginVo.getLoginacct();
+    String password = memberLoginVo.getPassword();
+    MemberEntity memberEntity = getOne(new LambdaQueryWrapper<MemberEntity>().eq(MemberEntity::getUsername, loginacct).or().eq(MemberEntity::getMobile, loginacct));
+    if (memberEntity == null) {
+        // 登录失败
+        return null;
+    } else {
+        String passwordDb = memberEntity.getPassword();
+        BCryptPasswordEncoder bCryptPasswordEncoder = new BCryptPasswordEncoder();
+        boolean matches = bCryptPasswordEncoder.matches(password, passwordDb);
+        if (matches) {
+            return memberEntity;
+        } else {
+            return null;
+        }
+    }
+}
+```
+
+****
+## 5. 社交登录
+
+### 5.1 OAuth 
+
+OAuth 是一个开放标准，用于在不暴露密码的情况下，允许第三方应用访问用户在服务提供商（如 Google、GitHub、微信）的资源。用户不需要把自己的账号密码给第三方应用，
+便可以授权第三方应用访问部分资源（比如读取邮箱、微博好友列表）。OAuth 定义了 4 种角色：
+
+- 资源拥有者：通常是用户，拥有受保护的资源
+- 客户端：第三方应用，需要访问资源的应用
+- 授权服务器：负责用户授权，颁发访问令牌（Access Token）
+- 资源服务器：存储用户资源，接收访问令牌来提供资源（在很多系统中，授权服务器和资源服务器可以是同一台服务器，但概念上是分开的）
+
+OAuth 2.0 主要包含：
+
+1、Access Token（访问令牌）
+
+它用于访问用户资源的凭证，通常有有效期。
+
+2、Refresh Token（刷新令牌）
+
+当 Access Token 到期后，用 Refresh Token 获取新的 Access Token，它可以避免用户频繁登录重新获取 Access Token。
+
+3、Scope（作用域）
+
+它用于限制客户端访问资源的范围，例如 read:user email repo 表示可以读取用户信息、邮箱和仓库。
+
+4、Redirect URI（回调地址）
+
+授权服务器授权成功后会将用户重定向到客户端的地址，所以必须提前注册，防止恶意重定向。
+
+OAuth 2.0 提供了多种授权方式：
+
+1、授权码模式（最常用）
+
+用户在客户端点击“用第三方登录”，客户端会重定向到授权服务器，等待用户登录并授权，随后授权服务器会返回授权码，客户端需要用授权码向授权服务器换取访问令牌（Access Token），
+客户端获取到令牌后就可以用令牌访问资源服务器了。这种授权方式的优点就是 Access Token 不暴露给用户浏览器，安全性较高。
+
+2、简化模式
+
+该模式主要用于前端单页应用，可以直接从授权服务器获取 Access Token，无需中间授权码，虽然流程简化，但安全性低，因为令牌会暴露在浏览器中。
+
+3、密码模式
+
+用户直接把用户名和密码给客户端，让客户端换取 Access Token，这种模式风险较高，不推荐使用，通常只在自有应用中使用。
+
+4、客户端模式
+
+该模式用于应用访问自己的资源或服务端之间的服务调用，它不涉及用户，客户端直接用自己的 client_id 和 client_secret 获取 Access Token。
+
+****
+### 5.2 GitHub 登录
+
+GitHub 提供 OAuth 2.0 授权机制，允许第三方应用获取用户在 GitHub 上的部分信息（如用户名、邮箱）而无需用户暴露密码。主要会用到以下字段：
+
+- Client ID：应用标识，由 GitHub 分配
+- Client Secret：应用密钥，用于服务端交换 Access Token
+- Authorization Code：用户授权后生成的临时码，用于获取 Access Token
+- Access Token：应用用来访问用户 GitHub 数据的凭证
+- Redirect URI / Callback URL：用户授权后 GitHub 回跳到应用的 URL
+
+注册 GitHub OAuth 应用的步骤：
+
+1. 登录 GitHub -> 右上角头像 -> Settings -> 左下角 Developer settings -> OAuth Apps -> New OAuth App。
+2. 填写信息对应的信息，主要有如下内容：
+
+   - Application Name：你的应用名字
+   - Homepage URL：应用主页，例如 https://gulimall.com
+   - Authorization callback URL：用户授权完成后 GitHub 跳转回你的 URL，例如 https://gulimall.com/success
+3. 注册完成后，GitHub 会生成 Client ID 和 Client Secret，Client Secret 需要好好保管，不能放到前端
+
+注册完成后让前端发起授权请求，当用户点击 “用 GitHub 登录” 时，浏览器重定向到 GitHub 授权页面：
+
+```http request
+GET https://github.com/login/oauth/authorize?client_id=YOUR_CLIENT_ID&state=随机字符串
+```
+
+这里的 state 是用来防 CSRF 攻击的随机值，登录完成后会原样返回，需要验证。当用户同意授权后 GitHub 会跳转到上面设置的 callback URL 回调地址，并附带 code 和 state，例如：
+
+```http request
+http://gulimall.com/success?code=1442c4a...&redirect_uri=http://auth.gulimall.com/oauth/github/success&state=2
+```
+
+此时就需要让服务端用授权码换取 Access Token，所以要让服务端接收到 code 后向 GitHub 请求 Access Token，这里用 Apifox 模拟：
+
+```http request
+POST https://github.com/login/oauth/access_token?client_id=...&client_secret=...&code=...&redirect_uri=http://gulimall.com/success
+```
+
+- client_id：必填，是从 GitHub 收到的 OAuth app 的客户端 ID
+- client_secret：必填，是从 GitHub 收到的 OAuth app 的客户端密码
+- code：必填，收到的作为对上面步骤的响应的代码
+- redirect_uri：必填，是用户获得授权后被发送到的应用程序中的 URL
+
+发送请求后会得到如下信息：
+
+```text
+access_token=gho_rHt5...&scope=&token_type=bearer
+```
+
+最后，用请求到的 Access Token 获取用户信息：
+
+```http request
+GET https://api.github.com/user
+Authorization: token ACCESS_TOKEN
+```
+
+需要注意的是，GitHub 不允许把 access_token 放在 URL 查询参数里，必须通过 HTTP Header 发送，所以必须在请求头上添加，最终访问成功，得到用户信息：
+
+```json
+{
+    "login": "Cell029",
+    "id": 15245...,
+    "node_id": "U_kgDO...",
+    "avatar_url": "https://avatars.githubusercontent.com/u/152457414?v=4",
+    "gravatar_id": "",
+    "url": "https://api.github.com/users/Cell029",
+    "html_url": "https://github.com/Cell029",
+    "followers_url": "https://api.github.com/users/Cell029/followers",
+    "following_url": "https://api.github.com/users/Cell029/following{/other_user}",
+    ...
+}
+```
+
+最终流程：
+
+```text
+用户点击 GitHub 登录
+        ⬇
+浏览器跳转到 GitHub 授权页面 
+        ⬇
+      用户授权
+        ⬇
+GitHub 回调你的 redirect_uri 并带 code 
+        ⬇
+服务端用 code 换 Access Token 
+        ⬇
+服务端用 Access Token 获取用户信息
+        ⬇
+  创建或登录本地账号
+```
+
+****
+### 5.3 GitHub 账号社交登录回调
+
+上面简单记录了一下 GitHub 账号如何获取 code 后再通过 code 获取到 Access Token 取获取 GitHub 用户的信息，现在就需要用 Java 代码来实现。所以整体的思路就是：
+用前端传来的 code 去 GitHub 换取一个访问令牌，用得到的 Access Token 去请求 GitHub 的 API 获取用户的详细信息（如 ID、用户名），
+将 GitHub 返回的用户信息发送给本地的用户服务，进行登录或注册操作。
+
+Controller 层：
+
+因为前端点击 GitHub 登录时就会去 GitHub 获取一个 code，该 code 是通过 url 传递的，所以用 @RequestParam 接收后就可以使用了，控制层就是调用一个 loginOrRegister() 方法，
+用来判断该 GitHub 用户是否注册过，在该方法内部会通过传递的 code 来获取 Access Token 和用户信息。
+
+```java
+@GetMapping("/oauth/github/success")
+public String githubSuccess(@RequestParam("code") String code, RedirectAttributes redirectAttributes) {
+    // 根据 code 换取 Access Token
+    try {
+        MemberResponseVo userInfo = gitHubOAuthService.loginOrRegister(code);
+        System.out.println(userInfo);
+      if (userInfo != null) {
+          // 登录成功，跳转首页
+          log.info("GitHub 用户登录成功");
+          return "redirect:http://gulimall.com";
+      } else {
+          log.error("GitHub 用户登录失败");
+          return "redirect:http://auth.gulimall.com/login.html";
+      }
+    } catch (OAuthException e) {
+        redirectAttributes.addFlashAttribute("errors", e.getMessage());
+        return "redirect:http://auth.gulimall.com/login.html";
+    }
+}
+```
+
+Service 层：
+
+该方法主要就是起到一个调用别的方法的作用，一个调用获取 Access Token，一个通过 Access Token 来获取 GitHub 用户信息进行登录与注册的判断。
+
+```java
+@Override
+public MemberResponseVo loginOrRegister(String code) throws OAuthException {
+    // 用授权码换取 AccessToken
+    String accessToken = getAccessToken(code);
+    // 用 AccessToken 换取用户信息
+    GitHubUserInfoVo userInfo = getUserInfo(accessToken);
+    // 将用户信息发送给内部会员服务，进行登录或注册
+    if (r.getCode() == 0) {
+        MemberResponseVo memberEntity = r.getData("memberEntity", new TypeReference<MemberResponseVo>() {
+    });
+        return memberEntity;
+    }
+    return null;
+}
+```
+
+```java
+public String getAccessToken(String code) throws OAuthException {
+    // 构建请求 URL(GitHub 的令牌端点)
+    String url = "https://github.com/login/oauth/access_token";
+    // 1. 设置请求头
+    HttpHeaders headers = new HttpHeaders();
+    headers.setAccept(Collections.singletonList(MediaType.APPLICATION_JSON)); // 告诉 GitHub 希望返回 JSON 格式的数据
+    // 2. 构建请求体 (OAuth2 标准参数)
+    Map<String, String> body = new HashMap<>();
+    body.put("client_id", clientId); // 应用的 id，在 GitHub 上注册时获得
+    body.put("client_secret", clientSecret); // 应用的密钥
+    body.put("code", code); // 前端传来的授权码
+    body.put("redirect_uri", redirectUri); // 必须与注册应用时填写的和前端请求时用的 redirect_uri 一致
+    // 3. 将头和体组装成 HTTP 实体
+    HttpEntity<Map<String, String>> entity = new HttpEntity<>(body, headers);
+    // 4. 发送POST请求
+    ResponseEntity<Map> response = restTemplate.postForEntity(url, entity, Map.class);
+    // 5. 处理响应
+    Map<String, Object> resp = response.getBody();
+    if (resp != null && resp.get("access_token") != null) {
+        return resp.get("access_token").toString();
+    } else {
+      throw new OAuthException("获取 AccessToken 失败");
+    }
+}
+```
+
+要获取 Access Token 就需要指定获取的 URL，而 https://github.com/login/oauth/access_token 是 OAuth 2.0 标准规定的令牌端点，然后就要通过携带请求头的方式传递 code，
+Accept: application/json 是关键，因为 GitHub 默认可能返回 application/x-www-form-urlencoded 格式，通过这个请求头明确要求返回 JSON，方便后续用 Map 解析。
+前面有记录，在获取 Access Token 时需要携带一些必要的参数，而这四个参数就是 OAuth 2.0 标准中用授权码换取令牌时必须的，client_id 和 client_secret 用于证明是合法应用在请求，
+code 是临时凭证，redirect_uri 则是用于二次校验（虽然 GitHub 会自动跳转，但还是写上比较好）。最后将请求头和请求体包装在一起，方便 RestTemplate 发送，
+并检查响应体中是否包含 access_token 字段，如果有则成功返回，否则视为失败。
+
+需要注意的是：因为 GitHub 属于外网，如果直接连接是连不上的，所以需要使用到 clash-verge，但是 Spring Boot 的 RestTemplate 默认不会自动走系统代理，所以就算本地能访问 GitHub，
+Java 程序也可能还是走的直连，导致超时。因此需要单独配置 RestTemplate，给它设置代理，在发送令牌请求时直接通过 clash 访问：
+
+```java
+@Component
+public class RestTemplateClashVerge {
+    @Bean
+    public RestTemplate restTemplate() {
+        // 设置代理
+        Proxy proxy = new Proxy(Proxy.Type.HTTP, new InetSocketAddress("127.0.0.1", 7897));
+        SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
+        factory.setProxy(proxy);
+        return new RestTemplate(factory);
+    }
+}
+```
+
+这里 new SimpleClientHttpRequestFactory() 的作用就是创建一个请求工厂（RequestFactory），RestTemplate 需要通过这个工厂来生成具体的 HTTP 请求对象。
+因为 RestTemplate 本身只是一个客户端工具，它本身不直接发送请求，它需要一个底层的请求工厂（ClientHttpRequestFactory）来创建 HttpURLConnection 或 HttpClient 请求对象。
+然后让这个工厂设置代理，再把工厂传递给 RestTemplate，如果直接写 return new RestTemplate(); 也会默认使用 SimpleClientHttpRequestFactory，
+但是这就没法设置代理对象了，所以才要显式地创建工厂。
+
+```java
+public GitHubUserInfoVo getUserInfo(String accessToken) throws OAuthException {
+    // 构建请求URL (GitHub 的用户信息 API 端点)
+    String url = "https://api.github.com/user";
+    // 1. 设置请求头 (身份验证的核心)
+    HttpHeaders headers = new HttpHeaders();
+    headers.set("Authorization", "token " + accessToken); // 标准 Bearer Token 认证格式
+    headers.setAccept(Collections.singletonList(MediaType.APPLICATION_JSON)); // 期望以 JSON 返回
+    // 2. 组装请求实体（这里没有请求体，只有头）
+    HttpEntity<String> entity = new HttpEntity<>(headers);
+    // 3. 发送GET请求
+    ResponseEntity<Map> response = restTemplate.exchange(url, HttpMethod.GET, entity, Map.class);
+    // 4. 处理响应
+    Map<String, Object> body = response.getBody();
+    if (body != null && body.get("id") != null) { // 通常用id作为用户唯一标识
+        // 成功就将 Map 中的数据映射到自定义的 GitHubUserInfoVo 对象中
+        GitHubUserInfoVo gitHubUserInfoVo = new GitHubUserInfoVo();
+        gitHubUserInfoVo.setId(Long.parseLong(body.get("id").toString()));
+        gitHubUserInfoVo.setLogin(body.get("login").toString());
+        return gitHubUserInfoVo;
+    } else {
+        throw new OAuthException("获取 GitHub 用户信息失败");
+    }
+}
+```
+
+首先设置一个请求路径 https://api.github.com/user ，它是 GitHub 提供的资源服务器端点，用于获取已验证用户的个人信息，接着封装请求头，GitHub 强制要求以请求头的形式传递，
+它告诉 GitHub 已经有访问令牌了，现在需要要访问受保护的资源，这是 OAuth 2.0 标准中携带访问令牌的方式之一（Bearer Token），因为这是一个 GET 请求，没有请求体，
+所以只需要传入 headers 并封装为 HttpEntity，接着指定 HTTP 方法为 GET，完整地传入构建的 HttpEntity。最后对响应结果进行解析：GitHub 用户 API 返回一个 JSON 对象，
+这里将其解析为 Map，然后手动提取所需的字段（如 id, login）并填充到自定义的 GitHubUserInfoVo 对象中。如果获取失败，这里还会抛出异常，抛出的异常会由 Controller 层接收到，
+由它进行异常的处理。
+
+```java
+/**
+ * 社交账号登录
+ */
+@PostMapping("/oauth/login")
+public R oauthLogin(@RequestBody MemberGitHubUserInfoVo memberGitHubUserInfoVo) {
+    MemberEntity memberEntity = memberService.oauthLogin(memberGitHubUserInfoVo);
+    return R.ok().put("memberEntity", memberEntity);
+}
+
+@Override
+public MemberEntity oauthLogin(MemberGitHubUserInfoVo memberGitHubUserInfoVo) {
+    String gitHubId = String.valueOf(memberGitHubUserInfoVo.getId());
+    String githubLogin = memberGitHubUserInfoVo.getLogin();
+    MemberEntity one = getOne(new LambdaQueryWrapper<MemberEntity>().eq(MemberEntity::getUsername, gitHubId));
+    if (one == null) {
+        // 如果没查到就注册
+        MemberEntity memberEntity = new MemberEntity();
+        memberEntity.setUsername(gitHubId);
+        // 获取会员等级对应的 id
+        MemberLevelEntity memberLevelEntity = memberLevelDao.getDefaultLevel();
+        memberEntity.setLevelId(memberLevelEntity.getId());
+        memberEntity.setNickname(githubLogin);
+        memberEntity.setCreateTime(new Date());
+        save(memberEntity);
+        return memberEntity;
+    } else {
+        return one;
+    }
+}
+```
+
+最后调用远程接口，对该 GitHub 用户进行账号的检查，看看是否已注册，如果没注册，那就把它的信息存入数据库中，如果已注册，那就直接将数据返回即可。
+
+****
+## 6. 分布式服务 Session 共享问题
+
+在单体应用中，用户登录后会在服务器内存中生成一个 Session，浏览器通过 Cookie 保存 JSESSIONID，每次请求会带上这个 ID，服务器通过这个 ID 找到对应的 Session，完成用户状态管理。
+
+```text
+浏览器 --> 服务器 --> Session 存储在服务器内存
+```
+
+这种方式在单台服务器下很简单，但在分布式架构（多台服务器）中就会出现问题：
+
+```text
+浏览器请求 --> 服务器A（有Session）  
+下一次请求 --> 服务器B（没有Session） --> 用户被当作未登录
+```
+
+所以 Session 无法在多台服务器之间共享同步。而目前的项目的架构为一服务对应一个域名，浏览器的 Session 是基于 Cookie 的，Cookie 默认只在当前域名或子域名下有效，
+不同域名之间 Cookie 无法共享，所以多域名 + 独立服务 = Session 不能自动共享。
+
+上述问题可以通过哈希一致性来解决，让每个 session 根据 userId 或 sessionId 映射到一个固定节点，访问同一个用户时总是路由到同一节点，这样不管如何，使用的 session 一定是属于自己的，
+不存在共享问题，也可以用 redis 与它配合使用，把所有的 session 存在 redis 中，这样不管使用的是哪个服务，最终都是按照计算的哈希值来查找对应的 session，
+这样就可以解决使用不同服务造成的大量 session 迁移问题，不过 session 通常都有有效期的，所以只有少量数据发生迁移也不影响。
+
+****
+
+
+
+
+
+
+
 
 
 

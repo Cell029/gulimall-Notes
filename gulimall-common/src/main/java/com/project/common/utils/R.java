@@ -19,6 +19,13 @@ public class R extends HashMap<String, Object> {
 		return t;
 	}
 
+	public <T> T getData(String msg, TypeReference<T> typeReference) {
+		Object data = get(msg); // data 默认为 Map 类型
+		String jsonString = JSON.toJSONString(data); // 先转 JSON
+		T t = JSON.parseObject(jsonString, typeReference); // 再反序列化为指定类型
+		return t;
+	}
+
 	public R setData(Object data) {
 		this.put("data", data);
 		return this;

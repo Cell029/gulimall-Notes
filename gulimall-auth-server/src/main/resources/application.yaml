@@ -12,11 +12,17 @@ spring:
     password: 123
 
 
+  devtools:
+    restart:
+      enabled: false
+
 #  thymeleaf:
 #    cache: false
 
-#server:
 logging:
   level:
     com.gulimall.gulimallauthserver: debug
-#  port: 20000
+
+
+
+

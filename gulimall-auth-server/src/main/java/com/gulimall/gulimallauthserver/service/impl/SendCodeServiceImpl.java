@@ -29,7 +29,6 @@ public class SendCodeServiceImpl implements SendCodeService {
                 return false;
             }
         }
-
         String code = RandomUtil.randomNumbers(6) + "_" + System.currentTimeMillis();
         // 保存验证码到 redis
         stringRedisTemplate.opsForValue().set(PhoneCodeConstant.LOGIN_CODE_KEY + phone, code, PhoneCodeConstant.LOGIN_CODE_TTL, TimeUnit.MINUTES);
@@ -48,10 +47,10 @@ public class SendCodeServiceImpl implements SendCodeService {
                 // 验证码正确则删除验证码，确保只能使用一次
                 stringRedisTemplate.delete(PhoneCodeConstant.LOGIN_CODE_KEY + phone);
                 // 进行注册
+                return true;
             } else {
                 return false;
             }
         }
-        return false;
     }
 }

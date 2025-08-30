@@ -3,6 +3,11 @@ package com.project.gulimall.member.controller;
 import java.util.Arrays;
 import java.util.Map;
 
+import com.project.common.exception.BizCodeEnum;
+import com.project.gulimall.member.exception.PhoneExistException;
+import com.project.gulimall.member.exception.UserNameExistException;
+import com.project.gulimall.member.vo.MemberGitHubUserInfoVo;
+import com.project.gulimall.member.vo.MemberLoginVo;
 import com.project.gulimall.member.vo.MemberRegisterVo;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.*;
@@ -78,14 +83,41 @@ public class MemberController {
         return R.ok();
     }
 
+    /**
+     * 注册
+     */
     @PostMapping("/register")
     public R register(@RequestBody MemberRegisterVo memberRegisterVo){
         try {
             memberService.regist(memberRegisterVo);
-        } catch (Exception e) {
-
+        } catch (PhoneExistException e) {
+            return R.error(BizCodeEnum.PHONE_EXIT_EXCEPTION.getCode(), BizCodeEnum.PHONE_EXIT_EXCEPTION.getMsg());
+        } catch (UserNameExistException e) {
+            return R.error(BizCodeEnum.USER_EXIT_EXCEPTION.getCode(), BizCodeEnum.USER_EXIT_EXCEPTION.getMsg());
         }
         return R.ok();
+    }
+
+    /**
+     * 登录
+     */
+    @PostMapping("/login")
+    public R login(@RequestBody MemberLoginVo memberLoginVo) {
+        MemberEntity memberEntity = memberService.login(memberLoginVo);
+        if (memberEntity != null) {
+            return R.ok();
+        } else {
+            return R.error(BizCodeEnum.LOGINACCT_PASSWORD_INVALID_EXCEPTION.getCode(), BizCodeEnum.LOGINACCT_PASSWORD_INVALID_EXCEPTION.getMsg());
+        }
+    }
+
+    /**
+     * 社交账号登录
+     */
+    @PostMapping("/oauth/login")
+    public R oauthLogin(@RequestBody MemberGitHubUserInfoVo memberGitHubUserInfoVo) {
+        MemberEntity memberEntity = memberService.oauthLogin(memberGitHubUserInfoVo);
+        return R.ok().put("memberEntity", memberEntity);
     }
 
 }

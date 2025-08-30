@@ -13,6 +13,7 @@ package com.project.common.exception;
  *  12: 订单
  *  13: 购物车
  *  14: 物流
+ *  15: 用户
  */
 public enum BizCodeEnum {
     UNKNOW_EXEPTION(10000,"系统未知异常"),
@@ -21,7 +22,13 @@ public enum BizCodeEnum {
 
     SMS_CODE_EXCEPTION( 10002,"验证码获取频率太高，请稍后再试"),
 
-    PRODUCT_UP_EXCEPTION(11000, "商品上架异常");
+    PRODUCT_UP_EXCEPTION(11000, "商品上架异常"),
+
+    USER_EXIT_EXCEPTION(15001, "用户已存在"),
+
+    PHONE_EXIT_EXCEPTION(15002, "手机号已存在"),
+
+    LOGINACCT_PASSWORD_INVALID_EXCEPTION(15003, "账号密码错误");
 
     private int code;
     private String msg;

@@ -5,6 +5,8 @@ import com.project.common.utils.PageUtils;
 import com.project.gulimall.member.entity.MemberEntity;
 import com.project.gulimall.member.exception.PhoneExistException;
 import com.project.gulimall.member.exception.UserNameExistException;
+import com.project.gulimall.member.vo.MemberGitHubUserInfoVo;
+import com.project.gulimall.member.vo.MemberLoginVo;
 import com.project.gulimall.member.vo.MemberRegisterVo;
 
 import java.util.Map;
@@ -23,6 +25,10 @@ public interface MemberService extends IService<MemberEntity> {
 
     // 检查用户名唯一性
     void checkUserNameUnique(String username) throws UserNameExistException;
+
+    MemberEntity login(MemberLoginVo memberLoginVo);
+
+    MemberEntity oauthLogin(MemberGitHubUserInfoVo memberGitHubUserInfoVo);
 
 }
 

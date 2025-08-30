@@ -28,6 +28,10 @@ spring:
       cache-null-values: true # 是否缓存空值
       null-value-ttl: 2m # null 占位 TTL
 
+  devtools:
+    restart:
+      enabled: false
+
 #gulimall:
 #  thread:
 #    core-pool-size: 20
