@@ -2,7 +2,7 @@ package com.gulimall.gulimallauthserver.service.impl;
 
 import com.alibaba.fastjson.TypeReference;
 import com.gulimall.gulimallauthserver.domain.vo.GitHubUserInfoVo;
-import com.gulimall.gulimallauthserver.domain.vo.MemberResponseVo;
+import com.project.common.domain.vo.MemberResponseVo;
 import com.gulimall.gulimallauthserver.excetpion.OAuthException;
 import com.gulimall.gulimallauthserver.feign.MemberFeignService;
 import com.gulimall.gulimallauthserver.service.GitHubOAuthService;

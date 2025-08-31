@@ -105,7 +105,7 @@ public class MemberController {
     public R login(@RequestBody MemberLoginVo memberLoginVo) {
         MemberEntity memberEntity = memberService.login(memberLoginVo);
         if (memberEntity != null) {
-            return R.ok();
+            return R.ok().setData("memberEntity", memberEntity);
         } else {
             return R.error(BizCodeEnum.LOGINACCT_PASSWORD_INVALID_EXCEPTION.getCode(), BizCodeEnum.LOGINACCT_PASSWORD_INVALID_EXCEPTION.getMsg());
         }
@@ -117,7 +117,7 @@ public class MemberController {
     @PostMapping("/oauth/login")
     public R oauthLogin(@RequestBody MemberGitHubUserInfoVo memberGitHubUserInfoVo) {
         MemberEntity memberEntity = memberService.oauthLogin(memberGitHubUserInfoVo);
-        return R.ok().put("memberEntity", memberEntity);
+        return R.ok().setData("memberEntity", memberEntity);
     }
 
 }

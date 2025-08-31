@@ -6,6 +6,18 @@ spring:
       discovery:
         server-addr: 127.0.0.1:8848
 
+  redis:
+    host: 127.0.0.1
+    port: 6379
+    password: 123
+
+  session:
+    store-type: redis
+    timeout: 30m
+    redis:
+      namespace: gulimall:loginUser
+
+
   devtools:
     restart:
       enabled: false

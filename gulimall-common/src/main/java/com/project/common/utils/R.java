@@ -30,6 +30,10 @@ public class R extends HashMap<String, Object> {
 		this.put("data", data);
 		return this;
 	}
+	public R setData(String dataName, Object data) {
+		this.put(dataName, data);
+		return this;
+	}
 
 	public R() {
 		put("code", 0);

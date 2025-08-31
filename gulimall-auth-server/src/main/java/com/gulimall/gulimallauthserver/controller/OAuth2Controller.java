@@ -1,7 +1,7 @@
 package com.gulimall.gulimallauthserver.controller;
 
-import com.gulimall.gulimallauthserver.domain.vo.GitHubUserInfoVo;
-import com.gulimall.gulimallauthserver.domain.vo.MemberResponseVo;
+import com.project.common.constant.LoginConstant;
+import com.project.common.domain.vo.MemberResponseVo;
 import com.gulimall.gulimallauthserver.excetpion.OAuthException;
 import com.gulimall.gulimallauthserver.service.GitHubOAuthService;
 import lombok.extern.slf4j.Slf4j;
@@ -10,6 +10,7 @@ import org.springframework.stereotype.Controller;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.servlet.mvc.support.RedirectAttributes;
+import javax.servlet.http.HttpSession;
 
 /**
  * 处理社交登录请求
@@ -22,7 +23,7 @@ public class OAuth2Controller {
     private GitHubOAuthService gitHubOAuthService;
 
     @GetMapping("/oauth/github/success")
-    public String githubSuccess(@RequestParam("code") String code, RedirectAttributes redirectAttributes) {
+    public String githubSuccess(@RequestParam("code") String code, RedirectAttributes redirectAttributes, HttpSession session) {
         // 根据 code 换取 Access Token
         try {
             MemberResponseVo userInfo = gitHubOAuthService.loginOrRegister(code);
@@ -30,7 +31,7 @@ public class OAuth2Controller {
             if (userInfo != null) {
                 // 登录成功，跳转首页
                 log.info("GitHub 用户登录成功");
-                redirectAttributes.addFlashAttribute("loginUser", userInfo);
+                session.setAttribute(LoginConstant.LOGIN_USER, userInfo);
                 return "redirect:http://gulimall.com";
             } else {
                 log.error("GitHub 用户登录失败");

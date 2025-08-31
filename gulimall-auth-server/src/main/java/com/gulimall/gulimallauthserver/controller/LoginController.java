@@ -4,6 +4,8 @@ import com.alibaba.fastjson.TypeReference;
 import com.gulimall.gulimallauthserver.domain.vo.UserLoginVo;
 import com.gulimall.gulimallauthserver.feign.MemberFeignService;
 import com.gulimall.gulimallauthserver.service.SendCodeService;
+import com.project.common.constant.LoginConstant;
+import com.project.common.domain.vo.MemberResponseVo;
 import com.project.common.domain.vo.UserRegisterVo;
 import com.project.common.exception.BizCodeEnum;
 import com.project.common.utils.R;
@@ -14,6 +16,8 @@ import org.springframework.validation.BindingResult;
 import org.springframework.validation.FieldError;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.servlet.mvc.support.RedirectAttributes;
+
+import javax.servlet.http.HttpSession;
 import javax.validation.Valid;
 import java.util.HashMap;
 import java.util.Map;
@@ -69,11 +73,15 @@ public class LoginController {
     }
 
     @PostMapping("/login")
-    public String login(UserLoginVo userLoginVo, RedirectAttributes redirectAttributes) {
+    public String login(UserLoginVo userLoginVo, RedirectAttributes redirectAttributes, HttpSession session) {
         // 调用远程登录
         R r = memberFeignService.login(userLoginVo);
         if (r.getCode() == 0) {
             // 成功
+            MemberResponseVo memberEntity = r.getData("memberEntity", new TypeReference<MemberResponseVo>() {
+            });
+            // 登录成功就将数据存到 spring session 中（实际在 redis 中）
+            session.setAttribute(LoginConstant.LOGIN_USER, memberEntity);
             return "redirect:http://gulimall.com";
         } else {
             Map<String, String> errors = new HashMap<>();
@@ -83,6 +91,17 @@ public class LoginController {
         }
     }
 
+    /**
+     * 进入登录页面时，如果 session 存在，那么就直接跳转到首页，而不是登录页面
+     */
+    @GetMapping("/login.html")
+    public String loginPage(HttpSession session) {
+        if (session.getAttribute(LoginConstant.LOGIN_USER) != null) {
+            return "redirect:http://gulimall.com";
+        } else {
+            return "login";
+        }
+    }
 
 }
 

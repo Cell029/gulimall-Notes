@@ -11,10 +11,17 @@ spring:
     port: 6379
     password: 123
 
+  session:
+    store-type: redis
+    timeout: 30m
+    redis:
+      namespace: gulimall:loginUser
+
 
   devtools:
     restart:
       enabled: false
+
 
 #  thymeleaf:
 #    cache: false
@@ -23,6 +30,10 @@ logging:
   level:
     com.gulimall.gulimallauthserver: debug
 
+server:
+  servlet:
+    session:
+      timeout: 30m
 
 
 

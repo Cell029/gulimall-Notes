@@ -1,4 +1,4 @@
-package com.gulimall.gulimallauthserver.domain.vo;
+package com.project.common.domain.vo;
 
 import com.baomidou.mybatisplus.annotation.TableId;
 import com.baomidou.mybatisplus.annotation.TableName;

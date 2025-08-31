@@ -12695,11 +12695,594 @@ public MemberEntity oauthLogin(MemberGitHubUserInfoVo memberGitHubUserInfoVo) {
 这样就可以解决使用不同服务造成的大量 session 迁移问题，不过 session 通常都有有效期的，所以只有少量数据发生迁移也不影响。
 
 ****
+## 7. SpringSession
+
+### 7.1 使用
+
+SpringSession 把原来容器内存里的 HttpSession 挪到外部存储（最常用 Redis），并且支持多实例、多节点共享会话，它不再依赖 Tomcat 或者 Jetty 的会话实现，
+通过一个过滤器把 HttpSession 委托给选定的仓库（例如 redis）。它还支持会话的创建、删除、过期等操作，引入相关组件后即可使用，不用大量修改原有代码。
+
+```java
+// 传统 Servlet 会话管理的问题
+HttpSession session = request.getSession(); // 只能在单机环境下工作
+session.setAttribute("user", user); // 集群环境下无法共享
+```
+
+具体使用：
+
+1、引入依赖
+
+```xml
+<!--spring session-->
+<dependency>
+    <groupId>org.springframework.session</groupId>
+    <artifactId>spring-session-data-redis</artifactId>
+</dependency>
+```
+
+2、指定使用的存储仓库（需要提前配置好 redis）
+
+```yaml
+spring:
+  session:
+    store-type: redis
+```
+
+3、在启动类上添加 @EnableRedisHttpSession 注解
+
+4、创建自定义配置类，修改 session 的作用域大小
+
+SpringSession 通过一个 CookieSerializer（通常是 DefaultCookieSerializer）来读写浏览器中的会话 Cookie，通过修改 DefaultCookieSerializer 的一些默认属性来达到效果，
+这里把默认名换成 GULISESSION，并且把 Cookie 的 Domain 属性设为顶级域，从而允许子域间共享同一 Cookie，也就是只要有 gulimall.com 那就共享一个 Cookie 数据。
+
+SpringSession 默认用 Java 原生序列化（java.io.Serializable 的二进制）存储进 redis，虽然能保证数据的存储，但是却肉眼不可读，所以最好修改一下序列化器，
+让数据序列化成 JSON 格式，这里就是使用的 GenericJackson2JsonRedisSerializer 序列化器，也是常用的。需要注意的是：Spring Session 文档明确写明，
+“You can customize the serializer by defining a bean named springSessionDefaultRedisSerializer”，也就是序列化器的 Bean 的名字必须叫 springSessionDefaultRedisSerializer，
+否则仍然会使用 JDK 默认的二进制序列化方式。
+
+```java
+@Configuration
+public class GulimallSessionConfig {
+    @Bean
+    public CookieSerializer cookieSerializer() {
+        DefaultCookieSerializer defaultCookieSerializer = new DefaultCookieSerializer();
+        defaultCookieSerializer.setCookieName("GULISESSION");
+        defaultCookieSerializer.setDomainName("gulimall.com");
+        return defaultCookieSerializer;
+    }
+
+    @Bean
+    public RedisSerializer<Object> redisSerializer() {
+        return new GenericJackson2JsonRedisSerializer();
+    }
+}
+```
+
+在跨服务时，每个服务里都需要配上相同的 CookieSerializer + springSessionDefaultRedisSerializer，这里记录一下 SpringSession 的工作机制，它大致为三步：
+
+1. 会话存储：Spring Session 把会话内容存在 Redis
+2. 会话标识：客户端（浏览器）带的 Cookie 里存的 sessionId（比如 GULISESSION=xxx）
+3. 会话读取：服务端收到请求 -> 解析 Cookie → 拿到 sessionId -> 去 Redis 查找 session -> 反序列化成 Java 对象 -> 放到 HttpSession 里
+
+所以在不通的服务与域名中，Cookie 的名称和使用域名的范围需要统一，否则浏览器不会在不同子域之间共享 Cookie，例如：如果 A 服务写了 SESSION，B 服务写了 GULISESSION，
+那两个 Cookie 就是不同的，浏览器访问 B 服务时不会带上 A 的 Cookie；如果 A 用 .gulimall.com，B 用 b.gulimall.com，Cookie 作用域不一样，也没法共享。
+并且 redis 里的数据序列化方式要统一，否则 A 服务存进去是 JDK 序列化，B 服务却用 JSON 解析，必然报错。因此，需要在所有可能用到共享 session 的数据的服务中都引入自定义的这个配置类，
+确保共享数据能够成功。
+
+****
+### 7.2 核心原理
+
+进入 @EnableRedisHttpSession 注解，可以看到它引入了一个 @Import({RedisHttpSessionConfiguration.class})，而 RedisHttpSessionConfiguration 继承 SpringHttpSessionConfiguration，
+在这个类里面就是对 CookieSerializer 的初始化，CookieSerializer 负责会话 ID 在客户端和服务器之间的传输管理，而这也是为什么默认使用 DefaultCookieSerializer：
+
+```java
+@PostConstruct
+public void init() {
+    // 检查是否有自定义的 cookieSerializer
+    CookieSerializer cookieSerializer = this.cookieSerializer != null ? this.cookieSerializer : this.createDefaultCookieSerializer();
+    // 设置到 HttpSessionIdResolver 中
+    this.defaultHttpSessionIdResolver.setCookieSerializer(cookieSerializer);
+}
+```
+
+在这个类中还使用了 SessionRepositoryFilter，也就是一个过滤器，最终实现的是 Filter 的过滤方法，在 SessionRepositoryFilter 中的核心方法就是：
+
+```java
+protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain filterChain) throws ServletException, IOException {
+    request.setAttribute(SESSION_REPOSITORY_ATTR, this.sessionRepository);
+    // 包装请求和响应
+    SessionRepositoryFilter<S>.SessionRepositoryRequestWrapper wrappedRequest = new SessionRepositoryRequestWrapper(request, response);
+    SessionRepositoryFilter<S>.SessionRepositoryResponseWrapper wrappedResponse = new SessionRepositoryResponseWrapper(wrappedRequest, response);
+    try {
+        // 执行过滤器链
+        filterChain.doFilter(wrappedRequest, wrappedResponse);
+    } finally {
+        // 提交会话
+        wrappedRequest.commitSession();
+    }
+}
+```
+
+request.setAttribute(SESSION_REPOSITORY_ATTR, this.sessionRepository); SESSION_REPOSITORY_ATTR 是常量 "SESSION_REPOSITORY"，
+把 SessionRepository 放到请求属性里供下游代码或框架组件，把仓库暴露出来，方便后续对其进行操作。后面就是封装原始的 HttpServletRequest 和 HttpServletResponse，
+通过包装实现拦截效果，防止使用原始的 session 存储在容器内存里（只有本地有效），虽然还是使用 request.getSession() 获取，但底层变成存 Redis/数据库，而不是容器内存。
+SessionRepositoryRequestWrapper 覆盖了几个关键方法，getSession() 和 getSession(boolean) 起拦截调用，从 Redis（或别的 SessionRepository）加载创建 Session，
+并返回一个代理对象（实现了 HttpSession 接口，但内部调用的是 SessionRepository），这样使用 request.getSession() 就直接变成了访问 redis 或别的仓库了。
+
+```java
+@Override
+public HttpSessionWrapper getSession(boolean create) {
+    // 如果已经有缓存的 session wrapper，直接返回
+    if (this.requestedSession != null) {
+        return this.requestedSession;
+    }
+    // 根据 resolver（通常是 Cookie）解析客户端带来的 sessionId
+    String sessionId = getRequestedSessionId();
+    if (sessionId != null) {
+        S session = this.sessionRepository.findById(sessionId);
+        if (session != null) {
+            this.requestedSession = new HttpSessionWrapper(session, getServletContext());
+            return this.requestedSession;
+        }
+    }
+    // 如果允许创建新 session
+    if (!create) {
+        return null;
+    }
+    S session = this.sessionRepository.createSession();
+    this.requestedSession = new HttpSessionWrapper(session, getServletContext());
+    return this.requestedSession;
+}
+```
+
+该方法覆盖了原始的 getSession() 方法，没有调用容器原生 session，通过 sessionRepository 获取或者创建 session，而在一开始就对 sessionRepository 进行了绑定，
+request.setAttribute(...) 把 sessionRepository 存到了 request 的属性里，当使用了 redis 后，就会加载 RedisIndexedSessionRepository，而获取 session 的操作，
+就是在 RedisIndexedSessionRepository 里进行的。
+
+而 SessionId 需要写回到客户端，通常是通过 Cookie 或 Header 的方式，如果不包装 Response，Spring Session 没法在恰当的时机拦截响应，屏蔽原始的 JSESSIONID，
+因为当业务调用 request.getSession() 创建了新 session 时，此时新的 sessionId 还在服务器端（Redis）里，浏览器并不知道这个新 sessionId，必须通过 Set-Cookie 写回客户端。
+但是当页面进行重定向时会立即提交 response，此时如果 sessionId 还没写回，浏览器就收不到新的 cookie，这里就封装了一个 commitSession() 方法，在所有响应前都会调用：
+
+```java
+void commitSession() {
+    if (session == null) return;
+    if (session.isInvalidated()) {
+        sessionRepository.deleteById(session.getId());  // 删除 Redis session
+        httpSessionIdResolver.expireSession(this, this.response); // 删除客户端 cookie
+    } else {
+        sessionRepository.save(session); // 保存 Redis session
+        httpSessionIdResolver.setSessionId(this, this.response, session.getId()); // 写回客户端 cookie
+    }
+}
+```
+
+Response wrapper 并不去 Redis 读取 session，而是调用 commitSession()，把 request wrapper 中已经获取或修改的 session 保存到 Redis，确保能把最新的 sessionId 同步到浏览器。
+
+关于 SessionId 的作用，则是为了能够成为 session 的唯一标识，在浏览器每次请求服务器时，必须携带这个 sessionId，服务器才能找到对应的 session 数据。
+而 HTTP 是 无状态协议，也就是说它的每次请求都是独立的，服务器不会自动记住客户端的 session，因此服务器必须把 sessionId 发送给客户端，客户端在后续请求带上这个 id。
+HTTP 提供了两种常用方法传递 sessionId，使用 Cookie（最常用）或者URL 重写（JSESSIONID=xxx 追加到 URL），而 Spring Session 默认使用 Cookie 来传递 sessionId。
+当 Spring Session 创建或更新 session 时，会在响应中写入：
+
+```http request
+HTTP/1.1 200 OK
+Set-Cookie: GULISESSION=abc123; Path=/; HttpOnly
+```
+
+浏览器在后续请求中自动携带 Cookie:
+
+```java
+GET /member/info HTTP/1.1
+Host: gulimall.com
+Cookie: GULISESSION=abc123
+```
+
+****
+### 7.3 修改显示用户效果
+
+在上面已经解决了 session 共享的问题，接下来就是修改原有代码，把登录的用户信息保存进 session 中，而目前只涉及两个登录，一个页面输入账号密码登录，一个使用  GitHub 登录，
+因为登录都是进行远程调用 gulimall-member 服务区查询表 pms_member，所以需要把查询到的 MemberEntity 对象放入 session 中：
+
+```java
+@PostMapping("/login")
+public String login(UserLoginVo userLoginVo, RedirectAttributes redirectAttributes, HttpSession session) {
+    // 调用远程登录
+    R r = memberFeignService.login(userLoginVo);
+    if (r.getCode() == 0) {
+        // 成功
+        MemberResponseVo memberEntity = r.getData("memberEntity", new TypeReference<MemberResponseVo>() {
+        });
+        // 登录成功就将数据存到 spring session 中（实际在 redis 中）
+        session.setAttribute(LoginConstant.LOGIN_USER, memberEntity);
+        return "redirect:http://gulimall.com";
+    } else {
+        Map<String, String> errors = new HashMap<>();
+        errors.put("msg", r.getData("msg", new TypeReference<String>() {}));
+        redirectAttributes.addFlashAttribute("errors", errors);
+        return "redirect:http://auth.gulimall.com/login.html";
+    }
+}
+```
+
+```java
+@GetMapping("/oauth/github/success")
+public String githubSuccess(@RequestParam("code") String code, RedirectAttributes redirectAttributes, HttpSession session) {
+    // 根据 code 换取 Access Token
+    try {
+        MemberResponseVo userInfo = gitHubOAuthService.loginOrRegister(code);
+        System.out.println(userInfo);
+        if (userInfo != null) {
+            // 登录成功，跳转首页
+            log.info("GitHub 用户登录成功");
+            session.setAttribute(LoginConstant.LOGIN_USER, userInfo);
+            return "redirect:http://gulimall.com";
+        } else {
+            log.error("GitHub 用户登录失败");
+            return "redirect:http://auth.gulimall.com/login.html";
+        }
+    } catch (OAuthException e) {
+        redirectAttributes.addFlashAttribute("errors", e.getMessage());
+        return "redirect:http://auth.gulimall.com/login.html";
+    }
+}
+```
+
+当然，前端页面也需要修改为动态的，在用户登录成功后，应该显示用户的名称，并且不能再点击登录按钮，目前一共有首页、检索页、详情页需要修改：
+
+```html
+<li>
+    <a th:if="${session.loginUser == null}"
+       href="http://auth.gulimall.com/login.html">
+        你好，请登录
+    </a>
+    <span th:if="${session.loginUser != null}">
+       你好，[[${session.loginUser.nickname}]]
+    </span>
+</li>
+
+<li>
+    <a th:if="${session.loginUser == null}"
+       href="http://auth.gulimall.com/reg.html"
+       class="li_2">
+        免费注册
+    </a>
+    <span th:if="${session.loginUser != null}" class="li_2 disabled">
+       已注册
+    </span>
+</li>
+```
+
+当然涉及到其它服务时，也需要进行对应的 SpringSession 的操作，引入依赖、添加 @EnableRedisHttpSession 注解、自定义配置类等操作，确保能够正确获取与解析同一个 session。
+
+还有一个功能，就是当 session 中有用户信息时，证明该用户是已经登录成功过的，所以如果此时再访问登录页面，应该直接跳转到首页，不用重复登录，除非点击退出。
+
+```java
+/**
+ * 进入登录页面时，如果 session 存在，那么就直接跳转到首页，而不是登录页面
+ */
+@GetMapping("/login.html")
+public String loginPage(HttpSession session) {
+    if (session.getAttribute(LoginConstant.LOGIN_USER) != null) {
+        return "redirect:http://gulimall.com";
+    } else {
+        return "login";
+    }
+}
+```
+
+需要注意的是：这里不能直接重定向到 http://auth.gulimall.com/login.html ，因为当用户没有登录时，session.getAttribute(LoginConstant.LOGIN_USER) 返回 null，
+如果使用的是重定向的话，那么浏览器访问 /login.html → 服务器又重定向到 /login.html → 又进入这个 Controller → 又重定向 → 无限循环重定向，所以这里应该直接返回模板，
+此时浏览器就会直接渲染 login.html 页面，也就不会触发 Controller 的方法。
+
+****
+## 8. 单点登录
+
+单点登录（SSO）指用户只需登录一次（在一个统一认证中心），就能无感访问同一组织下的多个应用或其子系统，而无需在每个系统重复登录。例如登录了 QQ，那么对应的 QQ 音乐、QQ 邮箱、
+QQ 游戏大厅就应该可以直接登录。而实现的本质就是让多服务共享同一个 “已认证标识”，例如 session。大致流程如下：
+
+1. 用户访问受保护资源（用户尝试访问商城系统）中需要登录才能操作的功能，如加入购物车。 
+2. 网关拦截并重定向至认证中心，如果判断用户未登录，就会将用户的请求重定向到单点登录系统（例如 sso.com）的登录页面，并携带一个回调地址（redirect_url），通常是用户最初想访问的那个页面。 
+3. 用户在认证中心登录，输入用户名和密码进行认证。 
+4. 认证中心颁发凭证并重定向，而认证中心验证用户凭证通过后，会做两件重要的事：
+
+   - 生成一个全局的、代表用户身份的令牌（通常是写入一个 Cookie，这个 Cookie 的域名是单点登录系统的顶级域名，例如 sso.com，这样所有子域都能在后续步骤中间接访问到它）。 
+   - 将浏览器重定向回最初用户请求的那个回调地址，并附上这个令牌作为参数。
+
+5. 当商城系统接收到重定向请求后，会提取出令牌，并向认证中心发送一个请求，验证此令牌的有效性并换取用户信息。 
+6. 验证通过后，商城系统会在自己的域下（例如 gulimall.com）创建局部的会话 Session 并设置 Cookie，然后将用户最初请求的资源返回给浏览器。 
+7. 当已登录的用户再去访问另一个子系统的受保护资源时，该系统的网关同样会判断其未登录（因为没有该子系统的局部会话 Cookie），并重定向到认证中心。 
+8. 在浏览器在访问认证中心时，会自动携带第 4 步中颁发的那个顶级域 Cookie（sso.com），认证中心通过此 Cookie 发现用户已经登录，于是不再显示登录页，而是直接再次重定向回刚刚访问的系统并附上令牌。 
+9. 该系统会重复第 5 和第 6 步，验证令牌并建立自己的局部会话，最终让用户无感地访问到资源。
 
 
+```text
+用户浏览器         商城系统(mall.com)         认证中心(sso.com)         营销系统(sales.com)
+    |                     |                           |                           |
+    |---1.访问资源-------> |                           |                           |
+    |<--2.重定向至SSO------|                           |                           |
+    |---------------------3.访问登录页----------------->|                           |
+    |---------------------4.提交登录凭据--------------->|                           |
+    |                     |<----验证凭据，生成令牌----->|                           |
+    |<--5.设置SSO Cookie，带令牌重定向-------------------|                           |
+    |---6.携带令牌访问----->|                           |                           |
+    |                     |----7.验证令牌------------->|                           |
+    |                     |<----8.返回用户信息----------|                           |
+    |                     |-----9.建立局部会话----------|                           |
+    |<-----10.设置Mall Cookie，返回资源------------------|                           |
 
+    # 二次访问其他子系统（营销）
+    |                     |                           |                           |
+    |----------------------11.访问资源------------------------------------------->|
+    |<---12.重定向至SSO----|                           |                           |
+    |---------------------13.访问SSO，带SSO Cookie---->|                           |
+    |                     |<----14.Cookie发现已登录-----|                           |
+    |<---15.带令牌重定向--------------------------------|                           |
+    |-------------------------16.携带令牌访问--------------------------------------->|
+    |                     |                           |-----17.验证令牌------------>|
+    |                     |                           |<----18.返回用户信息---------|
+    |                     |                           |-----19.建立局部会话---------|
+    |<----------20.设置Sales Cookie，返回资源----------------------------------------|
+```
 
+认证中心负责两件事：颁发令牌和验证令牌，所以需要模拟一个认证中心，当用户在未登录状态访问某些页面时直接跳转到认证中心的登录页面，登陆成功后这里使用 UUID 模拟全局令牌，
+并把它存入 redis 中，例如："SSO:TOKEN:540e8490-e29b-41d4-a716-474981589765164"。存入完成后，就重定向到原来访问的页面。
 
+```html
+<form action="/sso/login" method="post">
+    <input type="text" name="username" placeholder="用户名">
+    <input type="password" name="password" placeholder="密码">
+    <input type="hidden" name="redirectUrl" value="${redirectUrl}">
+    <button type="submit">登录</button>
+</form>
+```
+
+通过 Spring 提供的一个可自定义 HTTP 响应的对象 ResponseEntity 来设置状态码，把状态码设置为 302，也就是重定向（HttpStatus.FOUND），
+并设置 HTTP 响应头 Location，告诉浏览器要跳转到哪个 url。
+
+```java
+@RestController
+@RequestMapping("/sso")
+public class SsoController {
+    @Autowired
+    private StringRedisTemplate redisTemplate;
+    // token 有效期 30 分钟
+    private static final long TOKEN_EXPIRE = 30 * 60;
+
+    @PostMapping("/login")
+    public ResponseEntity<?> login(@RequestParam String username,
+                                   @RequestParam String password,
+                                   @RequestParam String redirectUrl) throws UnsupportedEncodingException {
+        // 用户名密码校验通过
+        String token = UUID.randomUUID().toString();
+        // 存入 Redis
+        redisTemplate.opsForValue().set("SSO:TOKEN:" + token, username, TOKEN_EXPIRE, TimeUnit.SECONDS);
+        // 返回重定向 URL
+        String redirect = redirectUrl + (redirectUrl.contains("?") ? "&" : "?") + "token=" + token;
+        return ResponseEntity.status(HttpStatus.FOUND)
+                .location(URI.create(redirect))
+                .build();
+    }
+
+    @GetMapping("/verify")
+    public ResponseEntity<String> verify(@RequestParam String token) {
+        String username = redisTemplate.opsForValue().get("SSO:TOKEN:" + token);
+        if (username != null) {
+            // 刷新 token TTL
+            redisTemplate.expire("SSO:TOKEN:" + token, 30, TimeUnit.MINUTES);
+            return ResponseEntity.ok(username);
+        }
+        return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body("Invalid token");
+    }
+}
+```
+
+当用户需要验证在认证中心获取到的 token 是否失效时，就会发送一个 http://sso.com/sso/login?redirectUrl=... url 请求，如果从 redis 中获取到的 token 信息没有过期的话，
+那就给它重置过期时间并把该 token 作为响应体返回，如果没获取到该 token（已过期），那么就返回 401，并用响应体告诉客户端 token 无效。
+
+```java
+@RestController
+@RequestMapping("/mall")
+public class MallController {
+    @Autowired
+    private StringRedisTemplate redisTemplate;
+    @Autowired
+    private RestTemplate restTemplate;
+    private static final long SESSION_EXPIRE = 30 * 60;
+
+    @GetMapping("/cart")
+    public Object cart(@RequestParam(required = false) String token,
+                       HttpServletRequest request,
+                       HttpServletResponse response) throws UnsupportedEncodingException {
+        // 1. 检查本地 session
+        Cookie[] cookies = request.getCookies();
+        if (cookies != null) {
+            for (Cookie c : cookies) {
+                if ("MALLSESSION".equals(c.getName())) {
+                    String username = redisTemplate.opsForValue().get("MALLSESSION:" + c.getValue());
+                    if (username != null) {
+                        // 刷新 TTL
+                        redisTemplate.expire("MALLSESSION:" + c.getValue(), SESSION_EXPIRE, TimeUnit.SECONDS);
+                        return "购物车页面，用户：" + username;
+                    }
+                }
+            }
+        }
+
+        // 2. 如果有 token，从 SSO 验证
+        if (token != null) {
+            String username;
+            try {
+                username = restTemplate.getForObject("http://sso.com/sso/verify?token=" + token, String.class);
+            } catch (Exception e) {
+                username = null;
+            }
+            if (username != null) {
+                // 建立本地 session
+                String mallSessionId = UUID.randomUUID().toString();
+                redisTemplate.opsForValue().set("MALLSESSION:" + mallSessionId, username, SESSION_EXPIRE, TimeUnit.SECONDS);
+                // 写 Cookie，顶级域可共享子域
+                Cookie cookie = new Cookie("MALLSESSION", mallSessionId);
+                cookie.setPath("/");
+                cookie.setDomain("mall.com"); // 顶级域
+                cookie.setHttpOnly(true);
+                cookie.setSecure(false); // 如果有 HTTPS，改为 true
+                response.addCookie(cookie);
+                return "购物车页面，用户：" + username;
+            }
+        }
+        // 3. 没有登录，跳转 SSO 登录页
+        String redirectUrl = URLEncoder.encode("http://mall.com/mall/cart", "UTF-8");
+        return "redirect:http://sso.com/sso/login?redirectUrl=" + redirectUrl;
+    }
+}
+```
+
+而业务处理的部分则会优先检查自己的本地会话，如果没有，再去找 SSO 中心帮忙验证。所以先获取 cookies 检查是否有商城页登录时存储的 MALLSESSION，如果没有，那就得去认证中心判断是否登陆过，
+通过 restTemplate.getForObject(...) 发起一个 GET 请求，接收请求返回的响应。如果当前的请求路径中包含 token，那么就可以拿这个 token 去询问 SSO 认证中心这个 Token 是否有效，
+如果发现该 token 有效，那么就可以为这个用户建立本地 session 了，然后再返回刚刚用户点击的页面；如果 token 失效，那么就再跳回认证中心获取 token 后再返回该页面。
+
+如果有另一个服务要在上面的服务登录后也能直接登录，那它的处理和上面的差不多：
+
+```java
+// 1. 检查本地 session
+Cookie[] cookies = request.getCookies();
+if (cookies != null) {
+    for (Cookie c : cookies) {
+        if ("BSERVICESESSION".equals(c.getName())) {
+            String username = redisTemplate.opsForValue().get("BSERVICESESSION:" + c.getValue());
+            if (username != null) {
+                redisTemplate.expire("BSERVICESESSION:" + c.getValue(), SESSION_EXPIRE, TimeUnit.SECONDS);
+                return "B 服务页面，用户：" + username;
+            }
+        }
+    }
+}
+```
+
+```java
+// 2. 如果请求里有 token，去 SSO 验证
+if (token != null) {
+    String username = restTemplate.getForObject(
+        "http://sso.com/sso/verify?token=" + token, String.class);
+    if (username != null) {
+        String bSessionId = UUID.randomUUID().toString();
+        redisTemplate.opsForValue().set("BSERVICESESSION:" + bSessionId, username, 30 * 60, TimeUnit.SECONDS);
+        Cookie cookie = new Cookie("BSERVICESESSION", bSessionId);
+        cookie.setPath("/");
+        cookie.setDomain("bservice.com"); // B 服务自己的域
+        cookie.setHttpOnly(true);
+        response.addCookie(cookie);
+        return "B 服务页面，用户：" + username;
+    }
+}
+```
+
+```java
+// 3. 没有登录，也没有 token，那就跳转到 SSO
+String redirectUrl = URLEncoder.encode("http://bservice.com/page", "UTF-8");
+return "redirect:http://sso.com/sso/login?redirectUrl=" + redirectUrl;
+```
+
+****
+# 九、购物车
+
+## 1. 环境搭建
+
+创建新的模块取名为 gulimall-cart，引入相关依赖以及注入 nacos：
+
+```xml
+<dependencies>
+    <!--引入 common 服务-->
+    <dependency>
+        <groupId>com.project</groupId>
+        <artifactId>gulimall-common</artifactId>
+        <version>0.0.1-SNAPSHOT</version>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-test</artifactId>
+        <scope>test</scope>
+        <exclusions>
+            <exclusion>
+                <groupId>com.vaadin.external.google</groupId>
+                <artifactId>android-json</artifactId>
+            </exclusion>
+        </exclusions>
+    </dependency>
+    <!--thymeleaf-->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-thymeleaf</artifactId>
+    </dependency>
+    <!--devtools-->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-devtools</artifactId>
+        <optional>true</optional>
+    </dependency>
+</dependencies>
+```
+
+因为引入的 common 中带有数据库的依赖，而目前的初始项目用不到数据库，所以需要在启动类上排除数据库的使用：
+
+```java
+@SpringBootApplication(exclude = {DataSourceAutoConfiguration.class})
+public class GulimallAuthServerApplication {
+    ...
+}
+```
+
+```yaml
+spring:
+  application:
+    name: gulimall-auth-server
+  cloud:
+    nacos:
+      discovery:
+        server-addr: 127.0.0.1:8848
+
+server:
+  port: 30000
+```
+
+```yaml
+spring:
+  application:
+    name: gulimall-auth-server
+
+  cloud:
+    nacos:
+      config:
+        server-addr: 127.0.0.1:8848
+        file-extension: yaml # 文件后缀名
+        namespace: 4a8970e8-50c0-4076-a3e5-41a0c4eb9c65 # cart
+```
+
+接着就是把静态资源放进 nginx 容器，并部署本地 hosts 与网关：
+
+```shell
+cp -r /mnt/d/docker_dataMountDirectory/gmall-static-resource/cart/. /nginx/html/static/cart
+```
+
+```xml
+192.168.1.110 cart.gulimall.com
+```
+
+```yaml
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: nginx_cart_route
+          uri: lb://gulimall-cart
+          predicates:
+            - Host=cart.gulimall.com
+```
+
+****
 
 
 

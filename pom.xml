@@ -20,6 +20,7 @@
 		<module>renren-generator</module>
         <module>gulimall-gateway</module>
         <module>gulimall-third-party</module>
+        <module>gulimall-cart</module>
     </modules>
 
 </project>

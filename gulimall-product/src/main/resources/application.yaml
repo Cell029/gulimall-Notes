@@ -28,6 +28,13 @@ spring:
       cache-null-values: true # 是否缓存空值
       null-value-ttl: 2m # null 占位 TTL
 
+  session:
+    store-type: redis
+    timeout: 30m
+    redis:
+      namespace: gulimall:loginUser
+
+
   devtools:
     restart:
       enabled: false
