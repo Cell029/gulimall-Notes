@@ -14,5 +14,15 @@ spring:
     port: 6379
     password: 123
 
+  session:
+    store-type: redis
+    timeout: 30m
+
+gulimall:
+  thread:
+    core-pool-size: 20
+    max-pool-size: 200
+    keep-alive-time: 10
+
 #server:
 #  port: 10000

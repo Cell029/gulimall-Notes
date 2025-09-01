@@ -13283,8 +13283,683 @@ spring:
 ```
 
 ****
+## 2. 购物车数据模型分析
+
+### 2.1 存储结构
+
+在购物车功能这一块分为未登录状态下添加商品和登录后添加商品的情况。对于未登录购物车功能：用户未登录时，仍然可以把商品加入购物车，但数据需要与用户账号无关，属于临时存储，
+等用户登录后可以合并到账号绑定的购物车，而这些数据可以选择的保存位置有:
+
+1、浏览器 cookie
+
+直接将购物车商品 JSON 数据保存在客户端 Cookie，这样实现简单，直接跟随请求传递，但 Cookie 存储大小有限（一般 4KB 左右），并且存储在浏览器的数据安全性差，容易被篡改，
+还可能会导致请求头过大，影响网络传递的性能，因此一般不会选择这个。
+
+2、LocalStorage 或 SessionStorage
+
+这个也是用前端存储商品信息，不过它的存储容量比 cookie 要大（通常 5MB），并且不会每次请求都带给后端，不过仍然是存储在浏览器，所以数据仅在本地生效，虽然关闭浏览器不会导致数据丢失，
+但是清理浏览器缓存或者更换浏览器会导致数据的丢失。
+
+3、Redis
+
+在使用购物车功能时会生成一个临时匿名 ID（UUID）存储到 Cookie 或者 LocalStorage，后端则基于这个匿名 ID 在 Redis 中保存购物车中的数据，这种方式属于后端存储，
+数据存储不会因为浏览器而被限制，并且后端统一管理数据，还能对这些数据进行偏好的计算，不过实现较为复杂，并且 Redis 是基于内存的，如果出现宕机等问题，也会造成数据丢失，
+但总体是比存在浏览器要好的。
+
+对于登录后的购物车功能，由于用户已登录，所以购物车需要和账号绑定，购物车的数据应该可以跨设备共享（例如 PC 添加，手机也能看到），因此需要支持购物车数据的长期存储。
+它的数据存储方式有：
+
+1、数据库
+
+因为需要长期存储，所以并不适合用浏览器进行存储，因此可以使用数据库存储，而数据库的优点就是持久化，按用户 ID 存储购物车表：user_id + sku_id + 数量 + 勾选状态。
+不过购物车是个读写都多的操作，所以频繁的读写数据库可能造成数据库性能压力过大（高并发场景下不推荐单独依赖数据库）。
+
+2、Redis 
+
+Redis 的优点就是访问速度快，适合高并发的场景，并且可以设置过期时间，数据的存储较为灵活，但数据较多时会占用大量内存，无法保证数据的长期持久化，需要定期处理或将数据存进数据库。
+
+3、混合方案
+
+可以让热数据存 Redis，冷数据或历史数据存入 MySQL，用户查询购物车时优先读 Redis，Redis 没获取到时再去数据库加载。当然，某个用户在登录后通常需要把未登录的购物车中的商品合并到登录后的购物车，
+通过判断匿名 ID 是否一致来决定能否合并。而数据存储在 Redis 中通常使用 Hash 结构，key 为用户的 ID，field 为商品 ID，value 为该商品的详细信息。例如：
+
+```redis
+HSET cart:user:123 1001 '{"qty":2,"checked":1,"price":199.00,"title":"T-shirt"}'
+HSET cart:user:123 1002 '{"qty":1,"checked":0,"price":299.00,"title":"Shoes"}'
+```
+
+```redis
+127.0.0.1:6379> HGETALL cart:user:123
+1) "1001"
+2) "{\"qty\":2,\"checked\":1,\"price\":199.00,\"title\":\"T-shirt\"}"
+3) "1002"
+4) "{\"qty\":1,\"checked\":0,\"price\":299.00,\"title\":\"Shoes\"}"
+```
+
+因为 Redis 对小 Hash 会做专门的编码优化（ziplist/hashtable），同一 Key 下多个 field 存储比多个 Key 更节省内存。而且这样存储操作也更方便，因为购物车经常需要修改数据信息，
+如果写为多个 key-value 的形式的话，那就需要从 value 中拿出完整的数据再进行判断是否为某个用户的某个商品，而用 Hash 结构，就可以直接通过 key 找到该用户的所有数据，
+然后再根据 field 字段对应修改即可。
+
+****
+### 2.2 对象封装
+
+购物车功能需要封装两个对象，一个用于管理某个 skuId 的商品信息，一个用于管理购物车界面所有的 skuId 集合。所以这里第一个 CartItem 封装的数据为商品 skuId、是否选中标识、
+标题、图片、商品规格参数、价格、数量以及总价，因为价格需要手动计算，所以这里手机编写 getter/setter 方法，对价格进行计算。
+
+```java
+public class CartItem {
+    private Long skuId;
+    private Boolean check = true;
+    private String title;
+    private String image;
+    private List<String> skuAttr;
+    private BigDecimal price;
+    private Integer count;
+    private BigDecimal totalPrice;
+
+    public Long getSkuId() {
+        return skuId;
+    }
+
+    public void setSkuId(Long skuId) {
+        this.skuId = skuId;
+    }
+
+    public Boolean getCheck() {
+        return check;
+    }
+
+    public void setCheck(Boolean check) {
+        this.check = check;
+    }
+
+    public String getTitle() {
+        return title;
+    }
+
+    public void setTitle(String title) {
+        this.title = title;
+    }
+
+    public String getImage() {
+        return image;
+    }
+
+    public void setImage(String image) {
+        this.image = image;
+    }
+
+    public List<String> getSkuAttr() {
+        return skuAttr;
+    }
+
+    public void setSkuAttr(List<String> skuAttr) {
+        this.skuAttr = skuAttr;
+    }
+
+    public BigDecimal getPrice() {
+        return price;
+    }
+
+    public void setPrice(BigDecimal price) {
+        this.price = price;
+    }
+
+    public Integer getCount() {
+        return count;
+    }
+
+    public void setCount(Integer count) {
+        this.count = count;
+    }
+
+    public BigDecimal getTotalPrice() {
+        return this.price.multiply(new BigDecimal(this.count));
+    }
+
+    public void setTotalPrice(BigDecimal totalPrice) {
+        this.totalPrice = totalPrice;
+    }
+}
+```
+
+关于 Cart 对象，它是用来封装多个 CartItem 对象的，所以要用一个集合接收 CartItem，然后计算所有商品的总数量、商品类型数量（不同的商品有几种）、商品总价和优惠价格。
+所以这里也是手动编写 setter/getter 方法，但需要根据 CartItem 的数量来进行动态的计算所有商品的总价格和数量，有几个 CartItem 就是有几个 countType，
+countNum 则为 CartItem 中的总数量累加之和，并且只计算勾选中的商品，totalAmount 则为 CartItem 的总价累加之和减去优惠价格。
+
+```java
+public class Cart {
+    List<CartItem> cartItems;
+    private Integer countNum;
+    private Integer countType;
+    private BigDecimal totalAmount; // 商品总价
+    private BigDecimal reduceAmount = new BigDecimal("0.00"); // 优惠价格
+
+    public List<CartItem> getCartItems() {
+        return cartItems;
+    }
+
+    public void setCartItems(List<CartItem> cartItems) {
+        this.cartItems = cartItems;
+    }
+
+    public Integer getCountNum() {
+        int count = 0;
+        if (!cartItems.isEmpty()) {
+            for (CartItem cartItem : cartItems) {
+                count += cartItem.getCount();
+            }
+        }
+        return count;
+    }
 
 
+    public Integer getCountType() {
+        int count = 0;
+        if (!cartItems.isEmpty()) {
+            for (CartItem cartItem : cartItems) {
+                count += 1;
+            }
+        }
+        return count;
+    }
+
+    public BigDecimal getTotalAmount() {
+        BigDecimal amount = new BigDecimal("0.00");
+        // 1. 计算购物项总价
+        if (!cartItems.isEmpty()) {
+            for (CartItem cartItem : cartItems) {
+                if (cartItem.getCount() > 0 && cartItem.getCheck()) {
+                    BigDecimal totalPrice = cartItem.getTotalPrice();
+                    amount = amount.add(totalPrice);
+                }
+            }
+        }
+        // 2. 减去优惠价
+        BigDecimal subtract = amount.subtract(this.getReduceAmount());
+        return subtract;
+    }
+
+    public BigDecimal getReduceAmount() {
+        return reduceAmount;
+    }
+
+    public void setReduceAmount(BigDecimal reduceAmount) {
+        this.reduceAmount = reduceAmount;
+    }
+}
+```
+
+****
+## 3. 创建临时用户
+
+在使用购物车的功能时需要先区分用户是否登录，所以需要统一在请求进入时识别用户身份（登录用户/临时用户），并在请求结束时补发临时用户的 Cookie。临时用户的核心作用就是在用户未登录时，
+为其提供一个唯一且稳定的标识，从而将购物车等临时数据与这个标识关联起来，它通过一个名为 user-key 的 Cookie 来记住数据，让购物车数据在多次访问中得以保留，即使还没有登录账号。
+因此需要创建一个拦截器对购物车服务的所有请求进行拦截，判断是否为临时用户。再这之前，需要先封装一个对象，用于接收 user-key 标识：
+
+```java
+/**
+ * 用来判断用户登录信息的对象
+ */
+@Data
+public class LoginUserInfoTo {
+    private Long userId;
+    private String userKey;
+    private boolean tempUser = false; // 标志位，判断是否有 userKey
+}
+```
+
+这里有三个字段，分别接收已登录用户的 id，临时用户识别标志 userKey，以及判断是否有 userKey 的标志字段 tempUser，用这个对象把当前访问购物车功能的用户抽象成一个统一模型，
+把登录用户和临时用户的逻辑统一封装。所以后续的代码就需要去 session 中获取到登录用户的 id，也就说该服务也需要配置 SpringSession。后面就根据是否有 userId 进行判断，
+有 userId，就用 userId 查 redis，没有就用 user-key 查 redis，又因为这里需要有一个合并购物车的功能，所以不管是否登录没登录，都需要设置要给 user-key。
+
+在拦截器中，先对所有的请求进行前置拦截，从 session 获取登录信息再判断该用户（已登录/临时）是否能从浏览器中获取到 user-key，为什么说去浏览器找呢，因为某个临时用户之前访问过购物车服务，
+那时就应该给该用户生成一个 user-key，而下一次还是使用这个浏览器，那么就应该从浏览器中找。找到了就赋值，没找到证明是第一次，那就使用 UUID 给它赋值。但不管有没有登录，
+都需要给该用户一个 user-key，因为后续合并购物车会用到这个。
+
+```java
+@Component
+public class CartInterceptor implements HandlerInterceptor {
+    public static ThreadLocal<LoginUserInfoTo> threadLocal = new ThreadLocal<>();
+    @Override
+    public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) throws Exception {
+        HttpSession session = request.getSession();
+        MemberResponseVo memberResponseVo = (MemberResponseVo) session.getAttribute(LoginConstant.LOGIN_USER);
+        LoginUserInfoTo loginUserInfoTo = new LoginUserInfoTo();
+        if (memberResponseVo != null) {
+            // 用户登录
+            loginUserInfoTo.setUserId(memberResponseVo.getId());
+        }
+
+        // 不管未登录还是登录，都从浏览器获取 user-key
+        Cookie[] cookies = request.getCookies();
+        if (cookies != null) {
+            for (Cookie cookie : cookies) {
+                String cookieName = cookie.getName();
+                if (cookieName.equals(CartConstant.TEMP_USER_COOKIE_NAME)) {
+                    loginUserInfoTo.setUserKey(cookie.getValue());
+                    loginUserInfoTo.setTempUser(true); // 获取到 user-key 就将标志位设为 true
+                }
+            }
+        }
+        
+        // 如果没有分配临时用户，那就需要手动分配一个
+        if (StringUtils.isEmpty(loginUserInfoTo.getUserKey())) {
+            String uuid = UUID.randomUUID().toString();
+            loginUserInfoTo.setUserKey(uuid);
+            loginUserInfoTo.setTempUser(true);
+        }
+        threadLocal.set(loginUserInfoTo);
+        return true;
+    }
+}
+```
+
+前置拦截也就是给当前操作购物车服务者添加 user-key 标识，处理完后（在请求结束前）当然就需要把这个标识发送给浏览器存储，所以这里需要设置 cookie 的一些相关信息，设置它的 user-key、
+使用域名范围以及过期时间。这样，下次请求时浏览器就会自动带上 Cookie，实现“同一个匿名用户”的购物车数据能持续生效。
+
+```java
+@Override
+public void postHandle(HttpServletRequest request, HttpServletResponse response, Object handler, ModelAndView modelAndView) throws Exception {
+    LoginUserInfoTo loginUserInfoTo = threadLocal.get();
+    if (loginUserInfoTo != null) {
+        if (loginUserInfoTo.isTempUser()) {
+            Cookie cookie = new Cookie(CartConstant.TEMP_USER_COOKIE_NAME, loginUserInfoTo.getUserKey());
+            cookie.setDomain("gulimall.com");
+            cookie.setMaxAge(CartConstant.TEMP_USER_COOKIE_TIMEOUT);
+            response.addCookie(cookie);
+        }
+    }
+}
+```
+
+这里调用 response.addCookie(cookie); 就是往响应头里写入一条 Set-Cookie：
+
+```http request
+HTTP/1.1 200 OK
+Content-Type: text/html
+Set-Cookie: user-key=abc-123-xyz; Domain=gulimall.com; Max-Age=2592000; Path=/
+```
+
+而需要让拦截器生效，就需要让它注入容器，所以这里通过实现 WebMvcConfigurer 接口来重写方法进行拦截器的注册与指定拦截器的匹配路径，因为想让这个逻辑对整个服务都生效，
+就需要把拦截器注册到 MVC 拦截器链里让其生效。
+
+```java
+@Configuration
+public class GulimallWebConfig implements WebMvcConfigurer {
+    @Autowired
+    private CartInterceptor cartInterceptor;
+  
+    @Override
+    public void addInterceptors(InterceptorRegistry registry) {
+      registry.addInterceptor(cartInterceptor).addPathPatterns("/**");
+    }
+}
+```
+
+****
+## 4. 添加购物车
+
+添加购物车功能就是点击某个商品后，选择好对应的销售属性和数量，然后点击加入购物车，此时就会跳转到购物车页面，在该页面会显示刚刚添加的商品信息。如果要把商品信息展示在购物车页面，
+那就需要查询具体的数据库信息，所以 skuId 是必须要有的，而添加的商品数量也可以通过前端传递，这样后端就方便计算商品价格了。
+
+```html
+<div class="box-btns-one">
+    <input type="text" name="" id="numInput" value="1" />
+    <div class="box-btns-one1">
+
+        <div>
+            <button id="jia">
+        +
+        </button>
+        </div>
+        <div>
+            <button id="jian">
+            -
+        </button>
+        </div>
+    </div>
+</div>
+```
+
+```html
+<div class="box-btns-two">
+    <a href="#" id="addToCartA" th:attr="skuId=${item.skuInfo.skuId}">
+        加入购物车
+    </a>
+</div>
+```
+
+```js
+$("#addToCartA").click(function () {
+    var num = $("#numInput").val();
+    var skuId = $(this).attr("skuId");
+    location.href="http://cart.gulimall.com/addToCart?skuId=" + skuId + "&num=" + num;
+    return false;
+})
+```
+
+Controller 层：
+
+在控制层就是接收 skuId 和商品数量 num，然后把封装好的 CartItem 对象存进域中，这样前端就可以获取到了。
+
+```java
+@GetMapping("/addToCart")
+public String addToCart(@RequestParam("skuId") Long skuId, @RequestParam("num") Integer num, Model model) {
+    CartItem cartItem = cartService.addToCart(skuId, num);
+    model.addAttribute("cartItem", cartItem);
+    return "success";
+}
+```
+
+Service 层：
+
+添加商品到购物车的流程就是先对当前的操作用户进行判断，需要知道该用户是否登录，如果登录了，那就把数据存入以用户 id 为 key 的 redis 中，否则就用 user-key 的值作为 key，
+而在操作 redis 时需要先指定 key 然后再 put 数据进去，所以这里为了方便就封装成一个方法，让 redis 的操作提前绑定好 key，后续获取到这个绑定好 key 的操作直接 put 数据即可。
+而判断是否登录也很简单，在创建临时用户时就已经解释了，只要判断从 ThreadLocal 获取到的 LoginUserInfoTo 对象有无 userId 即可。
+
+```java
+/**
+ * 获取要操作的购物车
+ */
+private BoundHashOperations<String, Object, Object> getCartOps() {
+    // 1. 判断是否为登录用户进行购物车操作
+    LoginUserInfoTo loginUserInfoTo = CartInterceptor.threadLocal.get();
+    String cartKey = "";
+    if (loginUserInfoTo.getUserId() != null) {
+        // 已登录
+        cartKey = CartConstant.CART_PREFIX + loginUserInfoTo.getUserId();
+    } else {
+        cartKey = CartConstant.CART_PREFIX + loginUserInfoTo.getUserKey();
+    }
+    // 2. 绑定 redis 操作的 key
+    BoundHashOperations<String, Object, Object> boundHashOperations = stringRedisTemplate.boundHashOps(cartKey);
+    return boundHashOperations;
+}
+```
+
+设置好 redis 要操作的 key 后，就可以开始对购物车商品对象 CartItem 的封装了，对于添加商品到购物车而言，它分两种情况：一种是购物车中有相同的商品，
+那么此时添加就是在原商品的基础上增加数量即可；另一种是购物车中没有该商品，那么就是直接新增即可。也就是说，一个是修改 redis 中的数据，一个是把数据新增进 redis。
+
+所以需要先从 redis 中获取该 skuId 的商品信息，如果不能获取到，那证明就是新增商品：新增商品这里采用的是异步编程，因为这个过程涉及多个查询数据库的操作，使用异步效率更高。
+首先就是远程查询当前要添加的商品信息，所以需要获取到 SkuInfoEntity 对象，远程调用 gulimall-product 服务的方法即可，该方法较为简单，直接查询表 pms_sku_info 即可。
+从获取到的 SkuInfoEntity 中可以拿到要添加进购物车的商品的图片、标题、单价等信息，而关于商品的销售属性则需要远程调用另一个方法。
+
+```java
+@Override
+public CartItem addToCart(Long skuId, Integer num) {
+    BoundHashOperations<String, Object, Object> cartOps = getCartOps();
+    // 判断 Redis 中是否有相同的商品
+    String redisSku = (String) cartOps.get(skuId.toString());
+    if (StringUtils.isEmpty(redisSku)) {
+        // 购物车中没有此商品
+        CartItem cartItem = new CartItem();
+        // 1. 远程查询当前要添加的商品信息
+        CompletableFuture<Void> getSkuInfoFuture = CompletableFuture.runAsync(() -> {
+            R r = productFeignService.getSkuInfo(skuId);
+            if (r.getCode() == 0) {
+                SkuInfoVo skuInfo = r.getData("skuInfo", new TypeReference<SkuInfoVo>() {
+                });
+                cartItem.setSkuId(skuId);
+                cartItem.setCheck(true);
+                cartItem.setCount(num);
+                cartItem.setImage(skuInfo.getSkuDefaultImg());
+                cartItem.setTitle(skuInfo.getSkuTitle());
+                cartItem.setPrice(skuInfo.getPrice());
+            }
+        }, threadPoolExecutor);
+}
+```
+
+关于获取商品的销售属性，需要远程调用以下方法，主要就是从数据库中根据 skuId 查询表 pms_sku_sale_attr_value，通过 concat(attr_name, ": ", attr_value) 方法，
+把属性名和属性值拼接成一个字符串，比如 "颜色: 红色" "尺码: XL"，所以最终返回结果是一个字符串列表，每个字符串是一个 "属性名: 属性值"，这样就不需要再通过 R 对象获取数据再转型了。
+
+```java
+@Override
+public List<String> getSkuSaleAttrValueList(Long skuId) {
+    return skuSaleAttrValueDao.getSkuSaleAttrValueList(skuId);
+}
+```
+
+```xml
+<select id="getSkuSaleAttrValueList" resultType="java.lang.String">
+    select concat(attr_name, ": ", attr_value) from pms_sku_sale_attr_value where sku_id = #{skuId}
+</select>
+```
+
+当然查询销售属性也是一个异步任务，它和上面的远程调用查询不互相依赖，所以都是用的是 runAsync() 方法，最后等待这两个异步任务都完成后就可以把封装好的 CartItem 写进 redis 了。
+
+```java
+@Override
+public CartItem addToCart(Long skuId, Integer num) {
+    BoundHashOperations<String, Object, Object> cartOps = getCartOps();
+    // 判断 Redis 中是否有相同的商品
+    String redisSku = (String) cartOps.get(skuId.toString());
+    if (StringUtils.isEmpty(redisSku)) {
+        // 购物车中没有此商品
+        ...
+        // 2. 远程查询 sku 组合信息
+        CompletableFuture<Void> getSkuSaleAttrValueListFuture = CompletableFuture.runAsync(() -> {
+            List<String> skuSaleAttrValueList = productFeignService.getSkuSaleAttrValueList(skuId);
+            cartItem.setSkuAttr(skuSaleAttrValueList);
+        }, threadPoolExecutor);
+        // 等待异步任务完成
+        try {
+            CompletableFuture.allOf(getSkuInfoFuture, getSkuSaleAttrValueListFuture).get();
+        } catch (InterruptedException | ExecutionException e) {
+            throw new RuntimeException(e);
+        }
+
+        // 3. 将 CartItem 对象写进 Redis
+        try {
+            cartOps.put(skuId.toString(), objectMapper.writeValueAsString(cartItem));
+        } catch (JsonProcessingException e) {
+            throw new RuntimeException(e);
+        }
+        return cartItem;
+    } 
+}
+```
+
+对于已添加的商品，再次添加时只需要修改数量即可，所以先从 Redis 中获取到数据，接着把该数据从 JSON 转换成原对象类型，通过 setter 方法修改数量，然后再转换成 JSON 并存入 redis。
+
+```java
+@Override
+public CartItem addToCart(Long skuId, Integer num) {
+    BoundHashOperations<String, Object, Object> cartOps = getCartOps();
+    // 判断 Redis 中是否有相同的商品
+    String redisSku = (String) cartOps.get(skuId.toString());
+    if (StringUtils.isEmpty(redisSku)) {
+        ...
+    } else {
+        // 有此商品，修改数量即可
+        CartItem cartItem;
+        try {
+            cartItem = objectMapper.readValue(redisSku, CartItem.class);
+        } catch (JsonProcessingException e) {
+            throw new RuntimeException(e);
+        }
+        cartItem.setCount(cartItem.getCount() + num);
+        try {
+            cartOps.put(skuId.toString(), objectMapper.writeValueAsString(cartItem));
+        } catch (JsonProcessingException e) {
+            throw new RuntimeException(e);
+        }
+        return cartItem;
+    }
+}
+```
+
+当然为了能够看到某个用户的购物车信息，也需要在这些页面获取到 session 中的登录用户信息：
+
+```html
+<li>
+    <a th:if="${session.loginUser == null}"
+       href="http://auth.gulimall.com/login.html">
+        你好，请登录
+    </a>
+    <a th:if="${session.loginUser != null}">
+        你好，[[${session.loginUser.nickname}]]
+    </a>
+</li>
+
+<li>
+    <a th:if="${session.loginUser == null}"
+       href="http://auth.gulimall.com/reg.html"
+       class="li_2">
+        免费注册
+    </a>
+    <span th:if="${session.loginUser != null}" class="li_2 disabled">
+       已注册
+    </span>
+</li>
+```
+
+不过目前的代码存在一个问题:当前已经添加了一个商品，此时浏览器的 url 为 http://cart.gulimall.com/addToCart?skuId=31&num=4 ，如果刷新页面，那就会再次发送该请求，
+就等于又添加了一次购物车，这显然是不合理的，因此需要修改原来的 Controller，不能直接跳转到 success 页面，而是执行完添加逻辑后，
+使用重定向把 skuId 作为参数传递给另一个 Controller 方法，由这个方法通过 skuId 查询刚刚添加的数据信息，这样再次刷新页面进入的就是 addToCartSuccessPage() 方法了，
+该方法不会添加商品，只进行查询展示。
+
+```java
+@GetMapping("/addToCart")
+public String addToCart(@RequestParam("skuId") Long skuId, @RequestParam("num") Integer num, RedirectAttributes redirectAttributes) {
+    CartItem cartItem = cartService.addToCart(skuId, num);
+    redirectAttributes.addAttribute("skuId", skuId); // 重定向时会自动把 skuId 拼接到 url 后面：.../addToCartSuccess.html?skuId=31
+    return "redirect:http://cart.gulimall.com/addToCartSuccess.html";
+}
+```
+
+```java
+@GetMapping("/addToCartSuccess.html")
+public String addToCartSuccessPage(@RequestParam("skuId") Long skuId, Model model) {
+    // 通过 skuId 再查一遍购物车信息
+    CartItem cartItem = cartService.getCartItem(skuId);
+    model.addAttribute("cartItem", cartItem);
+    return "success";
+}
+```
+
+```java
+@Override
+public CartItem getCartItem(Long skuId) {
+    BoundHashOperations<String, Object, Object> cartOps = getCartOps();
+    String redisSku = (String) cartOps.get(skuId.toString());
+    CartItem cartItem;
+    try {
+        cartItem = objectMapper.readValue(redisSku, CartItem.class);
+    } catch (JsonProcessingException e) {
+        throw new RuntimeException(e);
+    }
+    return cartItem;
+}
+```
+
+****
+## 5. 展示购物车中添加的商品
+
+Controller 层：
+
+定义一个 getCart() 方法获取到一个 Cart 对象，该对象里封装的数据就是购物车页面整体展示需要的数据，所以只需要获取一个这个对象并存入域中即可。
+
+```java
+@GetMapping("/cart.html")
+public String cartListPage(Model model) {
+    Cart cart = cartService.getCart();
+    model.addAttribute("cart", cart);
+    return "cartList";
+}
+```
+
+Service 层：
+
+对于查询购物车来说，也同样需要区分两种情况。如果用户只在登录情况下进行过商品添加至购物车，那么就可以直接查询 redis 获取到数据并返回；如果在未登录的时候也进行过添加操作，
+那么在他登陆后，就需要把它临时添加进购物车的商品数据合并到此时登录的用户的购物车中，也就是把 user-key 为 key 的 redis 数据合并到以 userId 为 key 的 redis 数据中，
+如果不存在以 userId 为 key 的 redis 数据，那么就直接以当前登录用户的 userId 作为 key 新建一个即可。对于合并操作来说，其实就是再调用一次添加购物车的那个方法而已，
+把查到的商品中的 skuId 和数量 count 传递给 addToCart 方法，由它把数据添加进对应的 redis 数据。
+
+```java
+@Override
+public Cart getCart() {
+    Cart cart = new Cart();
+    LoginUserInfoTo userInfo = CartInterceptor.threadLocal.get();
+    String tempCartKey = CartConstant.CART_PREFIX + userInfo.getUserKey();
+    // 最终返回的购物车数据
+    List<CartItem> cartItems = new ArrayList<>();
+    if (userInfo.getUserId() != null) {
+        // 登录用户
+        String userCartKey = CartConstant.CART_PREFIX + userInfo.getUserId();
+        // 1. 获取临时购物车
+        List<CartItem> tempItems = getCartItems(tempCartKey);
+        // 2. 如果临时购物车有数据，就合并到登录购物车
+        if (tempItems != null) {
+            for (CartItem item : tempItems) {
+                addToCart(item.getSkuId(), item.getCount());
+            }
+            // 3. 清空临时购物车
+            stringRedisTemplate.delete(tempCartKey);
+        }
+        // 4. 查询合并后的登录购物车
+        cartItems = getCartItems(userCartKey);
+    } else {
+        // 未登录，直接查临时购物车
+        cartItems = getCartItems(tempCartKey);
+    }
+    cart.setCartItems(cartItems);
+    return cart;
+}
+```
+
+因为是查询所有，所以这里不需要传递 key 值，直接查询 redis 的 Hash 中的所有 value，然后遍历它们转换成 CartItem 对象并封装进集合返回。
+
+```java
+private List<CartItem> getCartItems(String cartKey) {
+    BoundHashOperations<String, Object, Object> ops = stringRedisTemplate.boundHashOps(cartKey);
+    List<Object> values = ops.values();
+    if (values == null || values.isEmpty()) return new ArrayList<>();
+    return values.stream()
+            .filter(Objects::nonNull) // 过滤掉 null
+            .map(obj -> {
+        try {
+            return objectMapper.readValue((String) obj, CartItem.class);
+        } catch (JsonProcessingException e) {
+            throw new RuntimeException(e);
+        }
+    }).collect(Collectors.toList());
+}
+```
+
+前端也需要动态的展示这些数据：
+
+```html
+<div>
+    <ol>
+        <li><input type="checkbox" class="check" th:checked="${cartItem.check}"></li>
+        <li>
+            <dt><img th:src="${cartItem.image}" alt="">图片</dt>
+            <dd style="width: 400px">
+                <p>
+                    <span th:text="${cartItem.title}">标题</span>
+                    <br/>
+                    <span th:each="saleAttr : ${cartItem.skuAttr}" th:text="${saleAttr}">销售属性</span>
+                </p>
+            </dd>
+        </li>
+        <li>
+            <p class="dj" th:text="'￥' + ${#numbers.formatDecimal(cartItem.price, 3, 2)}">价格</p>
+        </li>
+        <li>
+            <p>
+                <span>-</span>
+                <span th:text="${cartItem.count}">5</span>
+                <span>+</span>
+            </p>
+        </li>
+        <li style="font-weight:bold"><p class="zj">￥[[${#numbers.formatDecimal(cartItem.totalPrice, 1, 2)}]]</p></li>
+    </ol>
+</div>
+```
+
+****
 
 
 

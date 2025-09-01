@@ -31,19 +31,17 @@ spring:
   session:
     store-type: redis
     timeout: 30m
-    redis:
-      namespace: gulimall:loginUser
 
 
   devtools:
     restart:
       enabled: false
 
-#gulimall:
-#  thread:
-#    core-pool-size: 20
-#    max-pool-size: 200
-#    keep-alive-time: 10
+gulimall:
+  thread:
+    core-pool-size: 20
+    max-pool-size: 200
+    keep-alive-time: 10
 
 feign:
   client:
