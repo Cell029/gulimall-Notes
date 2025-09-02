@@ -12,11 +12,30 @@ spring:
       discovery:
         server-addr: 127.0.0.1:8848
 
+  rabbitmq:
+    host: 127.0.0.1 # 虚拟机IP
+    port: 5672 # 端口
+    virtual-host: / # 虚拟主机
+    username: admin # 用户名
+    password: admin # 密码
+    publisher-confirm-type: correlated
+    publisher-returns: true
+    template:
+      mandatory: true # 只要抵达队列，以异步发送优先回调抵达确认
+    listener:
+      simple:
+        acknowledge-mode: manual # 手动 ack 消息
+
+
 mybatis-plus:
   mapper-locations: classpath:/mapper/**/*.xml
   global-config:
     db-config:
       id-type: auto # 主键自增
+
+logging:
+  level:
+    com.project.gulimall.order: debug
 
 #server:
 #  port: 9000

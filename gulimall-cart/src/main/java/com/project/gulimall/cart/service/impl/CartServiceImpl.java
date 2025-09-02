@@ -143,6 +143,45 @@ public class CartServiceImpl implements CartService {
         return cart;
     }
 
+    /**
+     * 勾选购物项
+     */
+    @Override
+    public void checkItem(Long skuId, Integer check) {
+        BoundHashOperations<String, Object, Object> cartOps = getCartOps();
+        CartItem cartItem = getCartItem(skuId);
+        cartItem.setCheck(check == 1);
+        try {
+            cartOps.put(skuId.toString(), objectMapper.writeValueAsString(cartItem));
+        } catch (JsonProcessingException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    /**
+     * 修改购物项的数量
+     */
+    @Override
+    public void changeItemCount(Long skuId, Integer num) {
+        BoundHashOperations<String, Object, Object> cartOps = getCartOps();
+        CartItem cartItem = getCartItem(skuId);
+        cartItem.setCount(num);
+        try {
+            cartOps.put(skuId.toString(), objectMapper.writeValueAsString(cartItem));
+        } catch (JsonProcessingException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    /**
+     * 删除购物项
+     */
+    @Override
+    public void deleteItem(Long skuId) {
+        BoundHashOperations<String, Object, Object> cartOps = getCartOps();
+        cartOps.delete(skuId.toString());
+    }
+
     private List<CartItem> getCartItems(String cartKey) {
         BoundHashOperations<String, Object, Object> ops = stringRedisTemplate.boundHashOps(cartKey);
         List<Object> values = ops.values();

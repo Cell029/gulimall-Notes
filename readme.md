@@ -13960,6 +13960,760 @@ private List<CartItem> getCartItems(String cartKey) {
 ```
 
 ****
+## 6. 购物车中某个商品购物项的功能
+
+### 6.1 选中购物项
+
+在涉及购物车商品 CartItem 对象的时候，给它设计了一个 check 字段，该字段就是用来判断当前商品是否被选中（true 为选中），所以选中购物项的功能就是通过修改该字段达到目的，
+因为最终结算金额时是根据被选中的商品来计算的，所以有必要单独给它一个字段作为标识。在前端就是给该按钮一个点击标识 class="itemCheck" 并让它动态获取当前点击商品的 skuId，
+然后在 js 方法中获取该商品的 skuId 与 checked 值并作为请求参数传递给后端：
+
+```html
+<li><input type="checkbox" class="itemCheck" th:attr="skuId=${cartItem.skuId}" th:checked="${cartItem.check}"></li>
+```
+
+```js
+$(".itemCheck").click(function () {
+    var skuId = $(this).attr("skuId");
+    var check = $(this).prop("checked");
+    location.href = "http://cart.gulimall.com/checkItem?skuId=" + skuId + "&check=" + (check ? 1 : 0);
+})
+```
+
+Controller 层：
+
+后端则是接收到者两个参数后对 CartItem 的 chek 字段进行对应的修改，修改后就返回查询购物车的功能展示所有购物相。
+
+```java
+@GetMapping("/checkItem")
+public String checkItem(@RequestParam("skuId") Long skuId, @RequestParam("check") Integer check) {
+    cartService.checkItem(skuId, check);
+    return "redirect:http://cart.gulimall.com/cart.html";
+}
+```
+
+Service 层：
+
+在编写添加购物车功能时有编写一个查询单个 skuId 的 CartItem 的方法，这里就可以直接调用，获取到具体的 CartItem 后修改它的 check 字段，因为该字段的类型时 boolean，
+而前端传递的过来的是 Integer（1 或 0），因此需要判断其是否等于 1，这里直接写双等号把它的结过作为 boolean。
+ 
+```java
+@Override
+public void checkItem(Long skuId, Integer check) {
+    BoundHashOperations<String, Object, Object> cartOps = getCartOps();
+    CartItem cartItem = getCartItem(skuId);
+    cartItem.setCheck(check == 1);
+    try {
+        cartOps.put(skuId.toString(), objectMapper.writeValueAsString(cartItem));
+    } catch (JsonProcessingException e) {
+        throw new RuntimeException(e);
+    }
+}
+```
+
+****
+### 6.2 改变购物项数量
+
+在购物车页面可以对添加的商品的数量进行修改，而这个修改操作就是将保存进 redis 中的 CartItem 的 count 字段进行对应的修改。前端则需要在增加与减少的按钮上添加点击标识，
+并且动态读取当前商品对象的 skuId 和实时数量。
+
+```html
+<li>
+    <p th:attr="skuId=${cartItem.skuId}">
+        <span class="countOpsBtn">-</span>
+        <span class="countOpsNum" th:text="${cartItem.count}">5</span>
+        <span class="countOpsBtn">+</span>
+    </p>
+</li>
+```
+
+在 js 中获取到当前操作商品对象的 skuId 与商品数量，把它们作为请求参数传递给后端：
+
+```js
+$(".countOpsBtn").click(function () {
+    var skuId = $(this).parent().attr("skuId");
+    var num = $(this).parent().find(".countOpsNum").text();
+    location.href = "http://cart.gulimall.com/countItem?skuId=" + skuId + "&num=" + num;
+})
+```
+
+Controller 层：
+
+```java
+@GetMapping("/countItem")
+public String countItem(@RequestParam("skuId") Long skuId, @RequestParam("num") Integer num) {
+    cartService.changeItemCount(skuId, num);
+    return "redirect:http://cart.gulimall.com/cart.html";
+}
+```
+
+Service 层：
+
+```java
+@Override
+public void changeItemCount(Long skuId, Integer num) {
+    BoundHashOperations<String, Object, Object> cartOps = getCartOps();
+    CartItem cartItem = getCartItem(skuId);
+    cartItem.setCount(num);
+    try {
+        cartOps.put(skuId.toString(), objectMapper.writeValueAsString(cartItem));
+    } catch (JsonProcessingException e) {
+        throw new RuntimeException(e);
+    }
+}
+```
+
+****
+### 6.3 删除购物项
+
+删除购物项功能就是传递一个 skuId 给后端，让后端删除掉存在 redis 中的那个数据即可，所以前端需要动态获取到当前操作的商品对象的 skuId，在前端页面点击删除按钮时会先弹出一个提示框，
+在提示框中点击删除按钮后才会真正执行，所以要给这两个按钮都绑定单击事件，
+
+```html
+<li>
+    <p class="deleteItemBtn" th:attr="skuId=${cartItem.skuId}">删除</p>
+</li>
+```
+
+```html
+<div class="One_isDel">
+    <p>
+        <span>删除</span><span><img src="/static/cart/img/错误.png" alt=""></span>
+    </p>
+    <div>
+        <dl>
+            <dt><img src="/static/cart/img/感叹三角形 (2).png" alt=""></dt>
+            <dd>
+                <li>删除商品？</li>
+                <li>您可以选择移到关注，或删除商品。</li>
+            </dd>
+        </dl>
+    </div>
+    <div>
+        <button type="button" onclick="deleteItem()">删除</button>
+    </div>
+</div>
+```
+
+第一个按钮就是用来获取 skuId 的，第二个按钮则是用来发送请求的，因为第二个按钮无法动态获取到当前操作对象的 skuId，因此只能这样设计：
+
+```js
+var deleteId = 0;
+// 删除购物项
+function deleteItem() {
+    location.href = "http://cart.gulimall.com/deleteItem?skuId=" + deleteId;
+}
+
+$(".deleteItemBtn").click(function () {
+    deleteId = $(this).attr("skuId");
+})
+```
+
+Controller 层：
+
+```java
+@GetMapping("/deleteItem")
+public String deleteItem(@RequestParam("skuId") Long skuId) {
+    cartService.deleteItem(skuId);
+    return "redirect:http://cart.gulimall.com/cart.html";
+}
+```
+
+Service 层：
+
+```java
+@Override
+public void deleteItem(Long skuId) {
+    BoundHashOperations<String, Object, Object> cartOps = getCartOps();
+    cartOps.delete(skuId.toString());
+}
+```
+
+****
+# 十、订单服务
+
+## 1. 消息队列
+
+### 1.1 RabbitMQ 概念
+
+RabbitMQ 是一个实现 AMQP（Advanced Message Queuing Protocol，高级消息队列协议）的消息中间件，它负责接收消息、路由消息并可靠地把消息投递给消费者，但它不是数据库，
+也不是文件存储。AMQP 中的核心内容：
+
+1. Producer（生产者）：投信的人。 
+2. Exchange（交换机）：像分拣中心，按规则把信转发到不同的投递箱。 
+3. Binding（绑定）：分拣规则（把哪个箱子和哪个规则连起来）。 
+4. Routing Key（路由键）：这封信“写在信封上的地址”。 
+5. Queue（队列）：邮筒，消息真正存放的地方，只存在于 Broker 端。 
+6. Consumer（消费者）：取信的人。 
+7. Broker：RabbitMQ 服务器本体。
+
+运行机制：
+
+> 生产者把消息交给 Exchange -> Exchange 根据 Binding 及 Routing Key 决定把消息放进哪些 Queue -> 消费者从 Queue 拉取（或被推送）消息处理。
+
+1、建立连接
+
+生产者和消费者都需要和 RabbitMQ 建立一个 TCP 连接，为了节省昂贵的 TCP 连接开销，双方都在其连接上创建一个 Channel（信道），
+后续所有的操作（发布消息、消费消息、声明队列等）都是通过这个轻量的 Channel 进行的。
+
+2、声明拓扑
+
+在发送消息之前，应用程序通常需要确保消息路径上的基础设施（Exchange, Queue, Binding）存在，而这个过程称就被称为 “声明拓扑”，例如：
+
+- 声明交换机：确保指定名称和类型的 Exchange 存在，如果不存在则创建它。 
+- 声明队列：确保指定名称的 Queue 存在，如果不存在则创建它。 
+- 绑定队列：创建一条 Binding 规则，将 Queue 绑定到 Exchange，并指定一个 Binding Key。
+
+以上操作是幂等的，也就是说可以多次执行 “声明一个名为 ‘my_queue’ 的队列” 的操作，RabbitMQ 只会确保它存在，而不会重复创建或报错（除非参数不同）。
+
+3、发布消息
+
+生产者通过它的 Channel 调用 basic.publish 方法，该方法通常需要指定几个关键参数：
+
+- exchange：消息要发送到的 Exchange 的名称。 
+- routing_key：路由键，一个用于辅助路由的字符串。 
+- mandatory：一个标志位（如果为 true，当消息无法被路由到任何队列时，Broker 会将消息返回给生产者）。 
+- properties：消息的属性（如 delivery_mode: 2 设置持久化，content_type: 'application/json'）。 
+- body：消息的有效载荷（Payload），即要发送的实际数据。
+
+然后再把消息发送到指定的 Exchange。
+
+4、路由消息
+
+Exchange 接收到消息后，会根据自身的类型和所有绑定的 Binding 规则，来决定消息的去向，例如：
+
+- Direct Exchange：将消息的 routing_key 与每个绑定队列的 binding_key 进行精确匹配。匹配成功，则消息投递到该队列。 
+- Fanout Exchange：忽略 routing_key，将消息广播到所有绑定到它的队列。 
+- Topic Exchange：将消息的 routing_key 与绑定队列的 binding_key（可包含通配符 * 和 #）进行模式匹配。匹配成功，则消息投递到该队列。 
+- Headers Exchange：忽略 routing_key，根据消息头（Headers）中的键值对与绑定规则进行匹配。
+
+最终的路由结果有两种可能：路由成功，那消息就会被成功路由到一个或多个队列，消息在这些队列中存储；路由失败，消息就不会被路由到任何队列，消息会被丢弃或返回给生产者（如果发布时设置了 mandatory=true）
+
+5、存储消息
+
+消息被路由到 Queue 中，并在其中等待被消费，而队列可以看作是消息的缓冲区。但需要注意的是：如果队列被声明为 durable（持久化），并且消息在发布时设置了 delivery_mode: 2（持久化的），
+那么即使 RabbitMQ 服务器重启，消息也不会丢失。但如果只满足一个条件（例如队列持久化但消息不是），则重启后队列存在，其中的非持久化消息会丢失。
+
+6、消费消息
+
+消费者通过它的 Channel 订阅一个队列，并指定一个回调函数（用于处理消息），一旦队列中有可用的消息，RabbitMQ 就会主动异步地通过 Channel 推送消息给消费者，
+接着消费者应用程序的回调函数就会被触发，开始处理消息。
+
+7、确认消息
+
+消费者处理完消息后，必须向 RabbitMQ 发送一个确认信息（ACKnowledgement），确认方式分为手动和自动：
+
+- 自动确认 (Auto Ack)：在订阅队列时设置 auto_ack=true，消息一被发送给消费者，Broker 就立即将其从队列中删除，但风险很高，如果消费者处理消息时崩溃，消息就永远丢失了。 
+- 手动确认 (Manual Ack)：在订阅队列时设置 auto_ack=false，消费者在处理完消息后，必须显式地调用 basic.ack 方法，Broker 收到 Ack 后，才将消息从队列中删除。
+
+不过，如果消费者未发送 Ack 就断开连接，RabbitMQ 就会认为这条消息处理失败，它会自动将这条消息重新入队，并准备投递给另一个消费者，这确保了消息不会因为某个消费者的意外而丢失。
+
+8、拒绝消息
+
+如果消费者处理消息失败，它可以拒绝一条或多条消息，并选择是否让消息重新入队或者直接丢弃。
+
+```text
+ [Producer]  
+     |   (消息 + RoutingKey)
+     v
+ [Exchange]  --路由规则-->  [Queue A]  --->  [Consumer A]
+     |                     [Queue B]  --->  [Consumer B]
+     |
+     +-- (无匹配时) --> [Alternate Exchange（备用交换机） / Return 回调]
+```
+
+```text
+          [Producer]
+              |
+              v
+        +-------------+
+        |  Exchange   |
+        +-------------+
+      /    |      |      \
+     /     |      |       \
+[Direct] [Topic] [Fanout] [Headers]
+   |        |        |        |
+ 精准匹配   通配匹配   广播分发   消息头匹配
+```
+
+具体操作流程可参考 [SpringCloud 笔记](https://github.com/Cell029/SpringCloud-Notes#%E5%85%ADmq)。
+
+****
+### 1.2 安装
+
+将 RabbitMQ 的消息存储（队列里的消息，持久化到磁盘的部分）和元数据（交换机、队列、绑定关系、用户、vhost 等配置）挂载到宿主机，并设置一个可远程登录的用户：
+
+```shell
+docker run -d \
+  --name rabbitmq \
+  -p 5672:5672 \
+  -p 15672:15672 \
+  -v /rabbitmq/data:/var/lib/rabbitmq \
+  -v /rabbitmq/log:/var/log/rabbitmq \
+  -e RABBITMQ_DEFAULT_USER=admin \
+  -e RABBITMQ_DEFAULT_PASS=admin \
+  rabbitmq:4.1.0-management
+```
+
+安装成功后访问 http://localhost:15672/ 输入账号密码即可。
+
+****
+### 1.3 SpringBoot 整合 RabbitMQ
+
+引入依赖：
+
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-amqp</artifactId>
+</dependency>
+```
+
+配置相关属性：
+
+```yaml
+spring:
+  rabbitmq:
+    host: 127.0.0.1 # 虚拟机IP
+    port: 5672 # 端口
+    virtual-host: / # 虚拟主机
+    username: admin # 用户名
+    password: admin # 密码
+```
+
+添加注解：
+
+```java
+@EnableRabbit
+public class GulimallOrderApplication {
+    ...
+}
+```
+
+之前记录过用配置类和注解的方式声明交换机、队列和绑定，这里就记录一下使用 AmqAdmin 的方式，不过这种方式其实和配置类差不多，因为配置类底层使用的就是 AmqAdmin：
+
+```java
+@Autowired
+private AmqpAdmin amqpAdmin;
+
+@Test
+void createExchange() {
+    /**
+     * public DirectExchange(String name, boolean durable, boolean autoDelete) {
+     *     super(name, durable, autoDelete);
+     * }
+     */
+    DirectExchange directExchange = new DirectExchange("hello-direct-exchange", true, false);
+    amqpAdmin.declareExchange(directExchange);
+    log.info("交换机[{}]创建成功", directExchange.getName());
+}
+
+@Test
+void createQueue() {
+    /**
+     * public Queue(String name, boolean durable, boolean exclusive, boolean autoDelete) {
+     *     this(name, durable, exclusive, autoDelete, (Map)null);
+     * }
+     */
+    Queue queue = new Queue("hello-queue", true, false, false);
+    amqpAdmin.declareQueue(queue);
+    log.info("队列[{}]创建成功", queue.getName());
+}
+
+@Test
+void createBinding() {
+    /**
+     * public Binding(String destination, DestinationType destinationType, String exchange, String routingKey, @Nullable Map<String, Object> arguments) {
+     *     super(arguments);
+     *     this.destination = destination;
+     *     this.destinationType = destinationType;
+     *     this.exchange = exchange;
+     *     this.routingKey = routingKey;
+     * }
+     */
+    Binding binding = new Binding("hello-queue", Binding.DestinationType.QUEUE, "hello-direct-exchange", "hello", null);
+    amqpAdmin.declareBinding(binding);
+    log.info("绑定[{}]创建成功", binding.toString()); // 绑定[Binding [destination=hello-queue, exchange=hello-direct-exchange, routingKey=hello, arguments={}]]创建成功
+}
+```
+
+发送消息还是需要注入 RabbitTemplate:
+
+```java
+@Test
+void sendMsg() {
+    /**
+     * public void convertAndSend(String exchange, String routingKey, Object object) throws AmqpException {
+     *     this.convertAndSend(exchange, routingKey, object, (CorrelationData)null);
+     * }
+     */
+    rabbitTemplate.convertAndSend("hello-direct-exchange", "hello", "hello world");
+}
+```
+
+当然，如果是发送对象类型的消息，那么就需要用到序列化机制，虽然 Rabbit 自带转换器可以转换对象类型，不过该转换器使用的是 JDK 默认的，也就是说它转换成的类型是肉眼不可读的，
+所以需要自定义一个消息转换器，把对象类型转换成 JSON 格式：
+
+```java
+@Configuration
+public class MyRabbitConfig {
+    @Bean
+    public MessageConverter messageConverter(){
+        // 1. 定义消息转换器
+        Jackson2JsonMessageConverter jackson2JsonMessageConverter = new Jackson2JsonMessageConverter();
+        // 2. 配置自动创建消息 id，用于识别不同消息，也可以在业务中基于 ID 判断是否是重复消息
+        jackson2JsonMessageConverter.setCreateMessageIds(true); // 底层使用 UUID 可以判断后续消费者是否重复消费一条消息
+        return jackson2JsonMessageConverter;
+    }
+}
+```
+
+接收消息时通常使用的就是 @RabbitListener 注解，需要在该注解列指定接收哪个队列的消息，可以指定多个，而消息的接收类型可以用 String 也可以用消息的原本类型，
+当然也可以选中接收完整的对象，也就是使用 Message 类型接收，它可以获取消息的所有属性，如 headers 和 properties，
+
+```java
+@RabbitListener(queues = "hello-queue")
+public void receiveFullMessage(Message message) {
+    String body = new String(message.getBody());
+    String routingKey = message.getMessageProperties().getReceivedRoutingKey();
+    Map<String, Object> headers = message.getMessageProperties().getHeaders();
+    System.out.println("Body: " + body);
+    System.out.println("Routing Key: " + routingKey);
+    System.out.println("Headers: " + headers);
+}
+```
+
+@RabbitListener 是一个类级别的注解（虽然常放在方法上），它定义了这个类负责监听哪个队列；@RabbitHandler 是一个方法级别的注解，它定义了 “当消息到来时，根据消息的类型，应该由这个类中的哪个方法来处理”。
+也就是说，前者决定在哪处理消息，后者决定了由谁来处理消息。
+
+```java
+@Component
+// 1. 用 @RabbitListener 声明这个类监听 "notificationQueue" 队列
+@RabbitListener(queues = "notificationQueue")
+public class MultiTypeMessageListener {
+
+    // 2. 用 @RabbitHandler 声明这是一个消息处理方法
+    // 当消息体是 EmailRequest 类型时，自动调用此方法
+    @RabbitHandler
+    public void handleEmail(EmailRequest emailRequest) {
+        // 调用邮件发送服务...
+    }
+
+    // 3. 另一个 @RabbitHandler 方法
+    // 当消息体是 SmsRequest 类型时，自动调用此方法
+    @RabbitHandler
+    public void handleSms(SmsRequest smsRequest) {
+        // 调用短信发送服务...
+    }
+
+    // 4. 处理推送请求
+    @RabbitHandler
+    public void handlePush(PushNotificationRequest pushRequest) {
+        // 调用推送服务...
+    }
+
+    // 5. 默认处理器（处理未知类型或 String 等）
+    @RabbitHandler(isDefault = true)
+    public void handleDefault(Object unknownMessage) {
+        // 可以进行日志记录、转发到死信队列等操作
+    }
+}
+```
+
+当然，也可以只使用 @RabbitListener，让它在不同的方法上接收不同的队列的消息，此时接收的对象使用 Message 类型，就可以获取更多消息的信息。而使用 @RabbitHandler 时，
+就不能再用 Message 对象接收消息了，因为 @RabbitHandler 的工作机制严重依赖于 Spring 的消息转换器和方法参数的类型匹配。当消息到达时，
+Spring 会尝试使用配置的 MessageConverter将消息体（字节数组）转换并反序列化成目标 Java 对象。然后，它查看 @RabbitListener 类中所有 @RabbitHandler 方法的参数类型，
+寻找一个其参数类型与反序列化后的对象类型完全匹配的方法。如果使用的是 Message 对象，那么就意味着放弃了自动反序列化，直接从 Message 中获取字节数组，此时，
+所有消息都会路由到同一个处理 Message 的方法，其他处理具体对象类型的 @RabbitHandler 方法永远不会被调用。
+
+用 @RabbitHandler 标注的方法不一定只能接收一个对象，不过需要使用注解搭配，如果接收的数据为消息体，那么就需要使用 @Payload（通常第一个参数默认自带），
+如果需要获取特定的消息的消息头或属性，就要使用 @Header：
+
+- @Header(AmqpHeaders.RECEIVED_ROUTING_KEY) String routingKey：获取消息的路由键
+- @Header(AmqpHeaders.CORRELATION_ID) String correlationId：获取关联 ID（常用于远程调用）
+- @Header(AmqpHeaders.CONTENT_TYPE) String contentType：获取内容类型
+- @Header("custom_header") String customHeader：获取任何自定义的 Header
+- @Header(AmqpHeaders.DELIVERY_TAG) Long deliveryTag：获取消息的交付标签（用于手动 ACK）
+
+****
+### 1.4 消息确认机制-可靠投递
+
+在不开启任何确认机制的情况下，生产者调用 rabbitTemplate.convertAndSend() 方法后，就认为消息发出去了，但无法知道消息是否真的成功发送到了 RabbitMQ 服务器；
+消息是否因为网络闪断、Broker 重启、交换机不存在等原因而丢失；消息到达了交换机，但是否因为路由键错误而无法投递到任何队列......可靠投递机制就是为了让生产者能够感知到消息投递过程中的各种状态，
+从而进行补偿、重试或日志记录，确保消息不会不知原因地丢失，而消息确认机制分为生产者确认和消费者确认两种。
+
+#### 1.4.1 生产者确认
+
+1、确认回调
+
+生产者确认-ConfirmCallback，用来确认消息是否成功抵达 RabbitMQ 服务器，当 Broker 接收到生产者发送的消息后，会异步地向生产者发送一个确认（ACK）或否定确认（NACK），
+但前提是在配置文件中开启了生产者确认模式：
+
+```yaml
+spring:
+  rabbitmq:
+    publisher-confirms: true # 老版本配置（已过时）
+    publisher-confirm-type: correlated # 新版本配置（推荐），发送消息时可绑定唯一 CorrelationData
+```
+
+CorrelationData 是实现消息确认与消息实体关联的关键，可以在发送前创建一个 CorrelationData 并为其设置一个唯一 ID（例如订单 ID、UUID），
+然后在 confirm 回调中通过这个 ID 找到对应的原始消息进行后续处理（例如更新数据库状态、重发），如果发送时没传，那它就是 null。
+
+```java
+@PostConstruct
+public void initRabbitTemplate(){
+    // 设置确认回调
+    rabbitTemplate.setConfirmCallback(new RabbitTemplate.ConfirmCallback() {
+        /**
+         * 只要消息抵达 Broker 那么 ack = true
+         * @param correlationData 当前消息的唯一关联数据，可以认为是消息的唯一 ID（例如 UUID）
+         * @param ack 消息是否成功收到
+         * @param cause 失败原因
+         */
+        @Override
+        public void confirm(CorrelationData correlationData, boolean ack, String cause) {
+            System.out.println("confirm correlationData:" + correlationData);
+            System.out.println("confirm ack:" + ack);
+            System.out.println("confirm cause:" + cause);
+        }
+    });
+}
+```
+
+2、消息退回
+
+消息退回机制是用于确认消息是否成功从 Exchange 路由到 Queue，必须在消息成功抵达 Exchange 后却无法根据自身的类型和指定的 routingKey 将消息路由到任何 Queue 时才触发。
+使用的前提也需要设置配置文件，必须将消息的 mandatory 属性设置为 true（告诉 Broker 如果消息不可路由就把它退回）：
+
+```yaml
+spring:
+  rabbitmq:
+    publisher-returns: true # 和 mandatory 配合使用
+    template:
+      mandatory: true # 默认通常是 false，需要显式开启
+```
+
+```java
+@PostConstruct
+public void initRabbitTemplate(){
+    // 设置消息路由失败返回
+    rabbitTemplate.setReturnCallback(new RabbitTemplate.ReturnCallback() {
+        /**
+         * 只要消息没有投递给指定的队列，就触发这个失败回调
+         * @param message 投递失败的消息对象
+         * @param replyCode 回复的状态码
+         * @param replyText 回复的文本内容
+         * @param exchange 发送时指定的交换机
+         * @param routingKey 发送时指定的路由
+         */
+        @Override
+        public void returnedMessage(Message message, int replyCode, String replyText, String exchange, String routingKey) {
+            System.out.println("returnedMessage message:" + message);
+            System.out.println("returnedMessage replyCode:" + replyCode);
+            System.out.println("returnedMessage replyText:" + replyText);
+            System.out.println("returnedMessage exchange:" + exchange);
+            System.out.println("returnedMessage routingKey:" + routingKey);
+        }
+    });
+}
+```
+
+基于确认机制的特性，可以在这两个方法中添加一些业务逻辑：
+
+```java
+@Slf4j
+@Configuration
+public class MyRabbitConfig {
+    /**
+     * 自定义 RabbitTemplate，并设置回调
+     */
+    @Bean
+    public RabbitTemplate rabbitTemplate(org.springframework.amqp.rabbit.connection.ConnectionFactory connectionFactory) {
+        RabbitTemplate rabbitTemplate = new RabbitTemplate(connectionFactory);
+        rabbitTemplate.setMandatory(true);
+      
+        // ConfirmCallback：消息是否到达 Broker
+        rabbitTemplate.setConfirmCallback((correlationData, ack, cause) -> {
+            String id = correlationData != null ? correlationData.getId() : "null";
+            if (ack) {
+                log.info("消息成功抵达Broker, 消息ID: {}", id);
+            } else {
+                log.error("消息未能抵达Broker, 消息ID: {}, 原因: {}", id, cause);
+            }
+        });
+
+        // ReturnsCallback：消息是否路由到队列
+        rabbitTemplate.setReturnsCallback(returned -> {
+            log.error("消息被退回！路由失败。消息体: {}, 交换机: {}, 路由键: {}, 原因: {}",
+                    new String(returned.getMessage().getBody()),
+                    returned.getExchange(),
+                    returned.getRoutingKey(),
+                    returned.getReplyText());
+        });
+        return rabbitTemplate;
+    }
+}
+```
+
+需要注意的是，为了避免循环注入 RabbitTemplate，这里的配置类选择了手动创建 RabbitTemplate，在其它服务类中再自动注入 RabbitTemplate。而一旦手动创建了 RabbitTemplate，
+自动配置的属性不会生效，所以需要在配置类中手动设置 rabbitTemplate.setMandatory(true); 让消息退回机制被触发。如果在配置类中自动注入了 RabbitTemplate，
+其它地方也自动注入了 RabbitTemplate，那么就会造成循环依赖，在以前的 SpringBoot 版本（2.6 以下）是允许循环依赖存在的，但是只后的新版本就默认禁止了，所以只能手动构造，
+并将其返回。这个配置类中的 ConnectionFactory 是 SpringBoot 自动提供的连接工厂，负责和 RabbitMQ 建立连接，也就是类似完成 RabbitTemplate 的初始化一样。
+
+创建一个 Controller 测试一下：
+
+```java
+@RestController
+public class RabbitMQController {
+
+    @Autowired
+    private RabbitTemplate rabbitTemplate; // 注入的是具有确认机制的 RabbitTemplate
+
+    // 正常路由
+    @GetMapping("/sendOk")
+    public String sendOk() {
+        rabbitTemplate.convertAndSend(RabbitConfig.EXCHANGE, RabbitConfig.ROUTING_KEY, "Hello RabbitMQ", new CorrelationData(UUID.randomUUID().toString()));
+        return "消息发送成功（会进入队列）"; // 消息成功抵达Broker, 消息ID: f74dd02c-7ddb-40fc-801d-eb16015ad99a
+    }
+
+    // 路由失败（交换机存在，但 routingKey 不匹配）
+    @GetMapping("/sendFail")
+    public String sendFail() {
+        rabbitTemplate.convertAndSend(RabbitConfig.EXCHANGE, "wrong.key", "Hello RabbitMQ", new CorrelationData(UUID.randomUUID().toString()));
+        return "消息发送失败（会触发 ReturnCallback）"; // 消息成功抵达Broker, 消息ID: 933849a5-a51d-402e-ab1b-56ec52d036a3
+    }
+
+    // 交换机不存在
+    @GetMapping("/sendNoExchange")
+    public String sendNoExchange() {
+        rabbitTemplate.convertAndSend("no.exchange", RabbitConfig.ROUTING_KEY, "Hello RabbitMQ", new CorrelationData(UUID.randomUUID().toString()));
+        return "消息发送失败（会触发 ConfirmCallback，ack=false）";
+        // 消息被退回！路由失败。消息体: Hello RabbitMQ, 交换机: product-confirm-exchange, 路由键: wrong.key, 原因: NO_ROUTE
+        // 消息未能抵达Broker, 消息ID: 609e8464-f73d-4590-9278-035b3bae67aa, 原因: channel error; protocol method: #method<channel.close>(reply-code=404, reply-text=NOT_FOUND - no exchange 'no.exchange' in vhost '/', class-id=60, method-id=40)
+    }
+}
+```
+
+****
+#### 1.4.2 消费者确认
+
+消费者确认机制是 RabbitMQ 确保消息可靠消费的核心机制，当消费者处理完消息后，需要明确告诉 RabbitMQ 消息的处理状态，该机制分为三种状态：手动、自动和无处理：
+
+```yaml
+spring:
+  rabbitmq:
+    listener:
+      simple:
+        acknowledge-mode: none # 不做处理；manual，手动模式；auto，自动模式，也是默认的模式
+```
+
+最推荐使用的就是手动模式，因为自动模式在接收到消息时不会对消息进行选择处理，它会在消费后直接把消息删除，因此手动模式具有更高的可塑性。手动操作有三个方法：
+
+- channel.basicAck(deliveryTag, multiple)：消息确认成功，不重新入队（deliveryTag 是消息的唯一标识符，在channel内唯一，每次消费消息时都会分配新的 deliveryTag），multiple 如果是 false 那就只确认当前 deliveryTag 的消息；如果为 true，那就确认小于等于当前 deliveryTag 的所有未确认消息（批量确认）
+- channel.basicNack(deliveryTag, multiple, requeue)：否定确认，可以一次处理多条消息，requeue=true 时重新入队，requeue=false 时丢弃
+- channel.basicReject(deliveryTag, requeue)：拒绝消息，与 basicNack 相似，但一次只能拒绝单条消息，不能批量
+
+1、确认消息
+
+```java
+@RabbitListener(queues = "order.queue")
+public void handleOrderMessage(Order order, Message message, Channel channel) {
+    try {
+        // 处理业务逻辑
+        // 手动确认消息
+        channel.basicAck(message.getMessageProperties().getDeliveryTag(), false);
+        log.info("消息确认成功: {}", order.getId());
+    } catch (Exception e) {
+        log.error("处理消息失败: {}", e.getMessage());
+    }
+}
+```
+
+2、否定确认
+
+```java
+@RabbitListener(queues = "order.queue")
+public void handleOrderMessage(Order order, Message message, Channel channel) throws IOException {
+    try {
+        channel.basicAck(message.getMessageProperties().getDeliveryTag(), false);
+    } catch (XxxException e) {
+        // 否定确认，不重新入队
+        channel.basicNack(message.getMessageProperties().getDeliveryTag(), false, false);
+        log.error("业务异常，消息丢弃: {}", e.getMessage());
+    } catch (ZzzException e) {
+        // 否定确认，重新入队（可设置重试次数）
+        if (getRetryCount(message) < MAX_RETRIES) {
+            channel.basicNack(message.getMessageProperties().getDeliveryTag(), false, true);
+            log.warn("临时异常，消息重新入队，重试次数: {}", getRetryCount(message));
+        } else {
+            channel.basicNack(message.getMessageProperties().getDeliveryTag(), false, false);
+            log.error("超过最大重试次数，消息丢弃");
+        }
+    }
+}
+```
+
+3、拒绝消息
+
+```java
+@RabbitListener(queues = "order.queue")
+public void handleOrderMessage(Order order, Message message, Channel channel) throws IOException {
+    try {
+        if (!isValidOrder(order)) {
+            // 拒绝消息，不重新入队
+            channel.basicReject(message.getMessageProperties().getDeliveryTag(), false);
+            log.warn("拒绝无效订单: {}", order.getId());
+            return;
+        }
+        channel.basicAck(message.getMessageProperties().getDeliveryTag(), false);
+    } catch (Exception e) {
+        // 拒绝消息，并重新入队
+        channel.basicReject(message.getMessageProperties().getDeliveryTag(), true);
+        log.error("处理失败，消息重新入队: {}", e.getMessage());
+    }
+}
+```
+
+定义一个配置类，用来手动确认消息，当然也不一定要写在配置类中，也可以定义在 Service 中，这里写在配置类里只是为了统一处理。
+
+```java
+@Slf4j
+@Component
+public class RabbitConsumer {
+    @RabbitListener(queues = RabbitConfig.QUEUE)
+    public void handleMessage(String msg, Message message, Channel channel) throws IOException {
+        long deliveryTag = message.getMessageProperties().getDeliveryTag();
+        try {
+            log.info("收到消息: {}", msg);
+            // 模拟业务逻辑异常
+            if (msg.contains("Fail")) {
+                throw new RuntimeException("模拟处理失败");
+            }
+            // 手动确认
+            channel.basicAck(deliveryTag, false);
+            log.info("消息确认成功");
+        } catch (Exception e) {
+            log.error("处理消息失败: {}", e.getMessage());
+            // 否定确认，不重新入队
+            channel.basicNack(deliveryTag, false, false);
+            // channel.basicReject(deliveryTag, false);
+        }
+    }
+}
+```
+
+这里模拟发送一条错误信息，它会在被消费者消费前就被拦截，然后被手动拒绝，此时消费者会直接丢弃它，
+
+```java
+// 模拟手动确认
+@GetMapping("/sendMessageContainFail")
+public String sendMessageContainFail() {
+    rabbitTemplate.convertAndSend(RabbitConfig.EXCHANGE, RabbitConfig.ROUTING_KEY, "Fail", new CorrelationData(UUID.randomUUID().toString()));
+    return "发送包含 Fail 字段的消息"; // 处理消息失败: 模拟处理失败
+}
+```
+
+****
 
 
 
