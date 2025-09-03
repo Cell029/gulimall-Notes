@@ -28,7 +28,6 @@ public class CartInterceptor implements HandlerInterceptor {
         if (memberResponseVo != null) {
             // 用户登录
             loginUserInfoTo.setUserId(memberResponseVo.getId());
-
         }
 
         // 不管未登录还是登录，都设置 user-key

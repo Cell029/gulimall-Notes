@@ -1,0 +1,28 @@
+package com.project.gulimall.order.config;
+
+import com.project.gulimall.order.config.ThreadPoolConfigProperties;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+
+@Configuration
+@EnableConfigurationProperties(ThreadPoolConfigProperties.class)
+public class MyThreadConfig {
+    @Bean
+    public ThreadPoolExecutor threadPoolExecutor(ThreadPoolConfigProperties threadPoolConfigProperties) {
+        return new ThreadPoolExecutor(
+                threadPoolConfigProperties.getCorePoolSize(), // 20
+                threadPoolConfigProperties.getMaxPoolSize(), // 200
+                threadPoolConfigProperties.getKeepAliveTime(), // 10
+                TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(100000),
+                Executors.defaultThreadFactory(),
+                new ThreadPoolExecutor.AbortPolicy()
+        );
+    }
+}

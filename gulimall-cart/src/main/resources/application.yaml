@@ -24,5 +24,9 @@ gulimall:
     max-pool-size: 200
     keep-alive-time: 10
 
+
 #server:
+logging:
+  level:
+    com.project.gulimall.cart: debug
 #  port: 10000

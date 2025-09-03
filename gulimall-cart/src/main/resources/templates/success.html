@@ -25,7 +25,7 @@
         </ul>
 
         <ul class="hd_wrap_right">
-            <li>
+            <li style="width: 100px">
                 <a th:if="${session.loginUser == null}"
                    href="http://auth.gulimall.com/login.html">
                     你好，请登录
@@ -42,8 +42,8 @@
                     免费注册
                 </a>
                 <span th:if="${session.loginUser != null}" class="li_2 disabled">
-								   已注册
-								</span>
+                   已注册
+                </span>
             </li>
             <li class="spacer"></li>
 

@@ -5,6 +5,7 @@ import com.project.common.utils.PageUtils;
 import com.project.gulimall.product.domain.entity.SkuInfoEntity;
 import com.project.gulimall.product.domain.vo.SkuItemVo;
 
+import java.math.BigDecimal;
 import java.util.List;
 import java.util.Map;
 
@@ -22,5 +23,7 @@ public interface SkuInfoService extends IService<SkuInfoEntity> {
     List<SkuInfoEntity> getSkusBySpuId(Long spuId);
 
     SkuItemVo item(Long skuId);
+
+    Map<Long, BigDecimal> getCurrentCartItemPriceMap(List<Long> skuIds);
 }
 

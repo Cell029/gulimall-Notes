@@ -12,6 +12,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -158,6 +159,16 @@ public class SkuInfoServiceImpl extends ServiceImpl<SkuInfoDao, SkuInfoEntity> i
             throw new RuntimeException(e);
         }
         return skuItemVo;
+    }
+
+    @Override
+    public Map<Long, BigDecimal> getCurrentCartItemPriceMap(List<Long> skuIds) {
+        HashMap<Long, BigDecimal> priceMap = new HashMap<>();
+        for (Long skuId : skuIds) {
+            SkuInfoEntity skuInfoEntity = getById(skuId);
+            priceMap.put(skuInfoEntity.getSkuId(), skuInfoEntity.getPrice());
+        }
+        return priceMap;
     }
 
 }

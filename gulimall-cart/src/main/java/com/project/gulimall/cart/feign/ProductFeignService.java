@@ -2,11 +2,11 @@ package com.project.gulimall.cart.feign;
 
 import com.project.common.utils.R;
 import org.springframework.cloud.openfeign.FeignClient;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.PathVariable;
-import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.*;
 
+import java.math.BigDecimal;
 import java.util.List;
+import java.util.Map;
 
 @FeignClient("gulimall-product")
 public interface ProductFeignService {
@@ -15,4 +15,10 @@ public interface ProductFeignService {
 
     @GetMapping("/product/skusaleattrvalue/stringlist/{skuId}")
     List<String> getSkuSaleAttrValueList(@PathVariable("skuId") Long skuId);
+
+    /**
+     * 查询最新的商品价格
+     */
+    @GetMapping("/product/skuinfo/getCurrentCartItemPriceMap")
+    Map<Long, BigDecimal> getCurrentCartItemPriceMap(@RequestParam("skuIds") List<Long> skuIds);
 }

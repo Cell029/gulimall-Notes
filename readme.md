@@ -14714,6 +14714,645 @@ public String sendMessageContainFail() {
 ```
 
 ****
+## 2. 订单服务环境搭建
+
+把静态资源放进 nginx 容器，并部署本地 hosts 与网关：
+
+```shell
+cp -r /mnt/d/docker_dataMountDirectory/gmall-static-resource/order/detail/. /nginx/html/static/order/detail/
+cp -r /mnt/d/docker_dataMountDirectory/gmall-static-resource/order/list/. /nginx/html/static/order/list/
+cp -r /mnt/d/docker_dataMountDirectory/gmall-static-resource/order/confirm/. /nginx/html/static/order/confirm/
+cp -r /mnt/d/docker_dataMountDirectory/gmall-static-resource/order/pay/. /nginx/html/static/order/pay/
+```
+
+```xml
+192.168.1.110 order.gulimall.com
+```
+
+```yaml
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: nginx_order_route
+            uri: lb://gulimall-order
+            predicates:
+              - Host=order.gulimall.com
+```
+
+配置一个动态的跳转层：
+
+```java
+@Controller
+public class IndexController {
+    @GetMapping("/{page}.html")
+    public String index(@PathVariable("page") String page, Model model) {
+        return page;
+    }
+}
+```
+
+配置 Session 服务，引入相关依赖和配置项：
+
+```xml
+<!--redis-->
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-data-redis</artifactId>
+</dependency>
+
+<!--spring session-->
+<dependency>
+  <groupId>org.springframework.session</groupId>
+  <artifactId>spring-session-data-redis</artifactId>
+</dependency>
+```
+
+```yaml
+spring:
+  session:
+    store-type: redis
+    timeout: 30m
+```
+
+最后就是处理各种跳转链接...
+
+****
+## 3. 订单
+
+### 3.1 基本概念
+
+订单服务在电商系统中的核心定位是：管理从用户下单到订单最终完成或关闭的整个生命周期，它不直接处理库存、支付或物流，而是作为协调者，通过调用或响应其他服务，
+以此来驱动整个订单流程的进行，该服务模块主要负责：
+
+- 订单生成：在点击结算按钮后将购物车中的商品转化为正式订单
+- 订单管理：提供订单的增、删、改、查功能，尤其是对状态的追踪管理
+- 流程协调：与支付、库存、物流、用户等服务交互，确保订单流程正确执行
+- 数据聚合：聚合商品信息、用户地址、支付信息、物流信息等，形成一张完整的订单视图
+
+订单的常见状态有：
+
+- 待付款：订单刚创建，等待用户支付，通常有倒计时（如30分钟），超时则自动取消
+- 已付款/待发货：支付成功，等待系统审核和仓库发货
+- 已发货/待收货：商家已发货，物流运输中，用户可查看物流跟踪
+- 交易成功：用户确认收货或超时自动确认收货，订单完成，进入售后阶段
+- 交易关闭：订单最终结束状态，包括用户主动取消、超时未支付、售后完成后关闭等
+- 退款/售后中：中间状态，表示订单正在处理售后申请
+
+订单业务的整体流程大致为：
+
+1、创建订单
+
+用户在购物车或商品页点击购买或结算等相关按钮，前端就需要将用户选择的商品 sku、购买数量、收货地址以及可能的优惠券等信息封装成一个请求，发送给订单服务的创建接口。
+当订单服务接收到请求后，会调用购物车服务或商品服务，获取这些商品的实时详细信息，如当前价格、标题、图片、规格等，并且还要检查这些商品是否有效（是否有库存），
+结算时也要计算好优惠金额。既然是订单服务，那就设计库存扣减，库存服务应该将用户要购买的商品数量从可用库存中减去，并放入预扣库存中，以此防止其他用户同时购买相同的商品而导致超卖，
+当然预扣库存肯定需要设置有效期，不能一直占用而不付款，超时未付则需要把它的库存重新写回可用库存中。最后生成订单数据，并执行支付服务。
+
+2、订单支付与回调
+
+用户在支付平台（如支付宝、微信）完成支付后，支付平台会通过一个回调接口异步地将支付结果通知到上架的支付服务，支付服务接收到通知后，先要验证签名的有效性，防止伪造的恶意请求。
+当验证通过后，才更新支付流水状态为成功。当支付成功后执行扣减库存与优惠卷的服务，此时通常也会通知物流等服务开始运行。
+
+****
+### 3.2 订单登录拦截
+
+在对购物车中的商品进行结算时会跳转到订单确认页面，如果想要成功跳转，那就必须是处于已登录的状态，否则就会跳转到登录页面进行登录，而之前做过未登录用户的购物车合并功能，
+所以此时跳转到登录页面并不会造成数据的丢失。要完成这个功能，那就得配置一个拦截器对当前是否登录进行拦截订单服务的所有请求，如果没登录就让它进行重定向跳转，如果登录了，
+那就把用户信息保存到 ThreadLocal，供后续该服务的使用。
+
+```java
+@Component
+public class LoginUserInterceptor implements HandlerInterceptor {
+
+    public static ThreadLocal<MemberResponseVo> threadLocal = new ThreadLocal<>();
+
+    @Override
+    public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) throws Exception {
+        MemberResponseVo loginUser = (MemberResponseVo) request.getSession().getAttribute("loginUser");
+        if (loginUser != null) {
+            threadLocal.set(loginUser);
+            return true;
+        } else {
+            // 没登录就去登录
+            request.getSession().setAttribute("noLoginMsg", "请先进行登录!");
+            response.sendRedirect("http://auth.gulimall.com/login.html");
+            return false;
+        }
+    }
+}
+```
+
+前面有记录过，要想让拦截器生效拦截链接，那就需要实现一个 WebMvcConfigurer 并添加拦截路径：
+
+```java
+@Configuration
+public class OrderWebConfig implements WebMvcConfigurer {
+
+    @Autowired
+    private LoginUserInterceptor loginUserInterceptor;
+
+    @Override
+    public void addInterceptors(InterceptorRegistry registry) {
+        registry.addInterceptor(loginUserInterceptor).addPathPatterns("/**");
+    }
+}
+```
+
+前端则显示一下拦截器存入域中的信息：
+
+```html
+<div class="si_top">
+    <p>
+        <span>谷粒商城不会以任何理由要求您转账汇款，谨防诈骗。</span>
+        <br/>
+        <span th:if="${session.noLoginMsg != null}" style="color: red">[[${session.noLoginMsg}]]</span>
+    </p>
+</div>
+```
+
+****
+### 3.3 订单确认页模型与数据获取封装
+
+在订单确认页通常需要展示当前用户的所有收货地址、已勾选的购物项、可用权益（积分、优惠券、账户余额等）、商品金额等信息。因此收货地址和已选购物项是用集合来接收的。
+
+```java
+@Data
+public class MemberAddressVo implements Serializable {
+    private static final long serialVersionUID = 1L;
+    /**
+     * id
+     */
+    @TableId
+    private Long id;
+    /**
+     * member_id
+     */
+    private Long memberId;
+    /**
+     * 收货人姓名
+     */
+    private String name;
+    /**
+     * 电话
+     */
+    private String phone;
+    /**
+     * 邮政编码
+     */
+    private String postCode;
+    /**
+     * 省份/直辖市
+     */
+    private String province;
+    /**
+     * 城市
+     */
+    private String city;
+    /**
+     * 区
+     */
+    private String region;
+    /**
+     * 详细地址(街道)
+     */
+    private String detailAddress;
+    /**
+     * 省市区代码
+     */
+    private String areacode;
+    /**
+     * 是否默认
+     */
+    private Integer defaultStatus;
+}
+```
+
+```java
+@Data
+public class OrderItemVo {
+    private Long skuId;
+    private String title;
+    private String image;
+    private List<String> skuAttr;
+    private BigDecimal price;
+    private Integer count;
+    private BigDecimal totalPrice;
+}
+```
+
+购物项的模型设计其实就是用的原有的 CartItem 模型，只不过这里不需要 check 字段以及手动编写的 setter/getter 方法，因为这些数据后续会通过远程调用拿到，然后直接赋值即可。
+当然目前的确认页的模型结构只是简单的构建一下，还有很多字段例如发票、一次性令牌等还未封装。而关于金额的一些字段，则是直接在类中进行动态封装，如果不在这里进行封装，
+那么后面多次设计金额的操作就都需要写一遍计算的代码，过于麻烦，不如直接这样写，到时候还不需要给这个字段赋值，只要调用该方法则会自动计算。
+
+```java
+@Data
+public class OrderConfirmVo {
+    // 收货地址，表 ums_member_receive_address
+    List<MemberAddressVo> address;
+
+    // 所有选中的购物项
+    List<OrderItemVo> items;
+
+    // 积分
+    Integer integration;
+
+    // 订单总额
+    public BigDecimal getTotal() {
+        BigDecimal bigDecimal = new BigDecimal("0.00");
+        if(!items.isEmpty()) {
+            for (OrderItemVo item : items) {
+                bigDecimal = bigDecimal.add(item.getPrice().multiply(new BigDecimal(item.getCount().toString())));
+            }
+        }
+        return bigDecimal;
+    }
+  
+    // 应付价格
+    public BigDecimal getPayPrice() {
+        return getTotal();
+    }
+  
+    // 防重令牌
+    private String orderToken;
+}
+```
+
+在购物车页面点击结算按钮时会发送一个请求，这个请求会跳转到订单确认页面：
+
+```html
+<div>
+    <button onclick="toTrade()" type="button">去结算</button>
+</div>
+```
+
+```js
+function toTrade() {
+    window.location.href = "http://order.gulimall.com/toTrade";
+}
+```
+
+而后端需要处理的就是将确认页面需要的数据封装好并放入域中供前端获取。
+
+Controller 层：
+
+```java
+@GetMapping("/toTrade")
+public String toTrade(Model model) {
+    OrderConfirmVo orderConfirmVo = orderService.confirmOrder();
+    model.addAttribute("orderConfirmData", orderConfirmVo);
+    return "confirm";
+}
+```
+
+Service 层：
+
+目前需要封装的数据只有三个，登录用户的收获地址、购物车中选中的购物项、用户积分，下单时的金额在构建确认订单模型时已设置动态获取，因此这里不需要特别给它赋值。其中前两个需要远程调用，
+而用户积分在登录时就把当前用户的所有信息放进了 session 域中，所以从 session 中获取即可。
+
+```java
+@Override
+public OrderConfirmVo confirmOrder() {
+    OrderConfirmVo orderConfirmVo = new OrderConfirmVo();
+    MemberResponseVo memberResponseVo = LoginUserInterceptor.threadLocal.get();
+    // 1. 远程查询当前用户的所有收获地址
+    List<MemberAddressVo> address = memberFeignService.getAddressByUserId(memberResponseVo.getId());
+    // 2. 远程查询购物项信息
+    List<OrderItemVo> items = cartFeignService.getCurrentUserCartItems(memberResponseVo.getId());
+    // 3. 查询用户积分
+    Integer integration = memberResponseVo.getIntegration();
+
+    orderConfirmVo.setAddress(address);
+    orderConfirmVo.setItems(items);
+    orderConfirmVo.setIntegration(integration);
+    // 4. 总价在实体类中自动计算，这里无需赋值
+
+    // 5. TODO 防重令牌的添加
+
+    return orderConfirmVo;
+}
+```
+
+获取登录用户的所有收获地址较为简单，传递当前登录用户的 id 再查询表 ums_member_receive_address 该 id 关联的数据即可。
+
+```java
+@FeignClient("gulimall-member")
+public interface MemberFeignService {
+    @GetMapping("/member/memberreceiveaddress/{memberId}/address")
+    List<MemberAddressVo> getAddressByUserId(@PathVariable Long memberId);
+}
+```
+
+```java
+@Override
+public List<MemberReceiveAddressEntity> getAddressByUserId(Long memberId) {
+    return list(new LambdaQueryWrapper<MemberReceiveAddressEntity>().eq(MemberReceiveAddressEntity::getMemberId, memberId));
+}
+```
+
+远程调用查询该用户选中的购物项也是传递一个登录用户的 id 即可。
+
+```java
+@FeignClient("gulimall-cart")
+public interface CartFeignService {
+    @GetMapping("/{userId}/getCurrentUserCartItems")
+    List<OrderItemVo> getCurrentUserCartItems(@PathVariable Long userId);
+}
+```
+
+不过这里采取的是存入 ThreadLocal 中的用户信息来查询购物项，为什么要多此一举，后面会记录。因为购物项的数据都是保存在 Redis 中的，所以需要调用查询 Redis 的方法，
+而在封装购物项的功能时整好写了批量获取所有数据的方法，这里直接调用即可。当然不能直接把从 Redis 中获取到的数据直接返回，毕竟是存入缓存中的数据，难免有非一致的情况出现，
+所以商品的价格必须要是最新的，因此得额外调用一个远程服务来查询 sku 的最新价格，也就是存入数据库中的那个。这里选择的是用一个 Map 集合接收远程调用的方法返回的数据，
+因为只需要最新的价格信息，所以用 skuId 作为 key，price 作为 value。然后根据当前遍历的 CartItem 对象依次重置 price 字段，当然这里只需要被选中的购物项，
+所以只需要 check 字段为 true 的 CartItem。
+
+```java
+@Override
+public List<CartItem> getCurrentUserCartItems(Long userId) {
+    LoginUserInfoTo currentUserInfo = CartInterceptor.threadLocal.get();
+    if (currentUserInfo.getUserId() == null) {
+        return null;
+    } else {
+        if (currentUserInfo.getUserId().equals(userId)) {
+            String userCartKey = CartConstant.CART_PREFIX + currentUserInfo.getUserId();
+            List<CartItem> cartItems = getCartItems(userCartKey);
+            // 远程调用 product 服务查询最新的价格
+            List<Long> skuIds = new ArrayList<>();
+            cartItems.forEach((cartItem) -> {
+                skuIds.add(cartItem.getSkuId());
+            });
+            Map<Long, BigDecimal> currentCartItemPriceMap = productFeignService.getCurrentCartItemPriceMap(skuIds);
+            return cartItems.stream()
+                    .filter(cartItem -> cartItem.getCheck() == true)
+                    .map(cartItem -> {
+                        // 更新为最新价格
+                        cartItem.setPrice(currentCartItemPriceMap.get(cartItem.getSkuId()));
+                        return cartItem;
+                    })
+                    .collect(Collectors.toList());
+        } else {
+            return null;
+        }
+    }
+}
+```
+
+这里的远程调用就是依次遍历 skuId 取到 SkuInfoEntity 对象，从中取出 price 字段封装进 map 集合并返回：
+
+```java
+@GetMapping("/product/skuinfo/getCurrentCartItemPriceMap")
+Map<Long, BigDecimal> getCurrentCartItemPriceMap(@RequestParam("skuIds") List<Long> skuIds);
+```
+
+```java
+@Override
+public Map<Long, BigDecimal> getCurrentCartItemPriceMap(List<Long> skuIds) {
+    HashMap<Long, BigDecimal> priceMap = new HashMap<>();
+    for (Long skuId : skuIds) {
+        SkuInfoEntity skuInfoEntity = getById(skuId);
+        priceMap.put(skuInfoEntity.getSkuId(), skuInfoEntity.getPrice());
+    }
+    return priceMap;
+}
+```
+
+****
+### 3.4 Feign 远程调用丢失请求头问题
+
+经过 debug 测试，发现上述代码的远程调用中，只能获取到当前用户的所有收货地址信息，购物项数据返回的则是 null，这就涉及到远程调用丢失请求头的问题了，
+因为远程查询购物项数据时使用的 userId 并不是 Order 服务传递过去的，而是用的 Cart 服务在拦截器配置中存入 ThreadLocal 的用户信息：
+
+```java
+HttpSession session = new HttpServletRequest().getSession();
+MemberResponseVo memberResponseVo = (MemberResponseVo) session.getAttribute(LoginConstant.LOGIN_USER);
+```
+
+可以看到这里是从 HttpServletRequest 中获取到 HttpSession，再从 session 中找到相同名称的 cookie 然后强转为 MemberResponseVo。这就引出了问题所在，
+HttpSession 是从请求头中获取到 session 的，如果传递的请求头是空的，那肯定获取不到用户信息，修改一下 Controller 层，看请求头中是否有 session：
+
+```java
+@ResponseBody
+@GetMapping("/{userId}/getCurrentUserCartItems")
+public List<CartItem> getCurrentUserCartItems(@PathVariable Long userId, HttpServletRequest request) {
+    Map<String, String> headers = Collections.list(request.getHeaderNames()).stream()
+            .collect(Collectors.toMap(
+                    name -> name,
+                    request::getHeader
+            ));
+    log.debug("Incoming headers: {}", headers);
+    return cartService.getCurrentUserCartItems(userId);
+}
+```
+
+从打印结果来看，请求头中确实没包含 session：
+
+```text
+Incoming headers: {host=192.168.0.112:30000, connection=keep-alive, accept=*/*, user-agent=Java/17.0.1}
+```
+
+先给一个结论：Feign 的核心设计理念是声明式的 HTTP 客户端，它的职责是根据定义的接口声明和参数，独立地构建一个完整的、符合 HTTP 协议的请求，然后发送出去。也就是说，
+它发送的是一个全新的、只确保能正确执行控制层方法的请求，所以请求头中没有之前自定义的 GULISESSION 等数据。
+
+Feign 的构建与执行过程：
+
+1、Feign Client 的代理生成
+
+当使用 @FeignClient 注解一个接口时，Spring 在启动时会为这个接口创建一个动态代理对象，而 SpringCloud 会通过一个 FeignClientFactoryBean 来创建 Feign Client 的实例。
+在这个 FeignClientFactoryBean 类中就会创建一个 Feign 的代理对象：
+
+```java
+<T> T getTarget() {
+    Targeter targeter = (Targeter)this.get(context, Targeter.class);
+    return (T)targeter.target(this, builder, context, new Target.HardCodedTarget(this.type, this.name, url));
+}
+```
+
+最终调用 ReflectiveFeign 的 newInstance() 方法进行创建代理对象，这个代理对象就是 @Autowired 进来的那个 Client（）：
+
+```java
+@Autowired
+private CartFeignService cartFeignService;
+```
+
+```java
+public <T> T newInstance(Target<T> target) {
+    InvocationHandler handler = this.factory.create(target, methodToHandler);
+    T proxy = (T)Proxy.newProxyInstance(target.type().getClassLoader(), new Class[]{target.type()}, handler);
+    for(DefaultMethodHandler defaultMethodHandler : defaultMethodHandlers) {
+        defaultMethodHandler.bindTo(proxy);
+    }
+    return proxy;
+}
+```
+
+所以 Feign 接口只是一个工具，它没有实现类，接口只声明了方法和映射关系，并不能直接发送 HTTP 请求，如果：
+
+```java
+MemberFeignService service = new MemberFeignService(); // 编译错误
+```
+
+而 Feign 使用了代理对象，代理对象会在方法调用时做拦截，构造 HTTP 请求、发给远程服务，然后解析响应。而 Feign 之所以不设置实现类，是因为微服务中会大量调用远程服务，
+如果每次调用都生成一个实现类，那就会导致生成多个重复的实现类。
+
+2、代理调用方法
+
+当进入远程调用的方法时，Feign 的动态代理会把接口方法调用映射到 ReflectiveFeign 的 invoke() 方法，它不会处理 equals, hashCode, toString 方法，
+其余方法进入 SynchronousMethodHandler：
+
+```java
+public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+    if (!"equals".equals(method.getName())) {
+        if ("hashCode".equals(method.getName())) {
+            return this.hashCode();
+        } else {
+            return "toString".equals(method.getName()) ? this.toString() : ((InvocationHandlerFactory.MethodHandler)this.dispatch.get(method)).invoke(args);
+        }
+    } 
+    ...
+}
+```
+
+最终它会进入 SynchronousMethodHandler.invoke(Object[] argv) 方法，它会先把方法名、注解、和调用参数（argv）转换成一个 RequestTemplate，
+这个 RequestTemplate 就是 Feign 用来描述即将发送请求的中间模型，executeAndDecode 是核心方法，就是由它负责发起 HTTP 调用并处理响应：
+
+```java
+public Object invoke(Object[] argv) throws Throwable {
+    RequestTemplate template = this.buildTemplateFromArgs.create(argv);
+    ...
+    while(true) {
+        try {
+            return this.executeAndDecode(template, options);
+        } catch (RetryableException var9) {
+          ....
+        }
+    }
+}
+```
+
+它会先把 RequestTemplate 转换为真正的 Request，这个 Request 就包含 URL、headers、body，this.client.execute(request, options) 就是真正向远程服务发起网络请求，
+在 execute() 方法里，它每次发送请求都会创建一个新的 HttpURLConnection，所以每次的请求都是一个新的不包含自定义属性的 HTTP 请求。
+
+```java
+Object executeAndDecode(RequestTemplate template, Request.Options options) throws Throwable {
+    Request request = this.targetRequest(template);
+    if (this.logLevel != Level.NONE) {
+        this.logger.logRequest(this.metadata.configKey(), this.logLevel, request);
+    }
+    long start = System.nanoTime();
+    Response response;
+    try {
+        response = this.client.execute(request, options);
+        response = response.toBuilder().request(request).requestTemplate(template).build();
+    } catch (IOException var13) {
+        ...
+    }
+    ...
+}
+```
+
+而在 targetRequest() 方法里，所有的 RequestInterceptor 都会被依次调用，它的核心作用就是在请求被发送前，对请求模板 RequestTemplate 注入或修改信息：
+
+```java
+Request targetRequest(RequestTemplate template) {
+    for(RequestInterceptor interceptor : this.requestInterceptors) {
+        interceptor.apply(template);
+    }
+    return this.target.apply(template);
+}
+```
+
+通过 debug 发现，如果没有自定义 RequestTemplate 模板的话，requestInterceptors 的长度就是 0，也就是说默认情况下 this.requestInterceptors 是空集合，
+此时请求就会走默认逻辑，不加额外 header、参数或者签名。而 RequestInterceptor.apply(template) 方法中的 template 参数，
+是一个指向原始 RequestTemplate 对象的引用（地址），而 interceptor.apply(template) 中的 apply() 是一个 void 类型的方法，也就是说它没有返回值，
+那么关于 RequestTemplate 的修改操作都是直接作用在 RequestTemplate 上的。
+
+最后对 url 进行解析，this.url() 返回的是服务名，例如这里的 "gulimall-cart"，input.target("gulimall-cart") 这个方法内部会做一件至关重要的事情，
+它利用 Spring Cloud 的服务发现功能将服务名 "gulimall-cart" 解析成一个具体的实例地址，比如 http://192.168.1.112:9000 。然后再将基础地址和相对路径拼接起来，
+形成完整 url。
+
+```java
+public Request apply(RequestTemplate input) {
+    // 检查当前RequestTemplate中的URL是否已经是绝对路径（以"http"开头）
+    if (input.url().indexOf("http") != 0) {
+        input.target(this.url()); 
+    }
+    return input.request();
+}
+```
+
+所以，上面解释了为什么远程调用时请求头中为什么不包含之前自定义的 session 等信息，因为它会生成一个新的 HTTP 请求，该请求和原来的 HttpServletRequest 并不是同一个，
+而是一个全新的，所以内部调用方法时会自动携带上浏览器中的 session，而远程调用方法时无法携带。想要解决这个问题，那么就可以从上面提到的 RequestInterceptor 入手，
+因为默认的 RequestInterceptor 集合是空的，所以需要自定义 RequestInterceptor，上面也记录了，在 Feign 发送请求前会依次调用 RequestInterceptor，
+因此，可以让这个 RequestInterceptor 给新建的 HTTP 请求携带上 Cookie 信息，而 Cookie 可以从发起远程调用的那个服务中获取。
+
+Spring 会在每个 HTTP 请求线程里保存当前请求上下文（ThreadLocal），而 RequestContextHolder 本身就是封装了 ThreadLocal 的工具类，
+getRequestAttributes() 方法返回的类型是 RequestAttributes，这是一个接口，封装了与当前请求相关的属性（Headers、参数、Session 等）。
+
+```java
+@Nullable
+public static RequestAttributes getRequestAttributes() {
+    RequestAttributes attributes = (RequestAttributes)requestAttributesHolder.get();
+    if (attributes == null) {
+        attributes = (RequestAttributes)inheritableRequestAttributesHolder.get();
+    }
+    return attributes;
+}
+```
+
+```java
+public interface RequestAttributes {
+    int SCOPE_REQUEST = 0;
+    int SCOPE_SESSION = 1;
+    String REFERENCE_REQUEST = "request"; // 表示请求作用域
+    String REFERENCE_SESSION = "session"; // 表示会话作用域
+
+    @Nullable
+    Object getAttribute(String var1, int var2); // 获取指定作用域（request/session）下的属性
+
+    void setAttribute(String var1, Object var2, int var3); // 设置指定作用域下的属性
+
+    void removeAttribute(String var1, int var2);
+
+    String[] getAttributeNames(int var1);
+
+    void registerDestructionCallback(String var1, Runnable var2, int var3);
+
+    @Nullable
+    Object resolveReference(String var1);
+
+    String getSessionId();
+
+    Object getSessionMutex();
+}
+```
+
+而这里把 RequestAttributes 强转为 ServletRequestAttributes，因为 ServletRequestAttributes 实现了 RequestAttributes 接口，但该实现类提供了额外的方法，
+getRequest() 和 getResponse()，通过 getRequest() 就能直接拿到 HttpServletRequest，HttpServletRequest 代表客户端发过来的 HTTP 请求，
+每个请求都会对应一个独立的 HttpServletRequest 对象，它封装了请求中的所有信息，包括：URL、请求方法、请求头、请求参数等。
+所以先通过请求上下文对象拿到当前调用远程服务的请求(HttpServletRequest)，然后再从该请求中拿到 Cookie 数据，最后添加进 Feign 的请求头里，
+这样即使 Feign 每次都会创建一个全新的 HTTP 也能携带上原请求的 Cookie 数据。
+
+```java
+@Configuration
+public class GuliFeignConfig {
+    @Bean("requestInterceptor")
+    public RequestInterceptor requestInterceptor() {
+        return new RequestInterceptor() {
+            public void apply(RequestTemplate requestTemplate) {
+                // 1. 使用 RequestContextHolder 拿到刚进来的请求数据
+                ServletRequestAttributes requestAttributes = (ServletRequestAttributes) RequestContextHolder.getRequestAttributes();
+                HttpServletRequest request = requestAttributes.getRequest();
+                // 2. 同步请求头信息
+                String cookie = request.getHeader("Cookie");
+                // 3. 给新请求同步老请求的 cookie
+                requestTemplate.header("Cookie", cookie);
+            }
+        };
+    }
+}
+```
+
+****
+
 
 
 

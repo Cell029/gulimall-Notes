@@ -5,6 +5,7 @@ import com.alibaba.fastjson.TypeReference;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.project.common.constant.CartConstant;
+import com.project.common.to.CartItemConfirmTo;
 import com.project.common.utils.R;
 import com.project.gulimall.cart.domain.to.LoginUserInfoTo;
 import com.project.gulimall.cart.domain.vo.Cart;
@@ -14,13 +15,17 @@ import com.project.gulimall.cart.feign.ProductFeignService;
 import com.project.gulimall.cart.interceptor.CartInterceptor;
 import com.project.gulimall.cart.service.CartService;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.BeanUtils;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.autoconfigure.AutoConfigurationPackage;
 import org.springframework.data.redis.core.BoundHashOperations;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
+import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -38,6 +43,7 @@ public class CartServiceImpl implements CartService {
     private ThreadPoolExecutor threadPoolExecutor;
     @Autowired
     private ObjectMapper objectMapper;
+
 
 
     @Override
@@ -180,6 +186,36 @@ public class CartServiceImpl implements CartService {
     public void deleteItem(Long skuId) {
         BoundHashOperations<String, Object, Object> cartOps = getCartOps();
         cartOps.delete(skuId.toString());
+    }
+
+
+    @Override
+    public List<CartItem> getCurrentUserCartItems(Long userId) {
+        LoginUserInfoTo currentUserInfo = CartInterceptor.threadLocal.get();
+        if (currentUserInfo.getUserId() == null) {
+            return null;
+        } else {
+            if (currentUserInfo.getUserId().equals(userId)) {
+                String userCartKey = CartConstant.CART_PREFIX + currentUserInfo.getUserId();
+                List<CartItem> cartItems = getCartItems(userCartKey);
+                // 远程调用 product 服务查询最新的价格
+                List<Long> skuIds = new ArrayList<>();
+                cartItems.forEach((cartItem) -> {
+                    skuIds.add(cartItem.getSkuId());
+                });
+                Map<Long, BigDecimal> currentCartItemPriceMap = productFeignService.getCurrentCartItemPriceMap(skuIds);
+                return cartItems.stream()
+                        .filter(cartItem -> cartItem.getCheck() == true)
+                        .map(cartItem -> {
+                            // 更新为最新价格
+                            cartItem.setPrice(currentCartItemPriceMap.get(cartItem.getSkuId()));
+                            return cartItem;
+                        })
+                        .collect(Collectors.toList());
+            } else {
+                return null;
+            }
+        }
     }
 
     private List<CartItem> getCartItems(String cartKey) {
