@@ -4,7 +4,7 @@
 <mapper namespace="com.project.gulimall.order.dao.OrderItemDao">
 
 	<!-- 可根据自己的需求，是否要使用 -->
-    <resultMap type="com.project.gulimall.order.entity.OrderItemEntity" id="orderItemMap">
+    <resultMap type="com.project.gulimall.order.domain.entity.OrderItemEntity" id="orderItemMap">
         <result property="id" column="id"/>
         <result property="orderId" column="order_id"/>
         <result property="orderSn" column="order_sn"/>

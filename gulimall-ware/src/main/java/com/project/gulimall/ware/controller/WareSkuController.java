@@ -28,7 +28,6 @@ public class WareSkuController {
     // @RequiresPermissions("ware:waresku:list")
     public R list(@RequestParam Map<String, Object> params){
         PageUtils page = wareSkuService.queryPage(params);
-
         return R.ok().put("page", page);
     }
 
@@ -36,7 +35,7 @@ public class WareSkuController {
      * 查询 sku 是否有库存
      */
     @GetMapping("/haveStock")
-    public R getSkusHaveStock(@RequestBody List<Long> skuIds){
+    public R getSkusHaveStock(@RequestParam("skuIds") List<Long> skuIds){
         List<SkuHasStockVo> vos = wareSkuService.getSkusHaveStock(skuIds);
         return R.ok().setData(vos);
     }
@@ -84,5 +83,7 @@ public class WareSkuController {
 
         return R.ok();
     }
+
+
 
 }

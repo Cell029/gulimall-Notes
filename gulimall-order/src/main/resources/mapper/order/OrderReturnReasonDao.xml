@@ -4,7 +4,7 @@
 <mapper namespace="com.project.gulimall.order.dao.OrderReturnReasonDao">
 
 	<!-- 可根据自己的需求，是否要使用 -->
-    <resultMap type="com.project.gulimall.order.entity.OrderReturnReasonEntity" id="orderReturnReasonMap">
+    <resultMap type="com.project.gulimall.order.domain.entity.OrderReturnReasonEntity" id="orderReturnReasonMap">
         <result property="id" column="id"/>
         <result property="name" column="name"/>
         <result property="sort" column="sort"/>

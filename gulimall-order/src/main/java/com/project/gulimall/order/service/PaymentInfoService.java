@@ -2,7 +2,7 @@ package com.project.gulimall.order.service;
 
 import com.baomidou.mybatisplus.extension.service.IService;
 import com.project.common.utils.PageUtils;
-import com.project.gulimall.order.entity.PaymentInfoEntity;
+import com.project.gulimall.order.domain.entity.PaymentInfoEntity;
 
 import java.util.Map;
 

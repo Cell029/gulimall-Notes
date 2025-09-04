@@ -84,7 +84,7 @@ public class WareSkuServiceImpl extends ServiceImpl<WareSkuDao, WareSkuEntity> i
             // select sum(stock - stock_locked) from wms_ware_sku where sku_id = ?
             Long stock = wareSkuDao.getSkuStock(skuId);
             vo.setSkuId(skuId);
-            vo.setHasStock(stock > 0);
+            vo.setHasStock(stock != null && stock > 0);
             return vo;
         }).collect(Collectors.toList());
         return skuHasStockVos;

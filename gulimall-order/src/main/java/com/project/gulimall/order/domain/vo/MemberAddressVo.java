@@ -1,4 +1,4 @@
-package com.project.gulimall.order.vo;
+package com.project.gulimall.order.domain.vo;
 
 import com.baomidou.mybatisplus.annotation.TableId;
 import lombok.Data;

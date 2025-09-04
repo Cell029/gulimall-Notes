@@ -1,7 +1,6 @@
 package com.project.gulimall.order.feign;
 
-import com.project.common.to.CartItemConfirmTo;
-import com.project.gulimall.order.vo.OrderItemVo;
+import com.project.gulimall.order.domain.vo.OrderItemVo;
 import org.springframework.cloud.openfeign.FeignClient;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;

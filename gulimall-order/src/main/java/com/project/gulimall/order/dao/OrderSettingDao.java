@@ -1,6 +1,6 @@
 package com.project.gulimall.order.dao;
 
-import com.project.gulimall.order.entity.OrderSettingEntity;
+import com.project.gulimall.order.domain.entity.OrderSettingEntity;
 import com.baomidou.mybatisplus.core.mapper.BaseMapper;
 import org.apache.ibatis.annotations.Mapper;
 

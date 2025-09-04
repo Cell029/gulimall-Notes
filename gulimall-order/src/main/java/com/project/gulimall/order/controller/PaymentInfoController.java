@@ -8,7 +8,7 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
-import com.project.gulimall.order.entity.PaymentInfoEntity;
+import com.project.gulimall.order.domain.entity.PaymentInfoEntity;
 import com.project.gulimall.order.service.PaymentInfoService;
 import com.project.common.utils.PageUtils;
 import com.project.common.utils.R;

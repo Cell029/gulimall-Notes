@@ -1,4 +1,4 @@
-package com.project.gulimall.order.entity;
+package com.project.gulimall.order.domain.entity;
 
 import com.baomidou.mybatisplus.annotation.TableId;
 import com.baomidou.mybatisplus.annotation.TableName;

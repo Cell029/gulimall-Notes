@@ -9,7 +9,7 @@ import com.project.common.utils.PageUtils;
 import com.project.common.utils.Query;
 
 import com.project.gulimall.order.dao.PaymentInfoDao;
-import com.project.gulimall.order.entity.PaymentInfoEntity;
+import com.project.gulimall.order.domain.entity.PaymentInfoEntity;
 import com.project.gulimall.order.service.PaymentInfoService;
 
 

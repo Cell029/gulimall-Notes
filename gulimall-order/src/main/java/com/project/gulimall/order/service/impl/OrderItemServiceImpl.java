@@ -9,7 +9,7 @@ import com.project.common.utils.PageUtils;
 import com.project.common.utils.Query;
 
 import com.project.gulimall.order.dao.OrderItemDao;
-import com.project.gulimall.order.entity.OrderItemEntity;
+import com.project.gulimall.order.domain.entity.OrderItemEntity;
 import com.project.gulimall.order.service.OrderItemService;
 
 

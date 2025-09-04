@@ -1,10 +1,10 @@
-package com.project.gulimall.order.vo;
+package com.project.gulimall.order.domain.vo;
 
-import com.project.common.to.CartItemConfirmTo;
 import lombok.Data;
 
 import java.math.BigDecimal;
 import java.util.List;
+import java.util.Map;
 
 @Data
 public class OrderConfirmVo {
@@ -17,24 +17,41 @@ public class OrderConfirmVo {
     // 积分
     private Integer integration;
 
+    // 库存
+    private Map<Long, Boolean> stocks;
+
+    // 商品总数
+    private Integer count;
+
+    public Integer getCount() {
+        count = 0;
+        if(!items.isEmpty()) {
+            for (OrderItemVo item : items) {
+                count += item.getCount();
+            }
+        }
+        return count;
+    }
+
     // 订单总额
     private BigDecimal total;
 
     public BigDecimal getTotal() {
-        BigDecimal bigDecimal = new BigDecimal("0.00");
+        total = new BigDecimal("0.00");
         if(!items.isEmpty()) {
            for (OrderItemVo item : items) {
-               bigDecimal = bigDecimal.add(item.getPrice().multiply(new BigDecimal(item.getCount().toString())));
+               total = total.add(item.getPrice().multiply(new BigDecimal(item.getCount().toString())));
            }
         }
-        return bigDecimal;
+        return total;
     }
 
     // 应付价格
     private BigDecimal payPrice;
 
     public BigDecimal getPayPrice() {
-        return getTotal();
+        payPrice = getTotal();
+        return payPrice;
     }
 
     // 防重令牌

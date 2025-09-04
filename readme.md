@@ -15352,7 +15352,639 @@ public class GuliFeignConfig {
 ```
 
 ****
+### 3.5 异步调用丢失请求头问题
 
+上面的封装订单确认页数据的方法远程调用了多个服务，而这些服务并没有依赖性，所以完全可以使用异步编程的方式提高效率，所以使用 CompletableFuture.runAsync() 方法对这两个远程调用进行改进，
+不过问题来了，进行测试时出现了和远程调用时一样的问题，请求头丢失了，导致远程服务无法获取到登录用户端信息，并且这两个都没获取到。而产生该问题的本质就是 ThreadLocal 导致的上下文丢失。
+SpringMVC 会把与本次 HTTP 请求有关的对象（如 HttpServletRequest、会话、Locale 等）放在 RequestContextHolder 里，它的底层是 ThreadLocal。
+而 ThreadLocal 只在创建它的那个线程可见，目前的代码是控制器方法在主线程（Servlet 容器工作线程）里执行，当使用 CompletableFuture.runAsync(...) 切出到线程池的他线程去做事时，
+这些线程里没有最初拦截器创建并保存在 ThreadLocal 中的那些数据，这就会导致 RequestContextHolder.getRequestAttributes() 获取到 null，在 Feign 拦截器里想读请求头也就拿不到了，
+于是下游请求就丢了 Cookie 等数据。
 
+想要解决这个问题，就需要在主线程中提前获取到当前线程的 RequestAttributes，然后在每个异步任务里把它手动放回去，这样，异步线程里的 RequestContextHolder 能读到主线程那份请求上下文。
+但需要注意的是：一定要清理这些数据，因为线程池中的线程是可复用的，如果不清理，下一次任务还能看到上一次请求的上下文，这就会产生脏数据或越权行为。
+并且 ServletRequestAttributes/HttpServletRequest 本身并非线程安全的，只读一些请求头的数据一般没问题，但是不要在子线程中去读请求体数据或者修改 request。
+
+```java
+@Override
+public OrderConfirmVo confirmOrder() {
+    OrderConfirmVo orderConfirmVo = new OrderConfirmVo();
+    MemberResponseVo memberResponseVo = LoginUserInterceptor.threadLocal.get();
+    System.out.println("主线程..." + Thread.currentThread().getName() + ": " + Thread.currentThread().getId());
+
+    // 获取之前的请求
+    RequestAttributes requestAttributes = RequestContextHolder.getRequestAttributes();
+
+    CompletableFuture<Void> getAddressFuture = CompletableFuture.runAsync(() -> {
+        System.out.println("member线程..." + Thread.currentThread().getName() + ": " + Thread.currentThread().getId());
+        // 共享之前的请求数据
+        RequestContextHolder.setRequestAttributes(requestAttributes);
+        // 1. 远程查询当前用户的所有收获地址
+        try {
+            List<MemberAddressVo> address = memberFeignService.getAddressByUserId(memberResponseVo.getId());
+            orderConfirmVo.setAddress(address);
+        } finally {
+            RequestContextHolder.resetRequestAttributes(); // 关键：清理
+        }
+    }, threadPoolExecutor);
+
+    CompletableFuture<Void> getCurrentUserCartFuture = CompletableFuture.runAsync(() -> {
+        System.out.println("cart线程..." + Thread.currentThread().getName() + ": " + Thread.currentThread().getId());
+        // 共享之前的请求数据
+        RequestContextHolder.setRequestAttributes(requestAttributes);
+        // 2. 远程查询购物项信息
+        try {
+            List<OrderItemVo> items = cartFeignService.getCurrentUserCartItems(memberResponseVo.getId());
+            orderConfirmVo.setItems(items);
+        } finally {
+            RequestContextHolder.resetRequestAttributes(); // 关键：清理
+        }
+    }, threadPoolExecutor);
+
+    // 3. 查询用户积分
+    Integer integration = memberResponseVo.getIntegration();
+
+    orderConfirmVo.setIntegration(integration);
+    // 4. 总价在实体类中自动计算，这里无需赋值
+
+    // 5. TODO 防重令牌的添加
+
+    try {
+        CompletableFuture.allOf(getAddressFuture, getCurrentUserCartFuture).get();
+    } catch (InterruptedException | ExecutionException e) {
+        throw new RuntimeException(e);
+    }
+
+    return orderConfirmVo;
+}
+```
+
+****
+## 4. 订单确认页面渲染
+
+### 4.1 前端获取基本数据
+
+在上面封装订单确认页数据时已经把 OrderConfirmVo 存入域中了，所以前端只需要获取到该数据即可使用。
+
+```html
+<!--地址-->
+<div class="top-3" th:each="address : ${orderConfirmData.address}">
+    <p>[[${address.name}]]</p><span>[[${address.name}]]  [[${address.province}]]  [[${address.detailAddress}]] [[${address.phone}]]</span>
+</div>
+```
+
+```html
+<!--图片-->
+<div class="yun1" th:each="item : ${orderConfirmData.items}">
+    <img  th:src="${item.image}" class="yun"/>
+    <div class="mi">
+        <p>[[${item.title}]]<span style="color: red;"> ￥[[${#numbers.formatDecimal(item.price, 1, 2)}]]</span> <span> x[[${item.count}]] </span> <span>[[${item.hasStock? "有货" : "无货"}]]</span></p>
+        <p><span>0.095kg</span></p>
+        <p class="tui-1"><img src="/static/order/confirm/img/i_07.png" />支持7天无理由退货</p>
+    </div>
+</div>
+```
+
+```html
+<!--商品总价-->
+<p class="qian_y">
+    <span>[[${orderConfirmData.count}]]</span>
+    <span>件商品，总商品金额：</span>
+    <span class="rmb">￥[[${#numbers.formatDecimal(orderConfirmData.payPrice, 1, 2)}]]</span>
+</p>
+```
+
+这里会显示总共有几件商品，不过之前封装 OrderConfirmVo 的时候没有添加商品数量字段，所以这里补充一下，该字段也是动态获取，不需要再业务中手动计算：
+
+```java
+@Data
+public class OrderConfirmVo {
+    // 商品总数
+    private Integer count;
+
+    public Integer getCount() {
+        count = 0;
+        if(!items.isEmpty()) {
+            for (OrderItemVo item : items) {
+                count += item.getCount();
+            }
+        }
+        return count;
+    }
+}
+```
+
+```html
+<div class="yfze">
+    <p class="yfze_a"><span class="z">应付总额：</span><span class="hq">￥[[${#numbers.formatDecimal(orderConfirmData.payPrice, 1, 2)}]]</span></p>
+    <p class="yfze_b">寄送至：  收货人：</p>
+</div>
+```
+
+****
+### 4.2 库存查询
+
+在订单确认页会展示出当前勾选中的购物项，而这些购物项需要明确标出是否有库存，没有库存就不能购买，所以需要在 OrderConfirmVo 对象中新增一个库存字段，用于显示是否有库存。
+
+```java
+@Data
+public class OrderConfirmVo {
+    // 库存
+    private Map<Long, Boolean> stocks;
+}
+```
+
+这里选择的是把它封装成一个 Map 集合，key 为 skuId，value 为 true/false，true 就是有库存，false 就是没库存，所以在封装该字段的时候需要远程调用 gulimall-ware 服务，
+查询当前勾选中的购物项是否具有库存。不过该远程调用需要依赖查询到的购物项，只有获取到购物项后才能知道需要查询的库存商品是哪些，所以该远程调用只能等待查询购物车完成后再执行。
+因为异步封装 OrderConfirmVo 时会封装一个 OrderConfirmVo 对象，所以可以在上面的异步请求完成后再获取封装的 List<OrderConfirmVo>，依次取出它们的 skuId 封装成集合，
+发送给 gulimall-ware 服务。
+
+```java
+@Override
+public OrderConfirmVo confirmOrder() {
+    OrderConfirmVo orderConfirmVo = new OrderConfirmVo();
+    MemberResponseVo memberResponseVo = LoginUserInterceptor.threadLocal.get();
+    // 获取之前的请求
+    RequestAttributes requestAttributes = RequestContextHolder.getRequestAttributes();
+    CompletableFuture<Void> getCurrentUserCartFuture = CompletableFuture.runAsync(() -> {
+        ...
+    }, threadPoolExecutor).thenRunAsync(() -> {
+        List<OrderItemVo> items = orderConfirmVo.getItems();
+        List<Long> skuIds = items.stream().map(OrderItemVo::getSkuId).collect(Collectors.toList());
+        R r = wareFeignService.getSkusHaveStock(skuIds);
+        List<SkuHasStockVo> data = r.getData(new TypeReference<List<SkuHasStockVo>>() {
+        });
+        if (!data.isEmpty()) {
+            orderConfirmVo.setStocks(data.stream().collect(Collectors.toMap(SkuHasStockVo::getSkuId, SkuHasStockVo::getHasStock)));
+        }
+    });
+    return orderConfirmVo;
+}
+```
+
+查询是否有库存时封装了一个对象，该对象只有 skuId 和 hasStock 字段，不过是查询多个商品是否具有库存，所以需要用 List 集合来接收该对象：
+
+```java
+@Data
+public class SkuHasStockVo {
+    private Long skuId;
+    private Boolean hasStock;
+}
+```
+
+```java
+@FeignClient("gulimall-ware")
+public interface WareFeignService {
+    @GetMapping("/ware/waresku/haveStock")
+    R getSkusHaveStock(@RequestParam("skuIds") List<Long> skuIds);
+}
+```
+
+查询是否有库存则是通过查询表 wms_ware_sku，以 skuId 为条件进行批量查询，每查询一次就完成对 SkuHasStockVo 对象的封装，而查询也就是查该 skuId 的库存减去锁定库存的数量，
+然后判断该数量是否大于 1 来赋值为 true 或 false：
+
+```java
+@Override
+public List<SkuHasStockVo> getSkusHaveStock(List<Long> skuIds) {
+    List<SkuHasStockVo> skuHasStockVos = skuIds.stream().map(skuId -> {
+        SkuHasStockVo vo = new SkuHasStockVo();
+        // 查询当前 sku 的总库存量
+        // select sum(stock - stock_locked) from wms_ware_sku where sku_id = ?
+        Long stock = wareSkuDao.getSkuStock(skuId);
+        vo.setSkuId(skuId);
+        vo.setHasStock(stock != null && stock > 0);
+        return vo;
+    }).collect(Collectors.toList());
+    return skuHasStockVos;
+}
+```
+
+```xml
+<select id="getSkuStock" resultType="java.lang.Long">
+    select sum(stock - stock_locked) from wms_ware_sku where sku_id = #{skuId}
+</select>
+```
+
+****
+### 4.3 模拟运费
+
+在计算运费前，需要先对地址管理进行完善，在首次进入订单确认页面时，应该自动选择某个地址作为默认地址，所以需要在前端页面进行判断，并且选中的地址需要被高亮显示，
+运费的计算也是与选中的地址有关。所以需要在前端显示收获地址的地方添加自定义字段，这里用的是 def，后续根据该值进行判断，为 1 代表就是默认地址，还有个 addrId，
+它是用来向后端发送请求查找对应的地址数据的。
+
+```html
+<div class="top-3 addr-item" th:each="address : ${orderConfirmData.address}">
+    <p th:attr="def=${address.defaultStatus},addrId=${address.id}">[[${address.name}]]</p><span>[[${address.name}]]  [[${address.province}]]  [[${address.detailAddress}]] [[${address.phone}]]</span>
+</div>
+```
+
+高亮显示就是根据当前的 def 是否为 1 进行选则的，为 1 就让它标红，否则标灰：
+
+```js
+function highlight() {
+    $(".addr-item p").css({"border" : "2px solid gray"})
+    $(".addr-item p[def = '1']").css({"border" : "2px solid red"})
+}
+```
+
+而获取运费是由后端进行计算的，前端则负责将当前选中的地址的 id 发送给后端即可，然后再将后端存入域中的数据取出。需要注意的是，这里发送的 GET 请求需要写为相对路径，
+不能直接写为绝对路径，例如 http://gulimall.com/api/... ，这会引起跨域问题，导致发送的请求无法被后端正确接收到。因为当前给不同的服务配置了不同的域名，
+即使它们都是 gulimall.com 的子域名，但是任然会造成他跨域问题，因此直接写相对路劲，浏览器会把这个相对路径拼接到当前页面的域名下，这就算是同源请求。
+然后通过网关将 /api/ware/** 转发到 gulimall-ware 服务，实现服务间的请求路由。
+
+```js
+$(".addr-item p").click(function () {
+    $(".addr-item p").attr("def", 0);
+    $(this).attr("def", 1);
+    highlight();
+    // 获取当前被点击的地址 id
+    var addrId = $(this).attr("addrId");
+    // 发送 ajax 获取运费信息
+    getFare(addrId);
+})
+
+function getFare(addrId) {
+    $.get("/api/ware/wareinfo/fare?addrId=" + addrId, function (data) {
+        console.log(data);
+        $("#fareEle").text(data.fare);
+        var total = [[${orderConfirmData.total}]];
+        $("#payPriceEle").text(total * 1 + data.fare * 1);
+    })
+}
+```
+
+Controller 层：
+
+```java
+@GetMapping("/fare")
+public R getFare(@RequestParam("addrId") Long addrId) {
+    BigDecimal fare = wareInfoService.getFare(addrId);
+    return R.ok().setData("fare", fare);
+}
+```
+
+Service 层：
+
+计算真实的运费需要引入第三方的接口，所以这里目前只是简单模拟一下运费，让它取用手机号的最后一位作为运费。但是不管怎么样，计算运费肯定是要获取到该用户的详细地址信息的，
+因此还是必须得远程调用 gulimall-member 服务获取 MemberAddressVo 对象。
+
+```java
+@Override
+public BigDecimal getFare(Long addrId) {
+    R r = memberFeignService.info(addrId);
+    MemberAddressVo memberReceiveAddress = r.getData("memberReceiveAddress", new TypeReference<MemberAddressVo>() {
+    });
+    if (memberReceiveAddress != null) {
+        String phone = memberReceiveAddress.getPhone();
+        String subString =  phone.substring(phone.length() - 1, phone.length());
+        return new BigDecimal(subString);
+    }
+    return new BigDecimal("0");
+}
+```
+
+不过，如果前端还要动态显示当前订单需要配送的地址和收货人的话，那上述代码就需要稍微修改一下，这里不再直接返回 BigDecimal，而是封装一个对象，里面封装运费和详细地址：
+
+```java
+@Data
+public class FareVo {
+    private MemberAddressVo address;
+    private BigDecimal fare;
+}
+```
+
+```java
+@Override
+public FareVo getFare(Long addrId) {
+    FareVo fareVo = new FareVo();
+    R r = memberFeignService.info(addrId);
+    MemberAddressVo memberReceiveAddress = r.getData("memberReceiveAddress", new TypeReference<MemberAddressVo>() {
+    });
+    if (memberReceiveAddress != null) {
+        String phone = memberReceiveAddress.getPhone();
+        String subString =  phone.substring(phone.length() - 1, phone.length());
+        BigDecimal fare = new BigDecimal(subString);
+        fareVo.setAddress(memberReceiveAddress);
+        fareVo.setFare(fare);
+        return fareVo;
+    }
+    return null;
+}
+```
+
+把当前远程获取到的地址信息一起返回给前端，这样前端就能动态获取当前用户选中的地址的信息了：
+
+```html
+<p class="yfze_b">寄送至：<span id="receiveAddressEle"></span> 收货人：<span id="receiverEle"></span></p>
+```
+
+js 代码也需要修改，让它动态展示：
+
+```js
+function getFare(addrId) {
+    $.get("/api/ware/wareinfo/fare?addrId=" + addrId, function (data) {
+        console.log(data);
+        $("#fareEle").text(data.data.fare);
+        var total = [[${orderConfirmData.total}]];
+        // 设置运费
+        $("#payPriceEle").text(total * 1 + data.data.fare * 1);
+        // 设置收货地址与收货人信息
+        $("#receiveAddressEle").text(data.data.address.province + " " + data.data.address.detailAddress);
+        $("#receiverEle").text(data.data.address.name);
+    })
+}
+```
+
+****
+## 4. 接口幂等性
+
+幂等是一个数学与计算机学概念，在数学中某一元运算为幂等时，它作用在任一元素两次后会和其作用一次的结果相同。幂等函数或幂等方法是指可以使用相同参数重复执行，
+并能获得相同结果的函数。这些函数不会影响系统状态，也不用担心重复执行会对系统造成改变。
+
+什么是接口幂等性？即客户端用同样的请求参数（即完全相同的请求）发起一次或多次调用，对服务器上资源状态产生的影响是相同的。幂等性保证的是多次请求的副作用相同，即资源最终的状态相同。
+当然这里的副作用是不会对结果产生破坏或者产生不可预料的结果。在接口调用时一般情况下都能正常返回信息不会重复提交，不过在遇见以下情况时可能就会出现问题：
+
+- 前端重复提交表单：在填写一些表格时候，用户填写完成提交，很多时候会因网络波动没有及时对用户做出提交成功响应，致使用户认为没有成功提交，然后一直点提交按钮，这时就会发生重复提交表单请求。
+- 用户恶意进行刷单：例如在实现用户投票这种功能时，如果攻击者针对一个用户进行重复提交投票，这样会导致接口接收到用户重复提交的投票信息，这样会使投票结果与事实严重不符。
+- 接口超时重复提交：很多时候 HTTP 客户端工具都默认开启超时重试的机制，尤其是调用第三方接口的时候，为了防止网络波动超时等造成请求失败，都会添加重试机制，不过这就会导致一个请求提交多次。
+- 消息进行重复消费：当使用 MQ 消息中间件时候，如果发生消息中间件出现错误未及时提交消费信息，导致发生重复消费。
+- 使用幂等性最大的优势在于使接口保证任何幂等性操作，免去因重试等造成系统产生的未知的问题。
+
+幂等性是为了简化客户端逻辑处理，能防止重复提交等操作，不过这种操作会增加服务端的逻辑复杂性和成本，因为必须引入额外的逻辑来检查请求是否已处理（如检查 Token、唯一键、状态等），
+这增加了代码复杂度和维护成本。所以在使用时候需要考虑是否引入幂等性的必要性，根据实际业务场景具体分析，不过所有支付、交易、资金相关接口都需要确保幂等性。
+因此问题的关键不在于是否要引入幂等性，而在于如何用最小的成本实现它，在使用时需要根据接口特性选择最合适的方案，避免过度设计。
+
+常用的确保幂等性的方案如下：
+
+1、唯一业务编号
+
+客户端在发起请求时，自带一个全局唯一的业务 ID（如订单号、支付流水号），服务端以该 ID 为键插入数据库并添加唯一约束。当再次发起请求时就会携带相同的 ID，此时查询数据库发现重复提交数据，
+此时就可以进行相关异常处理等操作。这个操作的本质就是利用数据库索引的唯一性，所以多次请求可能会增加数据库的压力。该操作适用于业务本身存在天然唯一 ID，
+且该 ID 在请求发起时即可确定（如电商订单创建：用户下单时生成唯一订单号，后续对该订单的支付、取消等操作均携带此订单号）。
+
+2、防重令牌（Token）
+
+当客户端无法生成唯一业务 ID 时可以采用此方案。客户端在执行业务操作前可以先向服务端申请一个临时唯一的 Token，执行业务操作时携带此 Token，接着服务端会处理该 Token，
+只有校验通过后才会执行业务，并标记该 Token 为已使用，通常使用 UUID 作为 Token 并存入 redis 中。该方案适用于无天然唯一业务 ID 的场景，例如短信发送、
+临时资源处理等操作，客户端无法自主生成唯一标识，需服务端分配临时凭证的场景。当然 Token 也可以携带用户的加密信息，例如加密后的用户 ID，这样还能做一下权限判断。
+不过需要确保 Token 的原子性操作，校验 Token 并标记为 “已使用” 必须是原子操作，否则并发场景下会出现 “两个请求同时查询到 Token 未使用，均执行业务” 的幂等失效问题。
+因此可以使用 Redis 的 lua 脚本来确保操作的原子性。
+
+3、乐观锁
+
+通过版本号或时间戳机制在更新数据时校验数据是否已被其他请求修改过，如果已被修改，则放弃当前更新，避免覆盖别人的更新，通常用于更新操作，它不同于真正的锁，所以性能较高，
+但不能用于创建操作，因为新建操作时版本号还不存在，所以无法对其进行版本号的比较。
+
+4、状态机幂等（基于业务状态）
+
+很多业务数据都有明确的状态流转（例如订单：待支付->已支付->已发货->已完成），如果请求的业务数据已经处于下一个状态，则忽略当前请求。
+
+****
+## 5. 订单提交
+
+### 5.1 使用 Token 令牌确保操作的幂等性
+
+上面有记录，关于订单提交的操作是需要确保它的幂等性的，所以这里采取了防重令牌的方式来确保幂等性，利用 Redis 的 lua 脚本确保 Token 的查询与删除时原子的。
+
+```java
+@Override
+public OrderConfirmVo confirmOrder() {
+    // 5. 防重令牌的添加
+    String token = UUID.randomUUID().toString().replace("-", "");
+    stringRedisTemplate.opsForValue().set(OrderConstant.USER_ORDER_TOKEN_PREFIX + memberResponseVo.getId(), token, 30, TimeUnit.MINUTES);
+    orderConfirmVo.setOrderToken(token);
+    
+    return orderConfirmVo;
+}
+```
+
+这里使用 UUID 作为 Token，把它存入 OrderConfirmVo 与 Redis，后面就是对比 OrderConfirmVo 中的 Token 和 Redis 中的 Token 是否一致来判断是否属于重估提交订单。
+而 Token 令牌的校验是在对提交订单对象的封装时进行的，因此需要先构建一个订单提交对象，该对象包含一个 OrderEntity 对象，它封装了订单的所有相关信息，所以后续数据的封装主要是作用于它，
+还有一个 code 字段，该字段就是用来判断订单是否提交成功，0 为成功，1 为不成功：
+
+```java
+@Data
+public class SubmitOrderResponseVo {
+    private OrderEntity order;
+    private Integer code; // 0 成功
+}
+```
+
+当然有些数据是后端无法自行查询数据库获取的，例如用户选择的收货地址、支付方式等信息，这些都是用户在前端操作图形界面后动态生成的，虽然数据库中都存有这些数据，
+但它们都是存在多个类似无法区分的，只能靠前端传递那个具体的数据才行，所以这里又封装了一个 OrderSubmitVo 对象：
+
+```java
+/**
+ * 封装订单提交数据，无需提交需要购买的商品，去购物车再获取一遍
+ */
+@Data
+public class OrderSubmitVo {
+    // 地址 id
+    private Long addrId;
+    // 支付方式
+    private Integer payType;
+    // 防重令牌
+    private String orderToken;
+    // 应付价格
+    private BigDecimal payPrice;
+    // 订单备注
+    private String note;
+}
+```
+
+Controller 层：
+
+根据最终封装的 SubmitOrderResponseVo 的 code 字段决定是否跳转到支付界面。
+
+```java
+@PostMapping("/submitOrder")
+public String submitOrder(@RequestBody OrderSubmitVo orderSubmitVo, Model model) {
+    SubmitOrderResponseVo submitOrderResponseVo = orderService.submitOrder(orderSubmitVo);
+    if (submitOrderResponseVo.getCode() == 0) {
+        // 提交订单成功，跳转到支付页
+        return "pay";
+    } else {
+        // 失败跳回订单确认页
+        return "redirect://order.gulimall.com/toTrade";
+    }
+}
+```
+
+Service 层：
+
+现在就是对提交订单数据的封装，在封装数据前需要对防重令牌 Token 进行验证，这里就是使用的 lua 脚本来确保读取与删除 Token 是原子性的。
+整体逻辑就是判断前端提交的 OrderSubmitVo 对象的 orderToken 字段和存入 Redis 中的 orderToken 字段是否一致，如果一致那就删除并返回 1，否则返回 0 且不删除。
+所以可以根据执行该脚本的返回值是否为 1 来进行后续流程的选择。当返回值为 0 时，证明令牌校验失败，也就是说此时是重复提交，那么就直接给 SubmitOrderResponseVo 的 code 字段赋值为 1。
+如果校验成功，就正常进行数据的封装。
+
+```java
+@Override
+public SubmitOrderResponseVo submitOrder(OrderSubmitVo orderSubmitVo) {
+    // 将页面传递的数据放入 ThreadLocal
+    threadLocal.set(orderSubmitVo);
+
+    SubmitOrderResponseVo submitOrderResponseVo = new SubmitOrderResponseVo();
+    MemberResponseVo memberResponseVo = LoginUserInterceptor.threadLocal.get();
+    // 1. 验证令牌
+    DefaultRedisScript<Long> redisScript = new DefaultRedisScript<>();
+    redisScript.setScriptText(
+            "if redis.call('get', KEYS[1]) == ARGV[1] then " +
+                    "   redis.call('del', KEYS[1]); " +
+                    "   return 1; " +
+                    "else " +
+                    "   return 0; " +
+                    "end"
+    ); // 返回 0 校验失败；返回 1 校验成功
+    redisScript.setResultType(Long.class);
+
+    String orderToken = orderSubmitVo.getOrderToken();
+    String redisToken = stringRedisTemplate.opsForValue().get(OrderConstant.USER_ORDER_TOKEN_PREFIX + memberResponseVo.getId());
+    Long result = stringRedisTemplate.execute(redisScript, Collections.singletonList(redisToken), orderToken);
+    if (result == 0L) {
+        // 令牌验证失败
+        submitOrderResponseVo.setCode(1);
+        return submitOrderResponseVo;
+    } else {
+        // TODO 验证成功
+        OrderCreateTo orderCreateTo = creatOrder();
+        
+    }
+    return submitOrderResponseVo;
+}
+```
+
+这里又封装了一个临时对象 OrderCreateTo，它用来接收 OrderEntity 和所有购物项数据：
+
+```java
+@Data
+public class OrderCreateTo {
+    private OrderEntity order;
+    private List<OrderItemEntity> orderItems;
+}
+```
+
+接着就是封装 OrderEntity 和 List<OrderItemEntity>：
+
+```java
+private OrderCreateTo creatOrder() {
+    OrderCreateTo orderCreateTo = new OrderCreateTo();
+    // 1. 生成订单号
+    String orderSn = IdWorker.getTimeId();
+    // 创建订单号
+    OrderEntity orderEntity = buildOrder(orderSn);
+    orderCreateTo.setOrder(orderEntity);
+
+    // 2. 获取到所有的订单项
+    List<OrderItemEntity> orderItemEntities = buildOrderItems(orderSn);
+    orderCreateTo.setOrderItems(orderItemEntities);
+
+    return orderCreateTo;
+}
+```
+
+先是构建 OrderEntity 的一些基本数据，例如详细的地址信息，收货地址的 id 可以从前端发送的 OrderSubmitVo 对象中获取，但除了这个，其它的地址信息就只能远程查询了，
+不过之前计算运费时又额外封装地址对象，所以这里直接调用那个服务获取 FareVo 对象，再从它的 MemberAddressVo 属性中获取对应的地址信息即可。
+
+```java
+private OrderEntity buildOrder(String orderSn) {
+
+    OrderEntity orderEntity = new OrderEntity();
+    orderEntity.setOrderSn(orderSn);
+    // 获取收获地址信息
+    OrderSubmitVo orderSubmitVo = threadLocal.get();
+    R fare = wareFeignService.getFare(orderSubmitVo.getAddrId());
+    FareVo fareVo = fare.getData(new TypeReference<FareVo>() {
+    });
+    // 设置运费
+    orderEntity.setFreightAmount(fareVo.getFare());
+    orderEntity.setReceiverProvince(fareVo.getAddress().getProvince());
+    orderEntity.setReceiverCity(fareVo.getAddress().getCity());
+    orderEntity.setReceiverRegion(fareVo.getAddress().getRegion());
+    orderEntity.setReceiverDetailAddress(fareVo.getAddress().getDetailAddress());
+    orderEntity.setReceiverName(fareVo.getAddress().getName());
+    orderEntity.setReceiverPhone(fareVo.getAddress().getPhone());
+    orderEntity.setReceiverPostCode(fareVo.getAddress().getPostCode());
+
+    return orderEntity;
+}
+```
+
+接着就是构建订单项数据，也就是购物车中勾选的商品，而购物车的商品数据也需要远程查询，不过之前已经封装过该方法了，并且还能获取到最新的价格，所以这里直接拿来用就行。
+但该方法返回的是一个 OrderItemVo 对象，所以需要取出里面的数据再封装给 OrderItemEntity。
+
+```java
+/**
+ * 构建所有订单项数据
+ */
+private List<OrderItemEntity> buildOrderItems(String orderSn) {
+    List<OrderItemVo> currentUserCartItems = cartFeignService.getCurrentUserCartItems(LoginUserInterceptor.threadLocal.get().getId());
+    if (!currentUserCartItems.isEmpty()) {
+        List<OrderItemEntity> orderItemEntities = currentUserCartItems.stream().map(cartItem -> {
+            OrderItemEntity orderItemEntity = buildOneOrderItem(cartItem);
+            orderItemEntity.setOrderSn(orderSn);
+            return orderItemEntity;
+        }).collect(Collectors.toList());
+        return orderItemEntities;
+    }
+    return null;
+}
+```
+
+OrderItemEntity 中需要封装一些 spu 数据和 sku 数据，sku 的数据很好获取，在远程查询购物项时就能取到所有数据，而 spu 的相关数据则需要远程调用 gulimall-product 服务了。
+
+```java
+/**
+ * 构建某一个订单项数据
+ */
+private OrderItemEntity buildOneOrderItem(OrderItemVo cartItem) {
+    OrderItemEntity orderItemEntity = new OrderItemEntity();
+    // 1. 订单信息（由 buildOrder(String orderSn) 完成）
+    // 2. 商品的 spu 信息
+    R r = productFeignService.getSpuInfoBySkuId(cartItem.getSkuId());
+    if (r.getCode() == 0) {
+        SpuInfoVo spuInfoEntity = r.getData(new TypeReference<SpuInfoVo>() {
+        });
+        orderItemEntity.setSpuId(spuInfoEntity.getId());
+        orderItemEntity.setSpuName(spuInfoEntity.getSpuName());
+        orderItemEntity.setSpuBrand(spuInfoEntity.getBrandId().toString());
+        orderItemEntity.setCategoryId(spuInfoEntity.getCatalogId());
+    }
+    // 3. 商品 sku 信息
+    orderItemEntity.setSkuId(cartItem.getSkuId());
+    orderItemEntity.setSkuName(cartItem.getTitle());
+    orderItemEntity.setSkuPic(cartItem.getImage());
+    orderItemEntity.setSkuPrice(cartItem.getPrice());
+    String skuAttr = StringUtils.collectionToDelimitedString(cartItem.getSkuAttr(), ";");
+    orderItemEntity.setSkuAttrsVals(skuAttr);
+    orderItemEntity.setSkuQuantity(cartItem.getCount());
+    // 4. 积分信息
+    orderItemEntity.setGiftGrowth(cartItem.getPrice().intValue());
+    orderItemEntity.setGiftIntegration(cartItem.getPrice().intValue());
+
+    return orderItemEntity;
+}
+```
+
+```java
+@FeignClient("gulimall-product")
+public interface ProductFeignService {
+    @GetMapping("/product/spuinfo/skuId/{id}")
+    R getSpuInfoBySkuId(@PathVariable("id") Long skuId);
+}
+```
+
+因为只传递了 skuId，所以必须先获取到该 skuId 对应的 spuId 才能查询 spu 的相关数据：
+
+```java
+@Override
+public SpuInfoEntity getSpuInfoBySkuId(Long skuId) {
+    SkuInfoEntity skuInfoEntity = skuInfoService.getById(skuId);
+    Long spuId = skuInfoEntity.getSpuId();
+    SpuInfoEntity spuInfoEntity = getById(spuId);
+    return spuInfoEntity;
+}
+```
+
+****
 
 

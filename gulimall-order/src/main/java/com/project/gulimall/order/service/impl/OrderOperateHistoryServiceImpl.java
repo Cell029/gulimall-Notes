@@ -9,7 +9,7 @@ import com.project.common.utils.PageUtils;
 import com.project.common.utils.Query;
 
 import com.project.gulimall.order.dao.OrderOperateHistoryDao;
-import com.project.gulimall.order.entity.OrderOperateHistoryEntity;
+import com.project.gulimall.order.domain.entity.OrderOperateHistoryEntity;
 import com.project.gulimall.order.service.OrderOperateHistoryService;
 
 

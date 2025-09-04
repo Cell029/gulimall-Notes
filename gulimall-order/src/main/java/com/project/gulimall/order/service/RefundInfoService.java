@@ -2,7 +2,7 @@ package com.project.gulimall.order.service;
 
 import com.baomidou.mybatisplus.extension.service.IService;
 import com.project.common.utils.PageUtils;
-import com.project.gulimall.order.entity.RefundInfoEntity;
+import com.project.gulimall.order.domain.entity.RefundInfoEntity;
 
 import java.util.Map;
 
