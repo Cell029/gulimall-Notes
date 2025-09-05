@@ -15838,8 +15838,8 @@ public SubmitOrderResponseVo submitOrder(OrderSubmitVo orderSubmitVo) {
     redisScript.setResultType(Long.class);
 
     String orderToken = orderSubmitVo.getOrderToken();
-    String redisToken = stringRedisTemplate.opsForValue().get(OrderConstant.USER_ORDER_TOKEN_PREFIX + memberResponseVo.getId());
-    Long result = stringRedisTemplate.execute(redisScript, Collections.singletonList(redisToken), orderToken);
+    String redisTokenKey = OrderConstant.USER_ORDER_TOKEN_PREFIX + memberResponseVo.getId();
+    Long result = stringRedisTemplate.execute(redisScript, Collections.singletonList(redisTokenKey), orderToken);
     if (result == 0L) {
         // 令牌验证失败
         submitOrderResponseVo.setCode(1);
@@ -15986,5 +15986,519 @@ public SpuInfoEntity getSpuInfoBySkuId(Long skuId) {
 ```
 
 ****
+### 5.2 封装订单价格和优惠积分等信息
+
+在上面的代码中，主要是封装了订单的一些基本数据和订单包含的一些购物项数据，但是还没有构建支付价格、优惠信息和积分等数据，所以这里需要封装一下。而计算价格的信息可以在创建订单的时候就进行，
+所以在 creatOrder() 方法中定义了一个 computePrice(orderEntity, orderItemEntities) 方法，传入订单对象和购物项对象。接着把封装号的所有数据都传入中间对象 OrderCreateTo，
+该对象就是用来简化方法之间的参数传递的。
+
+```java
+private OrderCreateTo creatOrder() {
+    OrderCreateTo orderCreateTo = new OrderCreateTo();
+    // 1. 生成订单号
+    String orderSn = IdWorker.getTimeId();
+    // 创建订单号
+    OrderEntity orderEntity = buildOrder(orderSn);
+
+    // 2. 获取到所有的订单项
+    List<OrderItemEntity> orderItemEntities = buildOrderItems(orderSn);
+
+    // 3. 计算价格、积分等信息
+    computePrice(orderEntity, orderItemEntities);
+
+    orderCreateTo.setOrder(orderEntity);
+    orderCreateTo.setOrderItems(orderItemEntities);
+    return orderCreateTo;
+}
+```
+
+computePrice() 方法就是用来封装价格以及优惠积分等信息，所以需要用到 OrderEntity 和 OrderItemEntity 对象，需要先从 OrderItemEntity 拿到当前单个购物项的价格和优惠积分等数据，
+然后对他们进行累加，得到的最终结果就可以直接封装进 OrderEntity 中相对应的字段中了。而这些数据则需要在构建单个购物项时进行封装。
+
+```java
+/**
+ * 构建某一个订单项数据
+ */
+private OrderItemEntity buildOneOrderItem(OrderItemVo cartItem) {
+    OrderItemEntity orderItemEntity = new OrderItemEntity();
+    // 1. 订单信息（由 buildOrder(String orderSn) 完成）
+    // 2. 商品的 spu 信息
+    R r = productFeignService.getSpuInfoBySkuId(cartItem.getSkuId());
+    if (r.getCode() == 0) {
+        SpuInfoVo spuInfoEntity = r.getData(new TypeReference<SpuInfoVo>() {
+        });
+        orderItemEntity.setSpuId(spuInfoEntity.getId());
+        orderItemEntity.setSpuName(spuInfoEntity.getSpuName());
+        orderItemEntity.setSpuBrand(spuInfoEntity.getBrandId().toString());
+        orderItemEntity.setCategoryId(spuInfoEntity.getCatalogId());
+    }
+    // 3. 商品 sku 信息
+    orderItemEntity.setSkuId(cartItem.getSkuId());
+    orderItemEntity.setSkuName(cartItem.getTitle());
+    orderItemEntity.setSkuPic(cartItem.getImage());
+    orderItemEntity.setSkuPrice(cartItem.getPrice());
+    String skuAttr = StringUtils.collectionToDelimitedString(cartItem.getSkuAttr(), ";");
+    orderItemEntity.setSkuAttrsVals(skuAttr);
+    orderItemEntity.setSkuQuantity(cartItem.getCount());
+    // 4. 积分信息
+    orderItemEntity.setGiftGrowth(cartItem.getPrice().multiply(BigDecimal.valueOf(cartItem.getCount())).intValue());
+    orderItemEntity.setGiftIntegration(cartItem.getPrice().multiply(BigDecimal.valueOf(cartItem.getCount())).intValue());
+    // 5. 订单项价格信息
+    orderItemEntity.setPromotionAmount(new BigDecimal("0.0"));
+    orderItemEntity.setCouponAmount(new BigDecimal("0.0"));
+    orderItemEntity.setIntegrationAmount(new BigDecimal("0.0"));
+    // 当前订单项的实际金额
+    BigDecimal originPrice = orderItemEntity.getSkuPrice().multiply(BigDecimal.valueOf(orderItemEntity.getSkuQuantity()));
+    BigDecimal newPrice = originPrice.subtract(orderItemEntity.getPromotionAmount())
+            .subtract(orderItemEntity.getCouponAmount())
+            .subtract(orderItemEntity.getIntegrationAmount());
+    orderItemEntity.setRealAmount(newPrice);
+    return orderItemEntity;
+}
+```
+
+```java
+private void computePrice(OrderEntity orderEntity, List<OrderItemEntity> orderItemEntities) {
+    BigDecimal totalPrice = new BigDecimal("0.0");
+    BigDecimal totalPromotionAmount = new BigDecimal("0.0");
+    BigDecimal totalCouponAmount = new BigDecimal("0.0");
+    BigDecimal totalIntegrationAmount = new BigDecimal("0.0");
+    // 积分
+    BigDecimal totalGift = new BigDecimal("0.0");
+    BigDecimal totalGrowth = new BigDecimal("0.0");
+    // 订单总额，叠加每一个订单项的总额
+    for (OrderItemEntity orderItemEntity : orderItemEntities) {
+        BigDecimal realAmount = orderItemEntity.getRealAmount();
+        totalPromotionAmount = totalPromotionAmount.add(orderItemEntity.getPromotionAmount());
+        totalCouponAmount = totalCouponAmount.add(orderItemEntity.getCouponAmount());
+        totalIntegrationAmount = totalIntegrationAmount.add(orderItemEntity.getIntegrationAmount());
+        totalPrice = totalPrice.add(realAmount);
+        totalGift = totalGift.add(BigDecimal.valueOf(orderItemEntity.getGiftIntegration()));
+        totalGrowth = totalGrowth.add(BigDecimal.valueOf(orderItemEntity.getGiftGrowth()));
+    }
+    // 1. 订单价格相关
+    orderEntity.setTotalAmount(totalPrice);
+    // 应付总额
+    orderEntity.setPayAmount(totalPrice.add(orderEntity.getFreightAmount()));
+    orderEntity.setPromotionAmount(totalPromotionAmount);
+    orderEntity.setCouponAmount(totalCouponAmount);
+    orderEntity.setIntegrationAmount(totalIntegrationAmount);
+
+    // 设置积分等信息
+    orderEntity.setIntegration(totalGift.intValue());
+    orderEntity.setGrowth(totalGrowth.intValue());
+
+    // 设置订单删除状态
+    orderEntity.setDeleteStatus(0); // 未删除
+}
+```
+
+在上面的代码中完成了一些价格和优惠积分等数据的封装，接着就需要对价格数据进行验价操作，为什么要进行验价？因为当前的价格在 Redis 中也存有一份，所以不一定是最新的，
+因此需要从数据库中获取到最新的数据后，与前端提交的价格进行对比，如果相同才能进行订单的保存，否则返回错误信息。不过这里对价格的一致性判断并不是看它们石佛完全一致，
+而是让它们相减，小于某个约定的值则认为订单页面的价格是最新的，因为价格的计算难免存在微小的误差，当这个误差在允许范围内则认为一致。
+
+```java
+@Transactional
+@Override
+public SubmitOrderResponseVo submitOrder(OrderSubmitVo orderSubmitVo) {
+    // 将页面传递的数据放入 ThreadLocal
+    threadLocal.set(orderSubmitVo);
+
+    SubmitOrderResponseVo submitOrderResponseVo = new SubmitOrderResponseVo();
+    submitOrderResponseVo.setCode(0);
+    MemberResponseVo memberResponseVo = LoginUserInterceptor.threadLocal.get();
+    // 1. 验证令牌
+    ...
+
+    String orderToken = orderSubmitVo.getOrderToken();
+    String redisTokenKey = OrderConstant.USER_ORDER_TOKEN_PREFIX + memberResponseVo.getId();
+    Long result = stringRedisTemplate.execute(redisScript, Collections.singletonList(redisTokenKey), orderToken);
+    if (result == 0L) {
+        // 令牌验证失败
+        submitOrderResponseVo.setCode(1);
+        return submitOrderResponseVo;
+    } else {
+        // TODO 验证成功
+        // 1. 创建订单、订单项等信息
+        OrderCreateTo orderCreateTo = creatOrder();
+        // 2. 验价
+        BigDecimal payAmount = orderCreateTo.getOrder().getPayAmount();
+        if (Math.abs(payAmount.subtract(orderSubmitVo.getPayPrice()).doubleValue()) < 0.01) {
+            // 3. 金额对比成功，保存订单
+            saveOrder(orderCreateTo);
+        } else {
+            submitOrderResponseVo.setCode(2);
+            return submitOrderResponseVo;
+        }
+    }
+}
+```
+
+当金额对比成功后，则可以进行订单的保存操作，该操作设计两张表，分别是订单表 oms_order 和订单项表 oms_order_item，把上面的方法中封装的两个对象分别插入对应的表中即可。
+
+```java
+/**
+ * 保存订单数据
+ */
+private void saveOrder(OrderCreateTo orderCreateTo) {
+    OrderEntity orderEntity = orderCreateTo.getOrder();
+    orderEntity.setModifyTime(new Date());
+    save(orderEntity);
+    List<OrderItemEntity> orderItemEntities = orderCreateTo.getOrderItems();
+    orderItemService.saveBatch(orderItemEntities);
+}
+```
+
+****
+### 5.3 锁定库存操作
+
+关于电商系统的库存操作，在扣减库存时并不是直接进行库存字段的删减，而是先把需要扣减的库存数量存入另一个字段：锁定库存，该字段用来临时存储当前需要扣减的库存，
+只有当订单成功提交并支付后才会完成真正的扣减，否则就会把这个锁定库存中的数据重新加回库存字段。因此，在提交订单时，需要判断当前商品的库存数据是否充足。
+库存锁定操作属于 gulimall-ware 服务，所以需要用到远程调用，在远程调用时需要传递当前订单的订单号和需要锁住的商品信息，因此封装为一个传递对象 WareSkuLockVo：
+
+```java
+@Data
+public class WareSkuLockVo {
+    private String orderSn; // 订单号
+    private List<OrderItemVo> lockItems; // 要锁住的所有库存商品信息
+}
+```
+
+在传递该对象前需要对其进行数据的封装，有关订单号和商品信息早在保存订单前就完成了封装，这里只需要从 OrderCreateTo 对象中拿出即可，不过锁定库存最主要的就是 skuId 和 num，
+因此不需要封装太多字段。
+
+```java
+@Transactional
+@Override
+public SubmitOrderResponseVo submitOrder(OrderSubmitVo orderSubmitVo) {
+    if (result == 0L) {
+        // 令牌验证失败
+        submitOrderResponseVo.setCode(1);
+        return submitOrderResponseVo;
+    } else {
+        // TODO 验证成功
+        // 1. 创建订单、订单项等信息
+        OrderCreateTo orderCreateTo = creatOrder();
+        // 2. 验价
+        BigDecimal payAmount = orderCreateTo.getOrder().getPayAmount();
+        if (Math.abs(payAmount.subtract(orderSubmitVo.getPayPrice()).doubleValue()) < 0.01) {
+            // 3. 金额对比成功，保存订单
+            saveOrder(orderCreateTo);
+            // 4. 库存锁定，只要有异常就回滚订单数据
+            WareSkuLockVo wareSkuLockVo = new WareSkuLockVo();
+            wareSkuLockVo.setOrderSn(orderCreateTo.getOrder().getOrderSn());
+            List<OrderItemVo> orderItemVoList = orderCreateTo.getOrderItems().stream().map(item -> {
+                OrderItemVo orderItemVo = new OrderItemVo();
+                orderItemVo.setSkuId(item.getSkuId());
+                orderItemVo.setCount(item.getSkuQuantity());
+                orderItemVo.setTitle(item.getSkuName());
+                return orderItemVo;
+            }).collect(Collectors.toList());
+            wareSkuLockVo.setLockItems(orderItemVoList);
+            // 远程锁定库存
+            R r = wareFeignService.orderLockStock(wareSkuLockVo);
+            if (r.getCode() == 0) {
+                // 库存锁定成功
+                submitOrderResponseVo.setOrder(orderCreateTo.getOrder());
+                return submitOrderResponseVo;
+            } else {
+                // 库存锁定失败
+                throw new NoStockException();
+            }
+        } else {
+            submitOrderResponseVo.setCode(2);
+            return submitOrderResponseVo;
+        }
+    }
+}
+```
+
+而锁定库存的逻辑大致为依次查找所有的仓库，当其中有一个仓库的库存足够此次的锁定时便进行锁定操作并结束查询仓库。这里封装了一个结果对象用来接收锁定库存时需要用到的数据：
+
+```java
+@Data
+public class SkuWareHasStock {
+    private Long skuId;
+    private Integer num;
+    private List<Long> wareIds;
+}
+```
+
+```java
+@PostMapping("/ware/waresku/lock/order")
+R orderLockStock(@RequestBody WareSkuLockVo wareSkuLockVo);
+```
+
+查询仓库是否有库存需要先封装对象，把远程传递来的 WareSkuLockVo 封装为 SkuWareHasStock，接着再看哪些仓库的库存充足。
+
+```java
+@Override
+@Transactional
+public Boolean orderLockStock(WareSkuLockVo wareSkuLockVo) {
+    // 1. 找到每个商品在哪个仓库都有库存
+    List<OrderItemVo> lockItems = wareSkuLockVo.getLockItems();
+    List<SkuWareHasStock> skuWareHasStocks = lockItems.stream().map(lockItem -> {
+        SkuWareHasStock skuWareHasStock = new SkuWareHasStock();
+        Long skuId = lockItem.getSkuId();
+        skuWareHasStock.setSkuId(skuId);
+        skuWareHasStock.setNum(lockItem.getCount());
+        List<Long> wareIds = wareSkuDao.listWareIdHasSkuStock(skuId);
+        skuWareHasStock.setWareIds(wareIds);
+        return skuWareHasStock;
+    }).collect(Collectors.toList());
+    // 2. 锁定库存
+    for (SkuWareHasStock skuWareHasStock : skuWareHasStocks) {
+        Boolean skuStockLocked = false;
+        Long skuId = skuWareHasStock.getSkuId();
+        List<Long> wareIds = skuWareHasStock.getWareIds();
+        if (wareIds.isEmpty()) {
+            throw new NoStockException(skuId);
+        }
+        for (Long wareId : wareIds) {
+            Long count = wareSkuDao.lockSkuStock(skuId, wareId, skuWareHasStock.getNum());
+            if (count == 1) {
+                // 库存锁定成功
+                skuStockLocked = true;
+                break;
+            } else {
+                // 当前仓库库存锁定失败，尝试下一个仓库
+            }
+        }
+        if (!skuStockLocked) {
+            // 当前仓库都库存不足，没法锁住
+            throw new NoStockException(skuId);
+        }
+    }
+    // 3. 锁定成功
+    return true;
+}
+```
+
+查询仓库库存是否充足则是直接查询表 wms_ware_sku，查询相关的 skuId 即可，不过需要确保查询条件为 stock 大于锁定库存加上当前需要锁定的商品数量：
+
+```xml
+<update id="lockSkuStock">
+    update wms_ware_sku set stock_locked = stock_locked + #{num} where sku_id = #{skuId} and ware_id = #{wareId} and stock - stock_locked >= #{num}
+</update>
+```
+
+如果成功完成更新操作就会返回受影响的表数据条数，通过条数是否大于 1 来判断是否成功锁定库存，锁定失败就抛出异常，回滚事务。最后就是库存锁定成功并返回封装好的订单提交数据给前端页面。
+
+```java
+@PostMapping("/submitOrder")
+public String submitOrder(@RequestBody OrderSubmitVo orderSubmitVo, Model model, RedirectAttributes redirectAttributes) {
+    SubmitOrderResponseVo submitOrderResponseVo = orderService.submitOrder(orderSubmitVo);
+    if (submitOrderResponseVo.getCode() == 0) {
+        // 提交订单成功，跳转到支付页
+        model.addAttribute("submitOrderResponseVo", submitOrderResponseVo);
+        return "pay";
+    } else {
+        String msg = "下单失败：";
+        switch (submitOrderResponseVo.getCode()) {
+            case 1: msg += "订单信息过期，请刷新后再提交！"; break;
+            case 2: msg += "订单商品价格发生变化，请确认后再提交！"; break;
+        }
+        redirectAttributes.addFlashAttribute("msg", msg);
+        // 失败跳回订单确认页
+        return "redirect://order.gulimall.com/toTrade";
+    }
+}
+```
+
+****
+## 6. 分布式事务
+
+### 6.1 本地事务
+
+本地事务指的是所有操作都在单个资源管理器（通常是单个数据库连接）内完成的事务，它的核心特点是“本地”，意味着它只能保证对单个数据库的一系列操作具备 ACID 特性，
+无法跨越多个异构的数据库或远程服务，通常使用注解 @Transactional 或编程式事务来管理本地事务，其底层依赖于数据库本身的事务支持。
+
+ACID 原则：
+
+1、原子性 (Atomicity)
+
+一个事务内的所有操作被视为一个不可分割的原子单元，这些操作要么全部成功，要么全部失败，不会停留在中间状态。数据库通过回滚日志实现原子性，如果事务失败或回滚，
+数据库会根据回滚日志将已经执行的操作全部撤销。
+
+2、一致性 (Consistency)
+
+事务执行前后，数据库必须从一个一致性状态变换到另一个一致性状态，也就是说事务要保证数据库的完整性约束（如主键、外键、唯一约束、触发器）不被破坏，
+由应用程序和数据库共同保证，因此应用程序要编写正确的业务逻辑，而数据库负责维护预定义的约束。
+
+3、隔离性 (Isolation)
+
+并发执行的事务之间应该相互隔离，一个事务的执行不应该影响其他同时执行的事务，以此防止出现脏读、不可重复读、幻读等问题。而数据库通过锁机制和多版本并发控制（MVCC）来实现，
+MySQL 的 InnoDB 引擎就广泛使用了 MVCC。
+
+4、持久性 (Durability)
+
+一旦事务提交成功，它对数据库的修改就是永久性的，即使发生系统故障（如断电、崩溃），数据也不会丢失。数据库通过 Redo Log（重做日志）来实现。在提交事务时，
+数据变更会先写入 Redo Log，然后再慢慢写回磁盘。即使系统崩溃，重启后也能根据 Redo Log 恢复已提交的数据。
+
+Spring 的事务管理是基于 AOP 思想的，AOP 的核心目的是将横切关注点与核心业务逻辑分离开来。而 @Transactional 注解本身只是一个元数据标记，
+它不会自动执行任何开启或提交事务的操作，这些操作都是由代理对象来完成的。Spring 在启动初始化 Bean 时，会为带有 @Transactional 注解的类创建代理对象。所以在使用事务的时候，
+不能直接调用本类的事务，否则就会导致代理对象失效。
+
+```java
+@Service
+public class OrderService {
+    
+    @Transactional
+    public void createOrder() {
+        saveOrder();
+        // 调用同类中的另一个事务方法
+        updateStock();
+    }
+
+    @Transactional
+    public void updateStock() {
+        // 更新库存
+    }
+}
+```
+
+外部调用 orderService.createOrder() -> 通过代理对象调用 -> 进入 TransactionInterceptor -> 事务逻辑生效。
+createOrder() 内部调用 this.updateStock() -> 这里的 this 是当前对象本身，不是代理对象，所以不会触发 AOP 拦截器，因此 updateStock() 上的事务注解被绕过了。
+所以得获取到自身的代理对象后，再通过该代理对象调用事务方法：
+
+```java
+@Autowired
+private ApplicationContext context;
+
+@Transactional
+public void createOrder() {
+    saveOrder();
+    // 通过代理对象调用
+    OrderService proxy = context.getBean(OrderService.class);
+    proxy.updateStock();
+}
+
+```
+
+****
+### 6.2 本地事务在分布式下的问题
+
+当前的订单提交代码属于分布式调用，但使用的事务却是 @Transactional 本地事务，这种搭配方式很有可能造成巨大的问题。当前的代码执行顺序大致为：
+
+1. 在本地事务（submitOrder）内生成并 saveOrder(orderCreateTo) （写入订单表，此时尚未提交事务）。
+2. 仍在本地事务内，调用远程库存服务 wareFeignService.orderLockStock(wareSkuLockVo)。
+3. 远程返回成功 -> 本地事务最终提交 -> 下单成功；否则抛异常回滚。
+
+该流程可能造成库存锁定成功，但后续订单提交失败：
+
+wareFeignService.orderLockStock() 远程调用成功，库存已经锁定，远程调用（RPC）返回成功（r.getCode() == 0），但在该方法后续的执行过程中（或在调用方 submitOrder 方法的后续过程中），发生了异常。
+例如：保存订单成功后，执行其他业务逻辑（如更新用户积分、发送消息等）时抛出异常；数据库连接突然断开，导致事务回滚。这就可能导致发生异常，@Transactional 生效，
+之前插入的订单和订单项的数据会被撤销。但此时远程调用已经生效了，因为库存锁定的操作是远程服务的一个独立事务，它已经提交并持久化到库存数据库中了，这个操作不会被回滚。
+这就导致订单不存在，但库存却被锁定了，这部分被锁定的库存无法被其他订单使用，变成了死库存，直到系统通过其他机制（如超时解锁）将其释放。
+
+造成上述问题的根本原因就是事务边界不一致，订单事务和库存事务是两个独立的、分别管理的本地事务。Spring 的 @Transactional 无法跨越多个数据库（订单库和库存库）和服务边界形成一个大事务。
+并且它没有一种机制来保证这两个独立的事务要么都成功，要么都失败。而分布式调用固有的网络延迟、超时、重试等问题都会让系统状态变得复杂和不确定。
+
+****
+### 6.3 分布式事务 CAP
+
+- 一致性（Consistency）：对任何客户端来说，每次读操作都能返回最新的写操作结果（或报错），也就是说，所有节点在同一时间看到的数据是完全相同的。
+- 可用性（Availability）：对任何非故障节点的请求（无论读写）都必须在合理的时间内得到正常的响应（不能是超时或拒绝连接）。
+- 分区容错性（Partition Tolerance）：系统能够持续提供服务，即使系统内部发生了网络分区（即由于网络故障，导致系统中的节点被分割成多个孤立的群体，彼此无法通信），这也是分布式服务中必须要保证的。
+
+由于网络分区无法避免，在实际开发中实际上不是在C、A、P 中三选二，而是在发生 P 时，是选择 C 还是选择 A。
+
+1、CP
+
+当网络分区（P）发生时，为了保证所有节点数据的一致性（C），系统将禁止对某些数据的写入，或者让部分节点拒绝服务的请求，从而牺牲可用性（A）。因此这种模式只适合对数据一致性要求极高的系统，
+例如金融系统中的转账、支付等功能，即使会让程序进入繁忙或等待状态，也必须保证数据的正确。
+
+2、AP
+
+当网络分区（P）发生时，系统依然允许所有节点对外提供服务（保证 A），但不同分区之间的数据可能因为无法同步而出现不一致（牺牲 C，强一致性，但最终会通过一些机制，比如冲突解决、数据同步达到最终一致性）。
+适合对用户体验和系统可用性要求极高的系统，可以容忍短暂的数据不一致。例如电商系统的商品库存功能、用户评论等。
+
+3、CA
+
+理论上，如果系统能保证永远不发生网络分区，那么它就可以同时拥有一致性和可用性，但这在分布式系统中是不存在的，任何跨网络的系统都无法百分百避免网络故障。因此，
+CA 系统实际上不是一个分布式系统的选项，它只存在于单点系统中，例如单个数据库服务器。所以，一旦采用了分布式架构，就必须考虑 P 的情况。
+
+****
+### 6.4 分布式 Raft 原理
+
+在分布式系统中，多个节点需要协同工作，但节点可能会故障、网络可能会延迟或中断，在这种不可靠的环境下，就需要用到 Raft 算法了，它保证即使在部分节点故障、网络分区的情况下，
+集群也能对外提供服务，并且所有成功提交的数据都不会丢失。Raft 算法有三个核心概念：
+
+1. 领导者选举：集群必须有一个领导者来处理所有客户端请求，当没有领导者时，节点需要能自动选举出新的领导者。 
+2. 日志复制：领导者从客户端接收操作命令，将这些命令作为日志条目复制到集群中的其他节点，并强制大多数节点保持日志一致。 
+3. 安全性：这是 Raft 的核心约束，它最关键的一条是：只有拥有最新、最完整日志的节点才有资格成为领导者，所以这确保了已提交的日志条目永远不会被覆盖。
+
+而节点之间又分为三个角色，集群中的每个节点都处于这三个角色之一：
+
+1. 领导者（Leader）：1 个，处理所有客户端请求；管理日志复制；唯一能接受客户端写请求的节点。
+2. 跟随者（Follower）：多个，它们完全被动，不发送任何请求，只响应来自 Leader 和 Candidate 的远程调用，但会接收并持久化 Leader 发来的日志。
+3. 候选者（Candidate）：它是选举过程中的临时状态，当 Follower 认为 Leader 失联时，会转变为 Candidate 并发起新一轮领导者选举。
+
+Raft 原理：
+
+1、任期
+
+Raft 将时间划分为任意长度的任期，每个任期用一个连续递增的数字标识（如第 1 任期、第 2 任期...），它主要是用于识别过时的信息和节点，因为每个节点都保存着自己看到的最新任期，
+而每一个任期内，最多只有一个领导者，但有些任期可能由于选举失败而没有领导者，因此就需要继续选举直到产生领导者。
+
+2、领导者选举
+
+领导者通过周期性地向所有跟随者发送信息 RPC，即使没有东西，也会持续周期性地发送，这叫做心跳机制。而 Follower 会启动一个随机的选举超时定时器（通常是 150ms-300ms），
+如果在该时间内没有收到当前 Leader 的心跳，它就认为 Leader 已经挂了，于是就会发起选举。此时 Follower 会增加自己的当前任期，并转换为 Candidate，然后给自己投一票，
+接着再向集群中所有其他节点并行发送请求投票 RPC，请求它们为自己投票。但每个节点在一个任期内最多投出一票（先到先得），它们会投票给 Candidate，
+但当且仅当：Candidate 的任期号 >= 自己的当前任期；Candidate 的日志至少和自己的一样新。最后，如果 Candidate 收到了超过半数的投票，它就会成为新的 Leader。
+此时它会立即向所有节点发送心跳，来阻止新的选举产生。但如果它收到了其他节点发来的 RPC，发现别人的任期号比自己大，它就承认这个更权威的节点，自行降级为 Follower。
+不过，如果多个 Candidate 同时参选，导致票数分散，没有任何一个获得超半数票，则本任期选举失败，此时每个 Candidate 会等待一个随机的超时时间后，开启下一任期再次发起选举，
+因为随机超时时间的存在，极大地降低了再次平局的概率。
+
+3、日志复制
+
+客户端将所有写请求发送给 Leader，Leader 首先将客户端请求中的命令作为一个新的日志条目追加到自己的本地日志中（此时状态是未提交），然后 Leader 通过附加条目 RPC，
+将该日志条目复制到所有 Follower。Follower 收到 RPC 后，会进行一致性检查，如果通过，则将日志条目追加到本地，并回复 Leader 成功。
+一旦 Leader 确认该日志条目已被超过半数的节点成功复制，Leader 就将其提交（Commit）并应用该数据，最后将结果返回给客户端。
+
+****
+### 6.5 Seata
+
+Seata（Simple Extensible Autonomous Transaction Architecture）是一款开源的分布式事务解决方案，致力于在微服务架构下提供高性能和简单易用的分布式事务服务。
+Seata 的架构中包含了三个核心组件：
+
+1、TC：事务协调器
+
+它负责维护全局事务和分支事务的状态，驱动全局事务的提交或回滚，是需要独立部署的服务器端组件。这是 Seata 的核心，需要保证高可用（通常通过集群部署）。
+
+2、TM：事务管理器
+
+它是事务的发起者，通过注解 @GlobalTransactional 开启一个全局事务，并向 TC 发起 “全局事务的开启、提交、回滚” 指令，它集成在微服务应用端，
+每个需要开启分布式事务的微服务都是一个 TM。
+
+3、RM：资源管理器
+
+它是事务的参与者，负责管理分支事务（Branch Transaction）处理的资源（即数据库），向 TC 注册分支事务、汇报分支事务状态，并接收来自 TC 的提交或回滚指令，
+集成在微服务应用端，每个操作数据库的微服务都是一个 RM。
+
+```text
+[TM (服务A)] —————— 开启全局事务 ——————> [TC Server]
+   |                                        |
+   |--- 执行分支事务A (向TC注册分支) ---------->|
+   |                                        |
+   |--- 调用服务B ---> [RM (服务B)]           |
+                    |--- 执行分支事务B ---> [TC (注册分支)]
+                    |                       |
+[TM] —————— 提交/回滚全局事务 ————————> [TC]
+                                            |--- 驱动所有分支事务提交/回滚 ---> [RM A, RM B, ...]
+```
+
+TM 和 RM 可以理解为 Seata 的客户端部分，引入到参与事务的微服务依赖中即可。将来 TM 和 RM 就会协助微服务，实现本地分支事务与 TC 之间交互，实现事务的提交或回滚。
+而 TC 服务则是事务协调中心，是一个独立的微服务，需要单独部署。
+
+****
+
+
+
+
+
+
+
 
 

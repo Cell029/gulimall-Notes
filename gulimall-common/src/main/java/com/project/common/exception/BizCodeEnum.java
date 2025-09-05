@@ -14,6 +14,7 @@ package com.project.common.exception;
  *  13: 购物车
  *  14: 物流
  *  15: 用户
+ *  21: 库存
  */
 public enum BizCodeEnum {
     UNKNOW_EXEPTION(10000,"系统未知异常"),
@@ -28,7 +29,9 @@ public enum BizCodeEnum {
 
     PHONE_EXIT_EXCEPTION(15002, "手机号已存在"),
 
-    LOGINACCT_PASSWORD_INVALID_EXCEPTION(15003, "账号密码错误");
+    LOGINACCT_PASSWORD_INVALID_EXCEPTION(15003, "账号密码错误"),
+
+    NO_STOCK_EXCEPTION(21000, "商品库存不足");
 
     private int code;
     private String msg;

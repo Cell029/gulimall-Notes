@@ -2,7 +2,8 @@ package com.project.gulimall.ware.service.impl;
 
 import com.alibaba.cloud.commons.lang.StringUtils;
 import com.project.common.utils.R;
-import com.project.gulimall.ware.domain.vo.SkuHasStockVo;
+import com.project.gulimall.ware.domain.vo.*;
+import com.project.common.exception.NoStockException;
 import com.project.gulimall.ware.feign.ProductFeignService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
@@ -89,5 +90,48 @@ public class WareSkuServiceImpl extends ServiceImpl<WareSkuDao, WareSkuEntity> i
         }).collect(Collectors.toList());
         return skuHasStockVos;
     }
+
+    @Override
+    @Transactional
+    public Boolean orderLockStock(WareSkuLockVo wareSkuLockVo) {
+        // 1. 找到每个商品在哪个仓库都有库存
+        List<OrderItemVo> lockItems = wareSkuLockVo.getLockItems();
+        List<SkuWareHasStock> skuWareHasStocks = lockItems.stream().map(lockItem -> {
+            SkuWareHasStock skuWareHasStock = new SkuWareHasStock();
+            Long skuId = lockItem.getSkuId();
+            skuWareHasStock.setSkuId(skuId);
+            skuWareHasStock.setNum(lockItem.getCount());
+            List<Long> wareIds = wareSkuDao.listWareIdHasSkuStock(skuId);
+            skuWareHasStock.setWareIds(wareIds);
+            return skuWareHasStock;
+        }).collect(Collectors.toList());
+        // 2. 锁定库存
+        for (SkuWareHasStock skuWareHasStock : skuWareHasStocks) {
+            Boolean skuStockLocked = false;
+            Long skuId = skuWareHasStock.getSkuId();
+            List<Long> wareIds = skuWareHasStock.getWareIds();
+            if (wareIds.isEmpty()) {
+                throw new NoStockException(skuId);
+            }
+            for (Long wareId : wareIds) {
+                Long count = wareSkuDao.lockSkuStock(skuId, wareId, skuWareHasStock.getNum());
+                if (count == 1) {
+                    // 库存锁定成功
+                    skuStockLocked = true;
+                    break;
+                } else {
+                    // 当前仓库库存锁定失败，尝试下一个仓库
+                }
+            }
+            if (!skuStockLocked) {
+                // 当前仓库都库存不足，没法锁住
+                throw new NoStockException(skuId);
+            }
+        }
+        // 3. 锁定成功
+        return true;
+    }
+
+
 
 }
