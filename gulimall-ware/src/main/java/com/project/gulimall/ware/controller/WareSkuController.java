@@ -90,11 +90,25 @@ public class WareSkuController {
     /**
      * 库存锁定
      */
-    @PostMapping("/lock/order")
+    /*@PostMapping("/lock/order")
     public R orderLockStock(@RequestBody WareSkuLockVo wareSkuLockVo){
         try {
             Boolean lockStock = wareSkuService.orderLockStock(wareSkuLockVo);
             return R.ok();
+        } catch (NoStockException e) {
+            return R.error(BizCodeEnum.NO_STOCK_EXCEPTION.getCode(), BizCodeEnum.NO_STOCK_EXCEPTION.getMsg());
+        }
+    }*/
+
+    @PostMapping("/lock/order")
+    public R orderLockStock(@RequestBody WareSkuLockVo wareSkuLockVo){
+        try {
+            Boolean b = wareSkuService.orderLockStockWithMessage(wareSkuLockVo);
+            if (b) {
+                return R.ok();
+            } else {
+                return R.error(BizCodeEnum.NO_STOCK_EXCEPTION.getCode(), BizCodeEnum.NO_STOCK_EXCEPTION.getMsg());
+            }
         } catch (NoStockException e) {
             return R.error(BizCodeEnum.NO_STOCK_EXCEPTION.getCode(), BizCodeEnum.NO_STOCK_EXCEPTION.getMsg());
         }

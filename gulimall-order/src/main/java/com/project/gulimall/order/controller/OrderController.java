@@ -3,11 +3,7 @@ package com.project.gulimall.order.controller;
 import java.util.Arrays;
 import java.util.Map;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.web.bind.annotation.PathVariable;
-import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RequestParam;
-import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.bind.annotation.*;
 import com.project.gulimall.order.domain.entity.OrderEntity;
 import com.project.gulimall.order.service.OrderService;
 import com.project.common.utils.PageUtils;
@@ -78,6 +74,15 @@ public class OrderController {
 		orderService.removeByIds(Arrays.asList(ids));
 
         return R.ok();
+    }
+
+    /**
+     * 查询订单状态
+     */
+    @GetMapping("/status/{orderSn}")
+    public R getOrderStatus(@PathVariable String orderSn){
+        OrderEntity orderEntity = orderService.getByOrderSn(orderSn);
+        return R.ok().setData("orderEntity", orderEntity);
     }
 
 }

@@ -16493,11 +16493,687 @@ TM 和 RM 可以理解为 Seata 的客户端部分，引入到参与事务的微
 而 TC 服务则是事务协调中心，是一个独立的微服务，需要单独部署。
 
 ****
+## 7. 延时队列
+
+### 7.1 RabbitMQ 延时队列
+
+延时队列是一种特殊的队列，其中的元素并不是在入队后立即被消费，而是必须等待至指定的延迟时间过后，消费者才能从队列中获取到该元素。延时队列在需要处理定时或延迟任务的场景中非常常见，
+例如电商系统中的订单下单后 30 分钟内未支付，自动取消订单。而 RabbitMQ 就可以实现延时队列的功能。
+
+1、基于死信队列：
+
+通过为单条消息或者单个队列设置存活时间 TTL，然后配合死信交换机使用。当消息在一个队列中变成死信后，它能被重新发送到另一个交换机，这个交换机就是死信交换机（DLX）。
+而消息在以下三种情况会变成死信：
+
+1. 消息被消费者拒绝 (basic.reject 或 basic.nack) 并且设置了 requeue=false（不重新放回队列）。 
+2. 消息因 TTL 过期。 
+3. 队列长度达到最大限制，导致消息被丢弃。
+
+而通常使用的延时队列是用的第二种方案，实现流程大致为：
+
+1、创建组件
+
+创建一个普通的交换机和一个普通的队列，再创建一个死信交换机和一个真正的业务队列，并将两者绑定。
+
+2、配置延迟队列：
+
+在声明 order.delay.queue 时，设置以下关键参数：
+
+- x-message-ttl: 1800000，队列中所有消息的TTL都为30分钟（单位毫秒） 
+- x-dead-letter-exchange: order.dlx.exchange，指定死信交换机 
+- x-dead-letter-routing-key: order.cancel，指定发送到死信交换机的 routing key，不设置则使用原消息的 routing key
+
+3、发送消息
+
+订单服务生产者将消息发送到普通交换机，并携带普通 routing key，最终消息会进入普通队列。此时，消费者是监听死信队列而不是监听普通队列。普通队列只是一个中间等待队列，
+无人消费。
+
+4、消息过期与转发
+
+消息在普通队列中等待 30 分钟，一旦存活时间达到 30 分钟，TTL 到期，该消息就会变成死信，RabbitMQ 会自动将这条死信消息重新发布到配置好的死信交换机中，
+死信交换机根据消息的 routing key 将其路由到最终的业务队列死信队列。而专门处理取消订单的服务会一直监听死信队列，一旦有消息进入，即 30 分钟到了，
+它就能立刻拿到消息并执行取消订单的逻辑。
+
+不过该方案有个严重缺点，那就是队首阻塞问题，假设队列中存在两条消息：消息A: TTL = 30 分钟，排在队首；消息B: TTL = 10 分钟，排在消息 A 后面。
+尽管消息 B 在 10 分钟后就应该到期，但 RabbitMQ 只会检查队首消息（消息 A）是否过期，只要消息 A 没有到期（30 分钟没到），即使消息 B 早已到期，它也不会被处理。
+消息 B 必须等待消息 A 被移除后（30 分钟后），才会变成队首并被检查是否过期。所以基于死信队列的方案只适用于所有消息延迟时间都相同的场景，如果消息延迟时间各异，
+此方案会导致短延迟的消息被长延迟的消息阻塞，无法按时投递。
+
+```java
+@Slf4j
+@Component
+public class MyRabbitMQInitializer {
+
+    @Bean
+    public Queue orderDelayQueue() {
+        /**
+         * x-dead-letter-exchange
+         * x-dead-letter-routing-key
+         * x-message-ttl
+         */
+        Map<String, Object> args = new HashMap<String, Object>();
+        args.put("x-dead-letter-exchange", "order-event-exchange"); // 指定死信交换机
+        args.put("x-dead-letter-routing-key", "order.release.order"); // 指定死信路由键
+        args.put("x-message-ttl", 60000); // 设置TTL
+
+        /**
+         * public Queue(String name, boolean durable, boolean exclusive, boolean autoDelete, @Nullable Map<String, Object> arguments);
+         */
+        return new Queue("order.delay.queue", true, false, false, args);
+    }
+
+    @Bean
+    public Queue orderReleaseQueue() {
+        return new Queue("order.release.queue", true, false, false);
+    }
+
+    @Bean
+    public Exchange orderEventExchange() {
+        /**
+         * public TopicExchange(String name, boolean durable, boolean autoDelete, Map<String, Object> arguments);
+         */
+        return new TopicExchange("order-event-exchange", true, false);
+    }
+
+    @Bean
+    public Binding orderCreateBinding() {
+        /**
+         * public Binding(String destination, DestinationType destinationType, String exchange, String routingKey, @Nullable Map<String, Object> arguments);
+         */
+        return new Binding("order.delay.queue", Binding.DestinationType.QUEUE, "order-event-exchange", "order.create.order", null);
+    }
+
+    @Bean
+    public Binding orderReleaseBinding() {
+        return new Binding("order.release.queue", Binding.DestinationType.QUEUE, "order-event-exchange", "order.release.order", null);
+    }
+
+    @RabbitListener(queues = "order.release.queue")
+    public void listener(OrderEntity orderEntity) {
+        log.info("收到订单超时消息，订单号：{}", orderEntity.getOrderSn());
+        // 简单的取消订单逻辑
+        if (orderEntity.getStatus() == 0) { // 0 表示未支付
+            log.info("执行订单取消操作，订单ID：{}", orderEntity.getId());
+            System.out.println("订单 " + orderEntity.getOrderSn() + " 因超时未支付已自动取消");
+        } else {
+            log.info("订单已支付，无需处理，订单号：{}", orderEntity.getOrderSn());
+        }
+    }
+}
+```
+
+```java
+@ResponseBody
+@GetMapping("/create")
+public String createOrder() {
+    // 1. 创建订单（简化示例）
+    OrderEntity order = new OrderEntity();
+    order.setOrderSn(UUID.randomUUID().toString());
+    order.setStatus(1); // 1-已支付
+    order.setCreateTime(new Date());
+    log.info("创建订单成功，订单号：{}", order.getOrderSn());
+    // 2. 发送延迟消息到 RabbitMQ
+    try {
+        rabbitTemplate.convertAndSend(
+                "order-event-exchange", // 交换机名称
+                "order.create.order", // 路由键
+                order // 消息体
+        );
+        log.info("订单延迟消息已发送，订单号：{}", order.getOrderSn());
+    } catch (Exception e) {
+        log.error("发送延迟消息失败", e);
+    }
+    // 3. 返回订单信息
+    return "订单创建成功";
+}
+```
+
+2、基于官方延迟插件（rabbitmq_delayed_message_exchange）
+
+为了解决死信队列的队首阻塞问题，RabbitMQ 官方提供了一个插件，就是引入了一种新的交换机类型：x-delayed-message。这种交换机内部维护了一个数据库，来存储所有延迟消息及其元数据。
+它会根据消息的延迟时间进行排序和调度，从而避免了队首阻塞问题。
+
+1、安装插件
+
+RabbitMQ 默认没有启用该插件，需要手动安装：
+
+```shell
+# 进入 RabbitMQ 容器找到 RabbitMQ 插件目录
+docker exec -it rabbitmq bash
+ls /plugins
+
+# 官网下载对应版本的插件并拷贝到该目录
+docker cp /mnt/e/GoogleDownload/rabbitmq_delayed_message_exchange-4.1.0.ez rabbitmq:/plugins/
+
+# 确认文件已存在，可以看到 rabbitmq_delayed_message_exchange-4.1.0.ez
+docker exec -it rabbitmq bash
+ls /plugins | grep delayed
+
+# 启用插件并重启容器
+rabbitmq-plugins enable rabbitmq_delayed_message_exchange
+docker restart rabbitmq
+
+# 验证，可以看到 [E*] rabbitmq_delayed_message_exchange 4.1.0
+docker exec -it rabbitmq rabbitmq-plugins list | grep delayed
+```
+
+2、声明交换机
+
+声明一个类型为 x-delayed-message 的交换机，必须在 arguments 中指定一个 x-delayed-type，表示该交换机底层基于哪种原生交换机类型（direct, topic, fanout）。
+
+```java
+Map<String, Object> args = new HashMap<>();
+args.put("x-delayed-type", "direct"); // 底层基于 direct 类型
+// exchangeDeclare(String exchange, String type, boolean durable, boolean autoDelete, Map<String, Object> arguments);
+channel.exchangeDeclare("my-delayed-exchange", "x-delayed-message", true, false, args); // 最后一个参数 Map 中必须包含一个键为 "x-delayed-type" 的数据
+```
+
+3、生产者发送消息时，通过在消息头中设置 x-delay 参数来指定每条消息的延迟时间，单位毫秒
+
+```java
+AMQP.BasicProperties.Builder props = new AMQP.BasicProperties.Builder();
+Map<String, Object> headers = new HashMap<>();
+headers.put("x-delay", 600000); // 延迟 10 分钟
+props.headers(headers);
+channel.basicPublish("my-delayed-exchange", "my-routing-key", props.build(), message.getBytes());
+```
+
+```java
+public class Producer {
+    private final static String DELAYED_EXCHANGE_NAME = "my-delayed-exchange";
+    private final static String ROUTING_KEY = "my.routing.key";
+
+    public static void main(String[] argv) throws Exception {
+        // 1. 创建连接工厂
+        ConnectionFactory factory = new ConnectionFactory();
+
+        // 2. 配置连接信息
+        factory.setHost("localhost"); // RabbitMQ服务器主机名
+        factory.setUsername("admin"); 
+        factory.setPassword("admin"); 
+        factory.setPort(5672);
+
+        // 3. 建立连接和通道
+        try (Connection connection = factory.newConnection();
+             Channel channel = connection.createChannel()) {
+
+            // 4. 准备创建延迟交换机所需的参数
+            // 最后一个参数 Map 中必须包含一个键为 "x-delayed-type" 的数据
+            Map<String, Object> exchangeArgs = new HashMap<>();
+            exchangeArgs.put("x-delayed-type", "direct"); 
+
+            // 5. 声明延迟交换机
+            // exchangeDeclare(String exchange, String type, boolean durable, boolean autoDelete, Map<String, Object> arguments)
+            channel.exchangeDeclare(
+                    DELAYED_EXCHANGE_NAME, // 交换机名称
+                    "x-delayed-message",   // 交换机类型，由延迟插件提供
+                    true, // durable: 持久化，服务器重启后交换机仍存在
+                    false, // autoDelete: 不自动删除（当所有队列解绑后不删除交换机）
+                    exchangeArgs // arguments: 参数，包含关键的 x-delayed-type
+            );
+            System.out.println("延迟交换机 '" + DELAYED_EXCHANGE_NAME + "' 声明成功！");
+
+            // 6. 准备要发送的消息内容
+            String message = "这是一条测试延迟消息！";
+            System.out.println("准备发送消息: '" + message + "'");
+
+            // 7. 构建消息属性，设置延迟时间
+            // 通过在消息头中设置 x-delay 参数来指定每条消息的延迟时间
+            Map<String, Object> headers = new HashMap<>();
+            headers.put("x-delay", 10000); // 延迟 10 秒
+
+            AMQP.BasicProperties props = new AMQP.BasicProperties.Builder()
+                    .headers(headers) // 设置自定义头，这是实现延迟的关键
+                    .contentType("text/plain") // 设置内容类型
+                    .deliveryMode(2)  // 设置消息为持久化 (2 = persistent)
+                    .build();
+
+            // 8. 发送消息到延迟交换机
+            // basicPublish(String exchange, String routingKey, BasicProperties props, byte[] body)
+            channel.basicPublish(
+                    DELAYED_EXCHANGE_NAME, // 交换机
+                    ROUTING_KEY, // routingKey: 路由键，用于消息路由
+                    props, // props: 包含延迟时间等属性的对象
+                    message.getBytes(StandardCharsets.UTF_8) // body: 消息体字节数组编码格式
+            );
+            System.out.println(" [x] 消息已发送，它将在 10 秒后被投递。");
+        } catch (Exception e) {
+            System.err.println("发生错误: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+}
+```
+
+这种写法不会也不用创建死信机，使用消息属性 Props 中的 headers.put("x-delay", ...) 来设置延迟。
+
+****
+### 7.2 监听库存解锁
+
+创建 RabbitMQ 的死信机和两个队列，一个锁定库存队列，库存锁定时发送消息给该队列；一个死信队列，在锁定库存队列中的消息存活指定的 TTL 事件后，消息就会进入该队列，
+然后再从该队列中处理消息，判断是否需要解锁库存。
+
+```java
+@Bean
+public Exchange stockEventExchange() {
+    return new TopicExchange("stock-event-exchange", true, false);
+}
+
+@Bean
+public Queue stockReleaseQueue() {
+    return new Queue("stock.release.queue", true, false, false);
+}
+
+@Bean
+public Queue stockLockedQueue() {
+    Map<String, Object> args = new HashMap<String, Object>();
+    args.put("x-dead-letter-exchange", "stock-event-exchange"); // 指定死信交换机
+    args.put("x-dead-letter-routing-key", "stock.release.queue"); // 指定死信路由键
+    args.put("x-message-ttl", 120000); // 设置 TTL
+    return new Queue("stock.locked.queue", true, false, false, args);
+}
+
+@Bean
+public Binding stockReleaseBinding() {
+    return new Binding("stock.release.queue",
+            Binding.DestinationType.QUEUE,
+            "stock-event-exchange",
+            "stock.release.queue",
+            null);
+}
+
+@Bean
+public Binding stockLockedBinding() {
+    return new Binding("stock.locked.queue",
+            Binding.DestinationType.QUEUE,
+            "stock-event-exchange",
+            "stock.locked",
+            null);
+}
+```
+
+在这个过程需要用到两张表以及对应的实体类：表 wms_ware_order_task_detail 和 wms_ware_order_task。
+
+wms_ware_order_task_detail：
+
+| 名称       | 类型    | 长度 | 小数点 | 不是 null | 虚拟 | 键 | 注释                 |
+|------------|---------|------|--------|-----------|------|----|----------------------|
+| id         | bigint  |      |        | ✔️         |      | 🔑 | id                   |
+| sku_id     | bigint  |      |        |           |      |    | sku_id               |
+| sku_name   | varchar | 255  |        |           |      |    | sku_name             |
+| sku_num    | int     |      |        |           |      |    | 购买个数             |
+| task_id    | bigint  |      |        |           |      |    | 工作单id             |
+| ware_id    | bigint  |      |        |           |      |    | 仓库id               |
+| lock_status| int     |      |        |           |      |    | 1-锁定；2-解锁；3-扣减 |
+
+wms_ware_order_task：
+
+| 名称             | 类型    | 长度 | 小数点 | 不是 null | 虚拟 | 键 | 注释                          |
+|------------------|---------|------|--------|-----------|------|----|-------------------------------|
+| id               | bigint  |      |        | ✔️         |      | 🔑 | id                            |
+| order_id         | bigint  |      |        |           |      |    | order_id                      |
+| order_sn         | varchar | 255  |        |           |      |    | order_sn                      |
+| consignee        | varchar | 100  |        |           |      |    | 收货人                        |
+| consignee_tel    | char    | 15   |        |           |      |    | 收货人电话                    |
+| delivery_address | varchar | 500  |        |           |      |    | 配送地址                      |
+| order_comment    | varchar | 200  |        |           |      |    | 订单备注                      |
+| payment_way      | tinyint | 1    |        |           |      |    | 付款方式【1:在线付款 2:货到付款】 |
+| task_status      | tinyint |      |        |           |      |    | 任务状态                      |
+| order_body       | varchar | 255  |        |           |      |    | 订单描述                      |
+| tracking_no      | char    | 30   |        |           |      |    | 物流单号                      |
+| create_time      | datetime|      |        |           |      |    | create_time                   |
+| ware_id          | bigint  |      |        |           |      |    | 仓库id                        |
+| task_comment     | varchar | 500  |        |           |      |    | 工作单备注                    |
+
+在分布式系统中，单纯的库存扣减无法满足复杂的业务需求，例如如何知道哪些库存被锁定了、如何知道是为哪个订单锁定的、如果订单取消，如何精确释放库存，因此才引入这两张表。
+在订单创建，库存锁定，也就是用户下单后，订单服务需要向库存服务发起锁定库存请求，此时库存服务需要在 wms_ware_order_task 表中创建一条主记录，填入订单基本信息，
+这条记录标志着为这个订单处理库存的一个总任务开始了。然后遍历商品，执数据库存锁定，在 wms_ware_order_task_detail 表中为这个 sku 创建一条明细记录，
+填入 sku_id、sku_num、ware_id、task_id（关联到主任务 ID）并将 lock_status 字段设置为 1（锁定状态），所有商品锁定成功后，库存服务向订单服务返回成功响应。
+在锁定库存的同时，库存服务会向 RabbitMQ 发送一条延时消息，消息体内包含主任务 ID (task_id) 或订单 ID，用于后续查询。当消息到期，即 TTL 时间内用户未支付，
+延时消息就变成死信，被投递到释放队列，此时库存服务的监听器就会接收到该消息。监听器根据消息中的任务 ID 和 WareOrderTaskDetailEntity 实体获取到对应的库存数据
+（直接发送实体，消息消费者不需要再查询数据库），主要检查的就是锁定状态 lock_status，如果状态仍是 1（锁定），那就说明用户确实未支付，需要释放库存，
+所以就需要执行 sql，将锁定的库存减少之前加上的，然后将 wms_ware_order_task_detail 表中相应记录的 lock_status 更新为 2（解锁状态）。
+
+```java
+@Override
+@Transactional
+public Boolean orderLockStock(WareSkuLockVo wareSkuLockVo) {
+
+    /**
+     * 保存库存工作单详情
+     */
+    WareOrderTaskEntity wareOrderTaskEntity = new WareOrderTaskEntity();
+    wareOrderTaskEntity.setOrderSn(wareSkuLockVo.getOrderSn()); // 填入订单号
+    wareOrderTaskService.save(wareOrderTaskEntity);
+
+    // 1. 找到每个商品在哪个仓库都有库存
+    ...
+    // 2. 锁定库存
+    for (SkuWareHasStock skuWareHasStock : skuWareHasStocks) {
+        Boolean skuStockLocked = false;
+        Long skuId = skuWareHasStock.getSkuId();
+        List<Long> wareIds = skuWareHasStock.getWareIds();
+        if (wareIds.isEmpty()) {
+            throw new NoStockException(skuId);
+        }
+        for (Long wareId : wareIds) {
+            Long count = wareSkuDao.lockSkuStock(skuId, wareId, skuWareHasStock.getNum());
+            if (count == 1) {
+                // 库存锁定成功
+                skuStockLocked = true;
+                // 告诉 MQ 库存锁定成功
+                WareOrderTaskDetailEntity wareOrderTaskDetailEntity =
+                        new WareOrderTaskDetailEntity(
+                                null, 
+                                skuId, 
+                                "", 
+                                skuWareHasStock.getNum(), 
+                                wareOrderTaskEntity.getId(), // task_id（关联到主任务 ID）
+                                wareId, 
+                                1);
+                wareOrderTaskDetailService.save(wareOrderTaskDetailEntity);
+                
+                StockLockedTo stockLockedTo = new StockLockedTo();
+                stockLockedTo.setTaskId(wareOrderTaskEntity.getId());
+                StockDetailTo stockDetailTo = new StockDetailTo();
+                BeanUtils.copyProperties(wareOrderTaskDetailEntity, stockDetailTo);
+                stockLockedTo.setStockDetailTo(stockDetailTo);
+                // 向 RabbitMQ 发送一条延时消息，消息体内包含主任务 ID (task_id) 和对应库存详情工作单
+                rabbitTemplate.convertAndSend("stock-event-exchange", "stock.locked", stockLockedTo);
+                break;
+            } else {
+                // 当前仓库库存锁定失败，尝试下一个仓库
+            }
+        }
+        if (!skuStockLocked) {
+            // 当前仓库都库存不足，没法锁住
+            throw new NoStockException(skuId);
+        }
+    }
+    // 3. 锁定成功
+    return true;
+}
+```
+
+要处理延时队列中的消息就得创建监听器，使用 @RabbitHandler 监听 RabbitMQ 队列中的 StockLockedTo 消息，该对象封装的就是传递给 RabbitMQ 的数据，
+用来关联的库存工作单 id 和库存工作详情单：
 
 
+```java
+@Data
+public class StockLockedTo {
+    private Long taskId; // 库存工作单 id
+    private StockDetailTo stockDetailTo; // 库存工作详情单
+}
+```
 
+当监听到死信队列中的消息时，证明订单在 TTL 时间内并没有完成支付操作，因此需要进行解锁库存的操作，成功解锁库存后便手动接收死信队列中的消息，如果解锁失败（捕获异常），
+那么就拒绝消息并让它重新入队，让其它监听者进行接收，避免消息丢失。
 
+```java
+@Service
+@RabbitListener(queues = "stock.release.queue")
+public class StockReleaseListener {
 
+    @Autowired
+    private WareSkuService wareSkuService;
+
+    @RabbitHandler
+    void releaseLockStock(StockLockedTo stockLockedTo, Message message, Channel channel) throws IOException {
+        System.out.println("收到解锁库存消息...");
+        try{
+            wareSkuService.unLockStock(stockLockedTo);
+            channel.basicAck(message.getMessageProperties().getDeliveryTag(), false);
+        } catch (Exception e) {
+            channel.basicReject(message.getMessageProperties().getDeliveryTag(), true);
+        }
+    }
+}
+```
+
+在释放库存前，需要查询库存的明细记录，获取到库存工作单详情表的 id，然后通过该 id 查询该对应的库存工作详情单的数据，如果有该条数据，那证明当时锁定该商品的库存时是成功的，
+那么就可以进行后续的解锁库存的操作，否则就不需要进行解锁，因为都没成功锁定。接着就可以获取到整个订单关联的库存工作单了，主要就是检查这个表中的订单状态。根据消息队列中获取到的库存工作单 id，
+可以获取到 wms_ware_order_task 数据，从中取出选择现在进行解锁库存的哪个订单号，通过订单号进行远程查询订单。为什么要查询订单呢，因为需要根据订单的状态来判断是否需要进行解锁操作，
+只有订单处于未成功支付的已关闭状态时才能够进行解锁库存的操作，因为不管是系统异常还是客户手动关闭或超时的订单最终都会被修改成该状态。
+
+```java
+@Override
+public void unLockStock(StockLockedTo stockLockedTo) {
+    StockDetailTo stockDetailTo = stockLockedTo.getStockDetailTo();
+    Long detailId = stockDetailTo.getId();
+    // 查询数据库关于此订单的锁定库存信息
+    WareOrderTaskDetailEntity wareOrderTaskDetailEntity = wareOrderTaskDetailService.getById(detailId);
+    if (wareOrderTaskDetailEntity != null) {
+        // 如果有此订单的锁定库存信息，就对该订单进行查询，没有该订单才进行解锁
+        Long taskId = stockLockedTo.getTaskId();
+        WareOrderTaskEntity wareOrderTaskEntity = wareOrderTaskService.getById(taskId);
+        if (wareOrderTaskEntity != null) {
+            String orderSn = wareOrderTaskEntity.getOrderSn(); // 根据订单号查询订单状态
+            R r = orderFeignService.getOrderStatus(orderSn);
+            if (r.getCode() == 0) {
+                OrderEntity orderEntity = r.getData("orderEntity", new TypeReference<OrderEntity>() {
+                });
+                if (orderEntity == null || orderEntity.getStatus() == 4) {
+                    // 订单不存在或者已经被取消，解锁库存
+                    if (wareOrderTaskEntity.getTaskStatus() == 1) {
+                        // 当前库存工作详情单状态为 1，即库存已锁定才能进行解锁
+                        unLockStock(stockDetailTo.getSkuId(), stockDetailTo.getWareId(), stockDetailTo.getSkuNum(), stockDetailTo.getId());
+                    }
+                }
+            } else {
+                throw new RuntimeException("调用远程服务失败...");
+            }
+        }
+    } else {
+        // 库存锁定失败，已经数据回滚，因此无需解锁
+    }
+}
+```
+
+获取到订单后就可以拿取里面的订单状态了，当满足条件时再进行下一层的判断，也就是当前库存工作单的库存状态为已锁定时，就可以进行解锁操作了。
+
+```java
+@GetMapping("/status/{orderSn}")
+public R getOrderStatus(@PathVariable String orderSn){
+    OrderEntity orderEntity = orderService.getByOrderSn(orderSn);
+    return R.ok().setData("orderEntity", orderEntity);
+}
+```
+
+```java
+@Override
+public OrderEntity getByOrderSn(String orderSn) {
+    return getOne(new LambdaQueryWrapper<OrderEntity>().eq(OrderEntity::getOrderSn, orderSn));
+}
+```
+
+不过需要注意的是：这里远程调用的是 gulimall-order 服务，单该服务曾经配置过请求拦截，gulimall-order 服务下的所有请求都会进行一次身份的校验，也就是检查是否有 session，
+但是这里调用远程服务肯定是没有携带 session 的，因此需要修改一下它的拦截规则，让本次请求不走身份验证，当然本来就是检查一下状态，也不需要验证是否登录：
+
+```java
+@Component
+public class LoginUserInterceptor implements HandlerInterceptor {
+
+    public static ThreadLocal<MemberResponseVo> threadLocal = new ThreadLocal<>();
+
+    @Override
+    public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) throws Exception {
+        String requestURI = request.getRequestURI();
+        boolean match = new AntPathMatcher().match("/order/order/status", requestURI);
+        if (match) {
+            return true;
+        }
+
+        MemberResponseVo loginUser = (MemberResponseVo) request.getSession().getAttribute("loginUser");
+        if (loginUser != null) {
+            threadLocal.set(loginUser);
+            return true;
+        } else {
+            // 没登录就去登录
+            request.getSession().setAttribute("noLoginMsg", "请先进行登录!");
+            response.sendRedirect("http://auth.gulimall.com/login.html");
+            return false;
+        }
+    }
+}
+```
+
+解锁操作其实就是修改库存表的锁定库存的字段，把它上一次增加的给减回去，接着再一起修改库存操作单的库存状态，修改为 2（已解锁）。
+
+```java
+private void unLockStock(Long skuId, Long wareId, Integer num, Long taskDetailId) {
+    // 库存解锁
+    wareSkuDao.unLockStock(skuId, wareId, num);
+    // 更新库存工作单状态
+    WareOrderTaskDetailEntity wareOrderTaskDetailEntity = new WareOrderTaskDetailEntity();
+    wareOrderTaskDetailEntity.setId(taskDetailId);
+    wareOrderTaskDetailEntity.setLockStatus(2); // 变为已解锁
+    wareOrderTaskDetailService.updateById(wareOrderTaskDetailEntity);
+}
+```
+
+```xml
+<update id="unLockStock">
+    update wms_ware_sku set stock_locked = stock_locked - #{num} where sku_id = #{skuId} and ware_id = #{wareId}
+</update>
+```
+
+不过当前代码存在一个问题，那就是在 @Transactional 事务内直接发送消息，Spring 的 @Transactional 是在方法执行完成后才提交数据库事务，
+而 rabbitTemplate.convertAndSend() 是立即执行的，如果数据库事务后续发生回滚，单消息却已经发出去了，这就会导致消费者接收到了消息，但数据库中却找不到数据。
+因为在解锁操作前会先查询 WareOrderTaskDetailEntity，只有该数据不为空且库存状态为已锁定时才进行解锁，但是像上面的写法，就可能导致 WareOrderTaskDetailEntity 为空，
+此时获取不到数据但仍会封装 StockLockedTo 对象，也就是传递了一个空对象给 RabbitMQ。那后续的解锁操作就无法正常进行，因此需要先执行锁库存的操作，只有完成锁定后，
+也就是完整地走完了事务的流程，才可以进行消息的发送，再根据是否锁定库存成功决定是否发送消息给 RabbitMQ。
+
+```java
+@Override
+public Boolean orderLockStockWithMessage(WareSkuLockVo wareSkuLockVo) {
+    try {
+        // 1. 先执行数据库操作（有事务）
+        Boolean result = orderLockStock(wareSkuLockVo);
+        if (result) {
+            // 2. 事务提交后再发送消息，需要重新查询数据来构造消息
+            WareOrderTaskEntity taskEntity = wareOrderTaskService.getByOrderSn(wareSkuLockVo.getOrderSn());
+            List<WareOrderTaskDetailEntity> details = wareOrderTaskDetailService.listByTaskId(taskEntity.getId());
+            for (WareOrderTaskDetailEntity detail : details) {
+                StockLockedTo stockLockedTo = new StockLockedTo();
+                stockLockedTo.setTaskId(taskEntity.getId());
+                StockDetailTo stockDetailTo = new StockDetailTo();
+                BeanUtils.copyProperties(detail, stockDetailTo);
+                stockLockedTo.setStockDetailTo(stockDetailTo);
+                rabbitTemplate.convertAndSend("stock-event-exchange", "stock.locked", stockLockedTo);
+            }
+            log.info("消息发送成功，订单号: {}", wareSkuLockVo.getOrderSn());
+        }
+        return result;
+    } catch (Exception e) {
+        log.error("库存锁定失败", e);
+        throw e;
+    }
+}
+```
+
+这样写看上去是对的，但是这里忽略了一个问题，那就是自调用会导致事务失效，因为事务的使用是基于代理对象的，直接调用会导致不走代理对象，所以需要把上面的锁定库存的方法抽取出来，
+把它放进另一个 Service 再调用。
+
+```java
+@Override
+public Boolean orderLockStockWithMessage(WareSkuLockVo wareSkuLockVo) {
+    try {
+        // 1. 先执行数据库操作（有事务）
+        OrderLockResult orderLockResult = stockLockService.orderLockStock(wareSkuLockVo);
+        if (orderLockResult.getSuccess()) {
+            // 2. 事务提交后再发送消息，需要重新查询数据来构造消息
+            List<StockLockedTo> stockLockedTos = orderLockResult.getStockLockedTos();
+            if (!stockLockedTos.isEmpty()) {
+                for (StockLockedTo stockLockedTo : stockLockedTos) {
+                    rabbitTemplate.convertAndSend("stock-event-exchange", "stock.locked", stockLockedTo);
+                }
+            } else {
+                log.error("消息为空: {}", stockLockedTos);
+            }
+            log.info("消息发送成功，订单号: {}", wareSkuLockVo.getOrderSn());
+        }
+        return orderLockResult.getSuccess();
+    } catch (NoStockException e) {
+        log.warn("库存不足，skuId: {}", e.getSkuId());
+        return false;
+    } catch (Exception e) {
+        log.error("库存锁定系统异常", e);
+        throw new RuntimeException("库存锁定失败", e);
+    }
+}
+```
+
+因为修改了锁定库存的使用逻辑，所以也需要修改一下 Controller 层的调用了，直接调用这个新的 Service 层的方法，而原来的 orderLockStock(wareSkuLockVo) 方法不变，
+只是去掉发送消息给 RabbitMQ 的部分即可。
+
+```java
+@PostMapping("/lock/order")
+public R orderLockStock(@RequestBody WareSkuLockVo wareSkuLockVo){
+    try {
+        Boolean b = wareSkuService.orderLockStockWithMessage(wareSkuLockVo);
+        if (b) {
+            return R.ok();
+        } else {
+            return R.error(BizCodeEnum.NO_STOCK_EXCEPTION.getCode(), BizCodeEnum.NO_STOCK_EXCEPTION.getMsg());
+        }
+    } catch (NoStockException e) {
+        return R.error(BizCodeEnum.NO_STOCK_EXCEPTION.getCode(), BizCodeEnum.NO_STOCK_EXCEPTION.getMsg());
+    }
+}
+```
+
+这里封装了一个新的对象用来传递数据给 orderLockStockWithMessage，在锁定库存的时候顺便把 StockLockedTo 封装好并进行传递：
+
+```java
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class OrderLockResult {
+    private Boolean success = false;
+    private List<StockLockedTo> stockLockedTos;
+}
+```
+
+```java
+@Transactional
+@Override
+public OrderLockResult orderLockStock(WareSkuLockVo wareSkuLockVo) {
+
+  List<StockLockedTo> pendingMessages = new ArrayList<>(); // 收集消息数据
+  。。。
+    for (Long wareId : wareIds) {
+      Long count = wareSkuDao.lockSkuStock(skuId, wareId, skuWareHasStock.getNum());
+      if (count == 1) {
+        // 库存锁定成功
+        skuStockLocked = true;
+        // 保存当前商品的库存操作单详情
+        WareOrderTaskDetailEntity wareOrderTaskDetailEntity = new WareOrderTaskDetailEntity(null, skuId, "", skuWareHasStock.getNum(), wareOrderTaskEntity.getId(), wareId, 1);
+        wareOrderTaskDetailService.save(wareOrderTaskDetailEntity);
+
+        StockLockedTo stockLockedTo = new StockLockedTo();
+        stockLockedTo.setTaskId(wareOrderTaskEntity.getId());
+        StockDetailTo stockDetailTo = new StockDetailTo();
+        BeanUtils.copyProperties(wareOrderTaskDetailEntity, stockDetailTo);
+        stockLockedTo.setStockDetailTo(stockDetailTo);
+        pendingMessages.add(stockLockedTo);
+        break;
+      } else {
+        // 当前仓库库存锁定失败，尝试下一个仓库
+      }
+    }
+    if (!skuStockLocked) {
+      // 当前仓库都库存不足，没法锁住
+      throw new NoStockException(skuId);
+    }
+  }
+  // 3. 锁定成功
+  return new OrderLockResult(true, pendingMessages);
+}
+```
+
+****
+### 7.3 定时关单
 
 
 

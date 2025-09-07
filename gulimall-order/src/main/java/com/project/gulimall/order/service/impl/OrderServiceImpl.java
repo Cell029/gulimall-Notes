@@ -1,6 +1,7 @@
 package com.project.gulimall.order.service.impl;
 
 import com.alibaba.fastjson.TypeReference;
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.toolkit.IdWorker;
 import com.project.common.constant.OrderConstant;
 import com.project.common.domain.vo.MemberResponseVo;
@@ -202,6 +203,11 @@ public class OrderServiceImpl extends ServiceImpl<OrderDao, OrderEntity> impleme
                 return submitOrderResponseVo;
             }
         }
+    }
+
+    @Override
+    public OrderEntity getByOrderSn(String orderSn) {
+        return getOne(new LambdaQueryWrapper<OrderEntity>().eq(OrderEntity::getOrderSn, orderSn));
     }
 
     /**

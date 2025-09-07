@@ -1,13 +1,19 @@
 package com.project.gulimall.order.controller;
 
 import com.project.gulimall.order.config.RabbitConfig;
+import com.project.gulimall.order.domain.entity.OrderEntity;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.rabbit.connection.CorrelationData;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.ResponseBody;
 import org.springframework.web.bind.annotation.RestController;
+
+import java.util.Date;
 import java.util.UUID;
 
+@Slf4j
 @RestController
 public class RabbitMQController {
 
@@ -42,5 +48,29 @@ public class RabbitMQController {
     public String sendMessageContainFail() {
         rabbitTemplate.convertAndSend(RabbitConfig.EXCHANGE, RabbitConfig.ROUTING_KEY, "Fail", new CorrelationData(UUID.randomUUID().toString()));
         return "发送包含 Fail 字段的消息"; // 处理消息失败: 模拟处理失败
+    }
+
+    @ResponseBody
+    @GetMapping("/create")
+    public String createOrder() {
+        // 1. 创建订单（简化示例）
+        OrderEntity order = new OrderEntity();
+        order.setOrderSn(UUID.randomUUID().toString());
+        order.setStatus(1); // 1-已支付
+        order.setCreateTime(new Date());
+        log.info("创建订单成功，订单号：{}", order.getOrderSn());
+        // 2. 发送延迟消息到 RabbitMQ
+        try {
+            rabbitTemplate.convertAndSend(
+                    "order-event-exchange", // 交换机名称
+                    "order.create.order", // 路由键
+                    order // 消息体
+            );
+            log.info("订单延迟消息已发送，订单号：{}", order.getOrderSn());
+        } catch (Exception e) {
+            log.error("发送延迟消息失败", e);
+        }
+        // 3. 返回订单信息
+        return "订单创建成功";
     }
 }
