@@ -7,6 +7,6 @@ import org.springframework.web.bind.annotation.PathVariable;
 
 @FeignClient("gulimall-order")
 public interface OrderFeignService {
-    @GetMapping("/order/order/status/{orderSn}")
+    @GetMapping(value = "/order/order/status/{orderSn}",  produces = "application/json")
     R getOrderStatus(@PathVariable String orderSn);
 }

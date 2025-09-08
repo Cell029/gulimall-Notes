@@ -26,7 +26,7 @@ public class OrderWebController {
     }
 
     @PostMapping("/submitOrder")
-    public String submitOrder(@RequestBody OrderSubmitVo orderSubmitVo, Model model, RedirectAttributes redirectAttributes) {
+    public String submitOrder(OrderSubmitVo orderSubmitVo, Model model, RedirectAttributes redirectAttributes) {
         SubmitOrderResponseVo submitOrderResponseVo = orderService.submitOrder(orderSubmitVo);
         if (submitOrderResponseVo.getCode() == 0) {
             // 提交订单成功，跳转到支付页

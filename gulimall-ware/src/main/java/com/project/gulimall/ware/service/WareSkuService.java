@@ -1,8 +1,10 @@
 package com.project.gulimall.ware.service;
 
 import com.baomidou.mybatisplus.extension.service.IService;
+import com.project.common.to.mq.OrderReleaseTo;
 import com.project.common.to.mq.StockLockedTo;
 import com.project.common.utils.PageUtils;
+import com.project.gulimall.ware.domain.entity.OrderEntity;
 import com.project.gulimall.ware.domain.entity.WareSkuEntity;
 import com.project.gulimall.ware.domain.vo.LockStockResult;
 import com.project.gulimall.ware.domain.vo.OrderLockResult;
@@ -26,6 +28,8 @@ public interface WareSkuService extends IService<WareSkuEntity> {
     // OrderLockResult orderLockStock(WareSkuLockVo wareSkuLockVo);
 
     void unLockStock(StockLockedTo stockLockedTo);
+
+    void unLockStock(OrderReleaseTo orderReleaseTo);
 
     Boolean orderLockStockWithMessage(WareSkuLockVo wareSkuLockVo);
 

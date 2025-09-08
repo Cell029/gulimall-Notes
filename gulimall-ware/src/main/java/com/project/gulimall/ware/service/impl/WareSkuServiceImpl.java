@@ -2,6 +2,8 @@ package com.project.gulimall.ware.service.impl;
 
 import com.alibaba.cloud.commons.lang.StringUtils;
 import com.alibaba.fastjson.TypeReference;
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.project.common.to.mq.OrderReleaseTo;
 import com.project.common.to.mq.StockDetailTo;
 import com.project.common.to.mq.StockLockedTo;
 import com.project.common.utils.R;
@@ -222,6 +224,7 @@ public class WareSkuServiceImpl extends ServiceImpl<WareSkuDao, WareSkuEntity> i
 
 
     @Override
+    @Transactional
     public void unLockStock(StockLockedTo stockLockedTo) {
         StockDetailTo stockDetailTo = stockLockedTo.getStockDetailTo();
         Long detailId = stockDetailTo.getId();
@@ -233,24 +236,47 @@ public class WareSkuServiceImpl extends ServiceImpl<WareSkuDao, WareSkuEntity> i
             WareOrderTaskEntity wareOrderTaskEntity = wareOrderTaskService.getById(taskId);
             if (wareOrderTaskEntity != null) {
                 String orderSn = wareOrderTaskEntity.getOrderSn(); // 根据订单号查询订单状态
-                R r = orderFeignService.getOrderStatus(orderSn);
-                if (r.getCode() == 0) {
-                    OrderEntity orderEntity = r.getData("orderEntity", new TypeReference<OrderEntity>() {
-                    });
-                    if (orderEntity == null || orderEntity.getStatus() == 4) {
-                        // 订单不存在或者已经被取消，解锁库存
-                        if (wareOrderTaskEntity.getTaskStatus() == 1) {
-                            // 当前库存工作详情单状态为 1，即库存已锁定才能进行解锁
-                            unLockStock(stockDetailTo.getSkuId(), stockDetailTo.getWareId(), stockDetailTo.getSkuNum(), stockDetailTo.getId());
+                log.info("Feign 调用订单服务 URL: /order/order/status/{}", orderSn);
+                try {
+                    R r = orderFeignService.getOrderStatus(orderSn);
+                    log.info("Feign 返回: {}", r);
+                    if (r.getCode() == 0) {
+                        OrderEntity orderEntity = r.getData("orderEntity", new TypeReference<OrderEntity>() {
+                        });
+                        if (orderEntity == null || orderEntity.getStatus() == 4) {
+                            // 订单不存在或者已经被取消，解锁库存
+                            if (wareOrderTaskEntity.getTaskStatus() == 1) {
+                                // 当前库存工作详情单状态为 1，即库存已锁定才能进行解锁
+                                unLockStock(stockDetailTo.getSkuId(), stockDetailTo.getWareId(), stockDetailTo.getSkuNum(), stockDetailTo.getId());
+                            }
                         }
+                    } else {
+                        throw new RuntimeException("调用远程服务失败...");
                     }
-                } else {
-                    throw new RuntimeException("调用远程服务失败...");
+                } catch (Exception e) {
+                    log.error("调用订单服务失败", e);
                 }
             }
-
         } else {
             // 库存锁定失败，已经数据回滚，因此无需解锁
+        }
+    }
+
+    /**
+     * 防止订单服务卡顿，订单状态一直改不了，导致库存解锁功能一直无法运行
+     */
+    @Override
+    @Transactional
+    public void unLockStock(OrderReleaseTo orderReleaseTo) {
+        String orderSn = orderReleaseTo.getOrderSn();
+        WareOrderTaskEntity wareOrderTaskEntity = wareOrderTaskService.getOrderTaskByOrderSn(orderSn);
+        Long taskId = wareOrderTaskEntity.getId();
+        // 按照库存工作单找到所有没有解锁的库存进行解锁
+        List<WareOrderTaskDetailEntity> wareOrderTaskDetailEntities = wareOrderTaskDetailService.list(new LambdaQueryWrapper<WareOrderTaskDetailEntity>()
+                .eq(WareOrderTaskDetailEntity::getTaskId, taskId)
+                .eq(WareOrderTaskDetailEntity::getLockStatus, 1));
+        for (WareOrderTaskDetailEntity wareOrderTaskDetailEntity : wareOrderTaskDetailEntities) {
+            unLockStock(wareOrderTaskDetailEntity.getSkuId(), wareOrderTaskDetailEntity.getWareId(), wareOrderTaskDetailEntity.getSkuNum(), wareOrderTaskDetailEntity.getId());
         }
     }
 

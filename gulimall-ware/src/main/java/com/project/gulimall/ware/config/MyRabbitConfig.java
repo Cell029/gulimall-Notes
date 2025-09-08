@@ -18,6 +18,7 @@ import java.util.Map;
 @Slf4j
 @Configuration
 public class MyRabbitConfig {
+
     @Bean
     public MessageConverter messageConverter() {
         Jackson2JsonMessageConverter jackson2JsonMessageConverter = new Jackson2JsonMessageConverter();
@@ -62,12 +63,14 @@ public class MyRabbitConfig {
                 null);
     }
 
+
     /**
      * 自定义 RabbitTemplate，并设置回调
      */
     @Bean
     public RabbitTemplate rabbitTemplate(org.springframework.amqp.rabbit.connection.ConnectionFactory connectionFactory) {
         RabbitTemplate rabbitTemplate = new RabbitTemplate(connectionFactory);
+        rabbitTemplate.setMessageConverter(messageConverter()); // 添加消息转换器
         rabbitTemplate.setMandatory(true);
 
         // ConfirmCallback：消息是否到达 Broker

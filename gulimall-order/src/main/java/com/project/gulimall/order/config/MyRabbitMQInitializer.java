@@ -61,15 +61,12 @@ public class MyRabbitMQInitializer {
         return new Binding("order.release.queue", Binding.DestinationType.QUEUE, "order-event-exchange", "order.release.order", null);
     }
 
-    @RabbitListener(queues = "order.release.queue")
-    public void listener(OrderEntity orderEntity) {
-        log.info("收到订单超时消息，订单号：{}", orderEntity.getOrderSn());
-        // 简单的取消订单逻辑
-        if (orderEntity.getStatus() == 0) { // 0 表示未支付
-            log.info("执行订单取消操作，订单ID：{}", orderEntity.getId());
-            System.out.println("订单 " + orderEntity.getOrderSn() + " 因超时未支付已自动取消");
-        } else {
-            log.info("订单已支付，无需处理，订单号：{}", orderEntity.getOrderSn());
-        }
+    /**
+     * 订单释放和库存释放也进行绑定
+     */
+    @Bean
+    public Binding orderReleaseOtherBinding() {
+        return new Binding("stock.release.queue", Binding.DestinationType.QUEUE, "order-event-exchange", "order.release.other", null);
     }
+
 }

@@ -14,5 +14,8 @@ public interface WareOrderTaskService extends IService<WareOrderTaskEntity> {
     PageUtils queryPage(Map<String, Object> params);
 
     WareOrderTaskEntity getByOrderSn(String orderSn);
+
+    WareOrderTaskEntity getOrderTaskByOrderSn(String orderSn);
+
 }
 

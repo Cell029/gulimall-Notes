@@ -6,6 +6,7 @@ import com.baomidou.mybatisplus.core.toolkit.IdWorker;
 import com.project.common.constant.OrderConstant;
 import com.project.common.domain.vo.MemberResponseVo;
 import com.project.common.exception.NoStockException;
+import com.project.common.to.mq.OrderReleaseTo;
 import com.project.common.utils.R;
 import com.project.gulimall.order.domain.entity.OrderItemEntity;
 import com.project.gulimall.order.domain.to.OrderCreateTo;
@@ -17,19 +18,20 @@ import com.project.gulimall.order.feign.ProductFeignService;
 import com.project.gulimall.order.feign.WareFeignService;
 import com.project.gulimall.order.interceptor.LoginUserInterceptor;
 import com.project.gulimall.order.service.OrderItemService;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.beans.BeanUtils;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
-
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
-
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.baomidou.mybatisplus.core.metadata.IPage;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
@@ -39,6 +41,8 @@ import com.project.gulimall.order.dao.OrderDao;
 import com.project.gulimall.order.domain.entity.OrderEntity;
 import com.project.gulimall.order.service.OrderService;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.util.StringUtils;
 import org.springframework.web.context.request.RequestAttributes;
 import org.springframework.web.context.request.RequestContextHolder;
@@ -62,6 +66,8 @@ public class OrderServiceImpl extends ServiceImpl<OrderDao, OrderEntity> impleme
     private StringRedisTemplate stringRedisTemplate;
     @Autowired
     private OrderItemService orderItemService;
+    @Autowired
+    private RabbitTemplate rabbitTemplate;
 
     @Override
     public PageUtils queryPage(Map<String, Object> params) {
@@ -193,6 +199,25 @@ public class OrderServiceImpl extends ServiceImpl<OrderDao, OrderEntity> impleme
                 if (r.getCode() == 0) {
                     // 库存锁定成功
                     submitOrderResponseVo.setOrder(orderCreateTo.getOrder());
+                    // rabbitTemplate.convertAndSend("order-event-exchange", "order.create.order", orderCreateTo.getOrder());
+
+                    // 在事务提交后发送消息
+                    TransactionSynchronizationManager.registerSynchronization(
+                            new TransactionSynchronization() {
+                                @Override
+                                public void afterCommit() {
+                                    try {
+                                        rabbitTemplate.convertAndSend(
+                                                "order-event-exchange",
+                                                "order.create.order",
+                                                orderCreateTo.getOrder()
+                                        );
+                                    } catch (Exception e) {
+                                        log.error("订单消息发送失败", e);
+                                    }
+                                }
+                            }
+                    );
                     return submitOrderResponseVo;
                 } else {
                     // 库存锁定失败
@@ -210,6 +235,42 @@ public class OrderServiceImpl extends ServiceImpl<OrderDao, OrderEntity> impleme
         return getOne(new LambdaQueryWrapper<OrderEntity>().eq(OrderEntity::getOrderSn, orderSn));
     }
 
+    @Override
+    public void closeOrder(OrderEntity orderEntity) {
+        // 查询当前订单的最新状态
+        OrderEntity orderEntityNew = getById(orderEntity.getId());
+        OrderReleaseTo orderReleaseTo = new OrderReleaseTo();
+        BeanUtils.copyProperties(orderEntityNew, orderReleaseTo);
+        if (Objects.equals(orderEntityNew.getStatus(), OrderStatusEnum.CREATE_NEW.getCode())) {
+            // 执行关单
+            OrderEntity orderEntityUpdateStatus = new OrderEntity();
+            orderEntityUpdateStatus.setId(orderEntity.getId());
+            orderEntityUpdateStatus.setStatus(OrderStatusEnum.CANCLED.getCode());
+            updateById(orderEntityUpdateStatus);
+            // 给 MQ 发送消息
+            rabbitTemplate.convertAndSend("order-event-exchange", "order.release.other", orderReleaseTo);
+        }
+    }
+
+    /**
+     * 获取当前订单的支付数据
+     * @param orderSn
+     * @return
+     */
+    @Override
+    public PayVo getOrderPay(String orderSn) {
+        PayVo payVo = new PayVo();
+        OrderEntity orderEntity = getByOrderSn(orderSn);
+        BigDecimal bigDecimal = orderEntity.getPayAmount().setScale(2, RoundingMode.HALF_UP);
+        payVo.setTotal_amount(bigDecimal.toString());
+        payVo.setOut_trade_no(orderSn);
+        List<OrderItemEntity> orderItemEntities = orderItemService.list(new LambdaQueryWrapper<OrderItemEntity>().eq(OrderItemEntity::getOrderSn, orderSn));
+        OrderItemEntity orderItemEntity = orderItemEntities.get(0);
+        payVo.setSubject(orderItemEntity.getSkuName());
+        payVo.setBody(orderItemEntity.getSkuAttrsVals());
+        return payVo;
+    }
+
     /**
      * 保存订单数据
      */
@@ -224,7 +285,7 @@ public class OrderServiceImpl extends ServiceImpl<OrderDao, OrderEntity> impleme
     private OrderCreateTo creatOrder() {
         OrderCreateTo orderCreateTo = new OrderCreateTo();
         // 1. 生成订单号
-        String orderSn = IdWorker.getTimeId();
+        String orderSn = IdWorker.getTimeId().substring(0, 32);
         // 创建订单号
         OrderEntity orderEntity = buildOrder(orderSn);
 

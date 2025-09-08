@@ -82,6 +82,9 @@ public class OrderController {
     @GetMapping("/status/{orderSn}")
     public R getOrderStatus(@PathVariable String orderSn){
         OrderEntity orderEntity = orderService.getByOrderSn(orderSn);
+        if (orderEntity == null) {
+            return R.error("订单不存在");
+        }
         return R.ok().setData("orderEntity", orderEntity);
     }
 

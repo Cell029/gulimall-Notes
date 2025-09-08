@@ -5,6 +5,7 @@ import com.project.common.utils.PageUtils;
 import com.project.gulimall.order.domain.entity.OrderEntity;
 import com.project.gulimall.order.domain.vo.OrderConfirmVo;
 import com.project.gulimall.order.domain.vo.OrderSubmitVo;
+import com.project.gulimall.order.domain.vo.PayVo;
 import com.project.gulimall.order.domain.vo.SubmitOrderResponseVo;
 
 import java.util.Map;
@@ -21,5 +22,10 @@ public interface OrderService extends IService<OrderEntity> {
     SubmitOrderResponseVo submitOrder(OrderSubmitVo orderSubmitVo);
 
     OrderEntity getByOrderSn(String orderSn);
+
+    void closeOrder(OrderEntity orderEntity);
+
+    PayVo getOrderPay(String orderSn);
+
 }
 

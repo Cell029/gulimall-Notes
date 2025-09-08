@@ -14530,6 +14530,7 @@ public class MyRabbitConfig {
     @Bean
     public RabbitTemplate rabbitTemplate(org.springframework.amqp.rabbit.connection.ConnectionFactory connectionFactory) {
         RabbitTemplate rabbitTemplate = new RabbitTemplate(connectionFactory);
+        rabbitTemplate.setMessageConverter(messageConverter()); // 添加消息转换器
         rabbitTemplate.setMandatory(true);
       
         // ConfirmCallback：消息是否到达 Broker
@@ -17175,6 +17176,500 @@ public OrderLockResult orderLockStock(WareSkuLockVo wareSkuLockVo) {
 ****
 ### 7.3 定时关单
 
+定时关单的逻辑和上面记录的解锁库存类似，在创建订单成功与锁定库存成功后发送一条消息给 RabbitMQ，这里绑定的是 order.create.order，当消息在该队列中存活超过 TTL 后，
+就会被发送到死信队列，再由监听器获取到这条超时的消息，最后处理该消息进行订单的关单操作。
+
+```java
+@Transactional
+@Override
+public SubmitOrderResponseVo submitOrder(OrderSubmitVo orderSubmitVo) {
+    // 1. 验证令牌
+    // 2. 创建订单
+    // 3. 验价
+    // 4. 保存订单
+    // 5. 锁定库存
+    // 6. 设置响应并注册消息发送
+    ...
+            // 远程锁定库存
+            R r = wareFeignService.orderLockStock(wareSkuLockVo);
+            if (r.getCode() == 0) {
+                // 库存锁定成功
+                submitOrderResponseVo.setOrder(orderCreateTo.getOrder());
+                // rabbitTemplate.convertAndSend("order-event-exchange", "order.create.order", orderCreateTo.getOrder());
+                // 在事务提交后发送消息
+                TransactionSynchronizationManager.registerSynchronization(
+                        new TransactionSynchronization() {
+                            @Override
+                            public void afterCommit() {
+                                try {
+                                    rabbitTemplate.convertAndSend(
+                                            "order-event-exchange",
+                                            "order.create.order",
+                                            orderCreateTo.getOrder()
+                                    );
+                                } catch (Exception e) {
+                                    log.error("订单消息发送失败", e);
+                                }
+                            }
+                        }
+                );
+              ...
+}
+```
+
+前面有记录过，在 @Transactional 中最好不要写发送消息的代码，这可能会导致消费者处理到空数据，因此需要在事务完成后再进行消息的发送，而这里使用了事务同步器，
+在当前事务完成提交后才会发送消息。
+
+该监听器监听死信队列 order.release.queue，在 TTL 时间后接收到对应的消息进行处理，但并不是所有的订单都要进行关单处理，还是得满足一些条件的，当处理完成后再手动接收该消息，
+如果发生异常则拒绝接收并让它重新入队。
+
+```java
+@Slf4j
+@Service
+@RabbitListener(queues = "order.release.queue")
+public class OrderCloseListener {
+
+    @Autowired
+    private OrderService orderService;
+
+    @RabbitHandler
+    public void listener(OrderEntity orderEntity, Channel channel, Message message) throws IOException {
+        log.info("收到订单超时消息，订单号：{}", orderEntity.getOrderSn());
+        // 简单的取消订单逻辑
+        if (orderEntity.getStatus() == 0) { // 0 表示待付款
+            try {
+                log.info("执行订单取消操作，订单ID：{}", orderEntity.getId());
+                orderService.closeOrder(orderEntity);
+                System.out.println("订单 " + orderEntity.getOrderSn() + " 因超时未支付已自动取消");
+                channel.basicAck(message.getMessageProperties().getDeliveryTag(), false);
+            } catch (Exception e) {
+                log.error("接收消息失败：{}", orderEntity.getId());
+                channel.basicReject(message.getMessageProperties().getDeliveryTag(), true);
+            }
+        } else {
+            log.info("订单已支付，无需处理，订单号：{}", orderEntity.getOrderSn());
+        }
+    }
+}
+```
+
+执行关单操作其实就是修改订单数据的状态，将它修改为已取消即可，主要是判断当前订单是否需要进行关单操作，避免把其它状态的订单也进行关闭操作，毕竟消息一旦发送，就必须要被消费一次。
+而这里在处理完关单操作时还发送了一条消息给 MQ，这条消息就是告诉库存服务当前订单已被关闭，你可以解锁库存了。因为当前使用的死信机 + 死信队列的方式实现延迟消息的，
+所以消息的处理存在队首堵塞的情况，而取消订单的消息在发送后如果出现了意外情况例如消费者宕机，那么该条消息就会一直得不到处理，但库存解锁服务在 TTL 时间后就会进行解锁库存的操作，
+但此时订单的状态仍未关闭，就会导致库存解锁操作认为该订单还未被取消，就不会触发解锁库存的消息，但后续机器恢复，开始执行取消订单的操作，可是库存解锁已经被消费了，
+这就导致订单确实被取消了，但是库存却未被解锁。因此需要在处理完关单操作后再发送一条解锁库存的消息进行兜底，确保订单在关闭后一定能进行库存解锁的操作。
+
+```java
+@Override
+public void closeOrder(OrderEntity orderEntity) {
+    // 查询当前订单的最新状态
+    OrderEntity orderEntityNew = getById(orderEntity.getId());
+    if (Objects.equals(orderEntityNew.getStatus(), OrderStatusEnum.CREATE_NEW.getCode())) {
+        // 执行关单
+        OrderEntity orderEntityUpdateStatus = new OrderEntity();
+        orderEntityUpdateStatus.setId(orderEntity.getId());
+        orderEntityUpdateStatus.setStatus(OrderStatusEnum.CANCLED.getCode());
+        updateById(orderEntityUpdateStatus);
+        // 给 MQ 发送消息
+        rabbitTemplate.convertAndSend("order-event-exchange", "order.release.other", orderEntityNew);
+    }
+}
+```
+
+当然也需要新增一下绑定关系，消息由 order-event-exchange 发送给 stock.release.queue 队列，
+
+```text
+订单服务 → order-event-exchange → (路由键: order.release.other) → stock.release.queue → 库存服务消费
+```
+
+```java
+/**
+ * 订单释放和库存释放也进行绑定
+ */
+@Bean
+public Binding orderReleaseOtherBinding() {
+    return new Binding("stock.release.queue", Binding.DestinationType.QUEUE, "order-event-exchange", "order.release.other", null);
+}
+```
+
+不过接收的消息不同，所以得再配置一个监听方法用来接收 OrderEntity 对象，处理完解锁库存操作后就手动消费消息，否则拒绝并让它重新入队：
+
+```java
+@RabbitHandler
+void releaseLockStockAfterOrderClosed(OrderEntity orderEntity, Message message, Channel channel) throws IOException {
+    System.out.println("收到订单关闭消息，准备解锁库存...");
+    try{
+        wareSkuService.unLockStock(orderEntity);
+        channel.basicAck(message.getMessageProperties().getDeliveryTag(), false);
+    } catch (Exception e) {
+        channel.basicReject(message.getMessageProperties().getDeliveryTag(), true);
+    }
+}
+```
+
+解锁库存的大致操作和原来的一致，只是处理的对象不同，但都需要循环遍历出当前订单中的所有商品信息，然后依次进行解锁操作
+
+```java
+/**
+ * 防止订单服务卡顿，订单状态一直改不了，导致库存解锁功能一直无法运行，
+ * @param orderEntity
+ */
+@Override
+@Transactional
+public void unLockStock(OrderEntity orderEntity) {
+    String orderSn = orderEntity.getOrderSn();
+    WareOrderTaskEntity wareOrderTaskEntity = wareOrderTaskService.getOrderTaskByOrderSn(orderSn);
+    Long taskId = wareOrderTaskEntity.getId();
+    // 按照库存工作单找到所有没有解锁的库存进行解锁
+    List<WareOrderTaskDetailEntity> wareOrderTaskDetailEntities = wareOrderTaskDetailService.list(new LambdaQueryWrapper<WareOrderTaskDetailEntity>()
+            .eq(WareOrderTaskDetailEntity::getTaskId, taskId)
+            .eq(WareOrderTaskDetailEntity::getLockStatus, 1));
+    for (WareOrderTaskDetailEntity wareOrderTaskDetailEntity : wareOrderTaskDetailEntities) {
+        unLockStock(wareOrderTaskDetailEntity.getSkuId(), wareOrderTaskDetailEntity.getWareId(), wareOrderTaskDetailEntity.getSkuNum(), wareOrderTaskDetailEntity.getId());
+    }
+}
+```
+
+```java
+@Override
+public WareOrderTaskEntity getOrderTaskByOrderSn(String orderSn) {
+    return getOne(new LambdaQueryWrapper<WareOrderTaskEntity>().eq(WareOrderTaskEntity::getOrderSn, orderSn));
+}
+``` 
+
+经过测试，发现超时订单可以自动取消，但是库存解锁却无法正常执行并且报错：
+
+```text
+Caused by: java.lang.ClassNotFoundException: com.project.gulimall.order.domain.entity.OrderEntity
+	at java.base/jdk.internal.loader.BuiltinClassLoader.loadClass(BuiltinClassLoader.java:641) ~[na:na]
+	at java.base/jdk.internal.loader.ClassLoaders$AppClassLoader.loadClass(ClassLoaders.java:188) ~[na:na]
+```
+
+很奇怪为什么库存服务会丢出找不到订单服务的 OrderEntity 实体类的错误，并且还尝试反序列化它，明明已经在库存服务中引入了该实体，按理来说应该直接反序列化库存服务中的即可。
+根本原因是：订单服务在发送消息时，Spring AMQP / Jackson 自动地在消息头（Headers）里添加了一个 `__TypeId__`，其值为订单服务中 OrderEntity 类的全限定名：
+com.project.gulimall.order.domain.entity.OrderEntity。当仓库服务消费这条消息时，Spring AMQP 的默认行为是查看这个 `__TypeId__` 头，
+并尝试根据这个类名来反序列化消息体。然而，仓库服务的 Classpath 里根本不存在这个类，因此抛出了 ClassNotFoundException。因为我在订单服务中直接使用 RabbitTemplate 发送了 OrderEntity 对象，
+而直接发送实体对象 RabbitTemplate 会自动序列化并添加 `__TypeId__` 头，所以需要确保消息在服务之间传递时是与具体实现类解耦的，因此创建一个公用的传递实体类，
+用该实体类来进行消息的接收与发送：
+
+```java
+@Override
+public void closeOrder(OrderEntity orderEntity) {
+    // 查询当前订单的最新状态
+    OrderEntity orderEntityNew = getById(orderEntity.getId());
+    OrderReleaseTo orderReleaseTo = new OrderReleaseTo();
+    BeanUtils.copyProperties(orderEntityNew, orderReleaseTo);
+    if (Objects.equals(orderEntityNew.getStatus(), OrderStatusEnum.CREATE_NEW.getCode())) {
+        // 执行关单
+        OrderEntity orderEntityUpdateStatus = new OrderEntity();
+        orderEntityUpdateStatus.setId(orderEntity.getId());
+        orderEntityUpdateStatus.setStatus(OrderStatusEnum.CANCLED.getCode());
+        updateById(orderEntityUpdateStatus);
+        // 给 MQ 发送消息，跨服务，使用中间传递对象
+        rabbitTemplate.convertAndSend("order-event-exchange", "order.release.other", orderReleaseTo);
+    }
+}
+```
+
+不要在服务间传递内部实体对象，而是定义双方约定好的、结构简单的对象来传递消息，这样每个服务都只依赖于自己定义的对象，彻底解耦。
+
+****
+### 7.4 RabbitMQ 消息丢失、积压、重复等问题的解决
+
+一条消息在 RabbitMQ 中的完整生命周期为：生产者发送消息 -> RabbitMQ Broker 接收和存储消息 -> 消费者消费消息，这三个环节分别对应着消息丢失、重复和积压的问题根源。
+
+1、消息丢失
+
+消息丢失是指在生命周期的任何一个环节，消息由于各种原因未能成功抵达下一环节，主要分为三种情况：
+
+环节一：生产者 -> Broker (发送阶段丢失)
+
+生产者发送消息给 RabbitMQ，但由于网络波动、RabbitMQ 重启等原因，导致消息未能成功投递到交换机或队列，这种情况就需要在发送消息时完成消息的持久化，可以把这条消息存入数据库，
+在需要重发的时候就可以拿到原始的消息，重新投递。
+
+环节二：Broker 内部 (存储阶段丢失)
+
+消息已经到达 RabbitMQ，但在存储在内存中还未完成持久化时，RabbitMQ 就宕机或重启，导致内存中的数据丢失。这种情况就需要在声明队列时设置 durable=true，这样队列的元数据会在 RabbitMQ 重启后恢复。
+同理在发送消息时，将消息的 deliveryMode 设置为 2 (PERSISTENT)：
+
+```java
+rabbitTemplate.convertAndSend(
+    "exchange-name",
+    "routing-key",
+    messageObject,
+    message -> { // 可选字段
+        message.getMessageProperties().setDeliveryMode(MessageDeliveryMode.PERSISTENT);
+        return message;
+    }
+);
+```
+
+环节三：Broker -> 消费者 (消费阶段丢失)
+
+消费者接收到消息，但还未处理完成，此时消费者应用宕机或通道断开，RabbitMQ 会认为这条消息已经被成功处理，从而将其从队列中删除，导致消息丢失。这种情况就需要避免消息被自动接收，
+因为接收后就会被删除，因此需要改为手动接收，只有当消费者业务逻辑成功执行完毕后，再手动发送 ACK 回执给 RabbitMQ。如果消费者在处理过程中失败（抛出异常、宕机），
+RabbitMQ 由于没有收到 ACK，会认为该消息处理失败，从而将其重新投递。
+
+2、消息积压
+
+消息积压是指生产者生产消息的速度远大于消费者消费的速度，导致消息在队列中大量堆积。主要原因是消费者消费能力不足或者出现故障，可以选择增加消费者数量，即水平扩展。
+在 RabbitMQ 中，启动多个消费者实例消费同一个队列，RabbitMQ 会使用 Round-Robin 轮询的方式将消息分发给各个消费者，这是最常用且有效的方法。
+
+3、消息重复
+
+消息重复是分布式系统中常见的问题，通常是由于重试机制引起的，例如网络抖动、消费者故障等都会触发重试，从而导致消息被重复投递，不过消息重复无法避免，只能由消费者业务逻辑来实现幂等性，
+以此确保只有一条被消费的消息是进行数据的修改的。
+
+****
+# 十一、支付服务
+
+## 1. 支付宝沙箱
+
+支付宝沙箱是支付宝开放平台为开发者提供的一个模拟支付环境。它复刻了支付宝真实 API 的主要功能和流程，但不涉及真实的资金流转。支付宝支付网络主要依赖两种非对称加密技术：
+
+1. RSA：一种经典的非对称加密算法。 
+2. SM2：中国国家密码管理局发布的椭圆曲线公钥密码算法，属于国密标准，目前支付宝推荐并主要使用RSA2（使用 SHA-256 的 RSA）和 SM2。
+
+支付宝的加密主要体现在三个环节：请求签名、响应验证和异步通知验证。
+
+1、商户发起支付请求（请求签名）
+
+当服务器要调用支付宝接口时，需要向支付宝网关发送一个请求，这个请求的构建过程就是一次数字签名。首先，要将所有需要的业务参数按照一定规则（如字母序）组装成一个字符串。
+然后将这些参数和系统参数按照特定规则（例如如 Key=Value&）拼接成一个长长的字符串，这个字符串包含了请求的全部信息。最后使用应用私钥对这个待签名字符串进行 RSA2 签名。
+用只有商户才有的私钥加密，任何人可以用支付宝的公钥解密这个签名并验证，成功即证明这条消息确实来自你。支付宝收到请求后，会用配置的应用公钥去验证签名，验证成功，
+则证明请求确实来自当前应用。而签名是基于所有参数计算的，任何参数在传输中被篡改，最终验证签名都会失败。
+
+2、支付宝同步返回响应（验证签名）
+
+当调用同步接口后，支付宝会立即返回一个结果，电商系统就需要验证这个返回是否真的来自支付宝。此过程就是将响应中的其他参数（除去签名和签名类型参数）同样按照规则拼接成待验签字符串。
+需要使用支付宝的公钥和指定的签名算法对签名进行解密，如果一致才允许通过。
+
+3、支付宝发送异步通知
+
+支付成功后，支付宝服务器会主动发送一个 POST 请求，通知内容包含订单号、支付状态、金额、交易号、通知时间等，同样会带上 sign 和 sign_type。商户服务器与同步返回类似，
+将字段拼接成待验签字符串，使用 支付宝公钥进行验签，成功则可以更新数据库状态。
+
+这里涉及两种密钥，商户的和支付宝的：
+
+1) 商户自己拥有的密钥对
+
+- 私钥：商户自己保存，不能泄露。
+- 公钥：提交给支付宝，支付宝用它来验证商户发起请求的签名。
+- 作用：商户对请求参数进行签名（用私钥加密生成 sign），支付宝收到请求，用商户公钥解密验证。
+
+2) 支付宝拥有的密钥对
+
+- 私钥：支付宝自己保存，不能泄露。 
+- 公钥：商户在系统里配置，用于验证支付宝返回的数据（同步返回和异步通知）。 
+- 作用：支付宝对返回的数据或通知签名（用支付宝私钥加密生成 sign），商户收到响应或者通知后就用支付宝公钥解密验证。
+
+****
+## 2. 整合支付
+
+在支付宝开放平台下载好用来测试的 SDK，提取里面的关键代码封装成配置类，只要把参数传进去，SDK 就会用配置的商户私钥（merchant_private_key）自动生成签名，
+顺便还会把所有系统参数和业务参数拼接成支付宝需要的 HTTP 请求格式。当调用 pay() 方法时就会拼接上各种参数并把请求发送到支付宝网关（gatewayUrl），并返回结果。
+
+```xml
+<!--支付宝 SDK-->
+<dependency>
+    <groupId>com.alipay.sdk</groupId>
+    <artifactId>alipay-sdk-java</artifactId>
+    <version>4.40.440.ALL</version>
+</dependency>
+```
+
+```java
+@ConfigurationProperties(prefix = "alipay")
+@Component
+@Data
+public class AlipayTemplate {
+
+    //在支付宝创建的应用的id
+    private   String app_id = "9021000152656302";
+    // 商户私钥，您的PKCS8格式RSA2私钥
+    private  String merchant_private_key = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCDqtuNkx6AZmLY8XD8q1O202DVadWJp2IdnUNFxck2t7vHn3yasa0E7MO16CNKzOI4c9joo1crXHxtfoBFK8Qk2JJdAo4s4JKhtn6CnCXIaOKBQ/ZRQHFvpr4fWdnVQQgKceQV72yS330kt/3wPPPMaqcJL+8oNrWcWkGK96rPcGxlJpBCrHhdUB3VAwpZC4acmUVHbxAnuRsWDoQewgI4Xe6J1yXhSiCd948gjONsSXKmm3iZZQlR445vuHyjOPTaNiTWpBmEUZN60BYKXuUh6M2S8XwR3BCkB7/r9OTWneKc/VRwrgN/zA4SFPeHYpV5X/1TPFdxwgUO58s04h+JAgMBAAECggEAXsh+aLpBuNj7y4Rze9Cx4Ojlynv3lrKCNSNirDWnldZKPXgYMRw6m1L9yFOmJFC9gToUKdR8CeD4SbJJEIJjHssxAfe29aNsqzE+fTN/F3g5piiQhwlHH8L/Fn6OC7BW4339XbUPieOMqQQyr+CQ+NTGDh0NovtPXZCzoiCMO+uAJ26FQ82xDnCJ1w+tmkq8By99ZdSTQ7ckANbq3kncDe4XoQvhUxYKPIa+4sdtf33rwIPzAXOkzZboh6IcFrtqZxwWzx700tZkzFcOB48wa5FkSJ8Dsk9AtMzZIjIUKtgFEt2hry8apU/J0hPVDzJPRa6f6kFxNRYsBm4HaJ5IoQKBgQC4HOWayQC7gFwWZJ7SKzLdRxmvBd5v301ltqN6wjQ0wEbOWMy9kswWsDkCkvGO5DapcN0BIRQ1Z9I3dRzFhOMlhv1kFa602O3ZzXpiOuCZoTMZJgHYLgqSEfezmSCs6rL8oCAZSM9bfm474VPiS6JcYTRGy+kYOxaNUx+/C19pPQKBgQC3E77geVGBWOFceH11c9qlTuGHGU1gwvRMvmTzLCXSotOlrqO1RHULtJbzjpTvwsysBnCEAgUQo2iX5U/peDfqduFhOSxUN9ugOVVBY5zbEQycz3WD3ii16EF7UUJ3mV9QU6XekYlS6JO1YLPY+YKyk9i52wX1ThfH1/GEDqb8PQKBgQCkSxURBOEkcKy8Rtn7DhV7pGDk8EXIaun0JADKINbZY+NLa654VLDOZj7Zbysjqb6lgVOWGGCiL51FY7pi/+x6pnUjhL28IABP5a6aTZPzRAgHHwVyVdOU+Xeiyrh/1YgXKwS5y2FOcgoIYVCrlXazHQK7UmcU+lVrk4u2vX1MuQKBgCr96g8QrkEvvAxZBy0zvZ6gPXnaST91yKTU+SPZtDAYqJb5wdvpbYsIJ4Kecv8ywZmMEZQOXV4g4Yj6AqAS6R6YOCj6ohxM2bhwfkLSv5z6DfotBa2n1+uP1QC+fltTmvxkCEmR56uejkFDqjhDr5t7+KL8ehO2+QKnBUI7pp8JAoGAGGgeIZQEjiV46gebzgSBntY244yFsDkn7jR9M63VgoP48O1v+7kRvHMSanxiXks1zDtLNDhwmApQ9atOW2JiM4RcA19Sbdl35mvyEyAlrjOESH+EkIWCRtZD/nYk+i5F7lNL891QrydKj3ovsJNZUwWFYP+m0+CJDBYa3w70t44=";
+    // 支付宝公钥,查看地址：https://openhome.alipay.com/platform/keyManage.htm 对应APPID下的支付宝公钥。
+    private  String alipay_public_key = "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtw1GMxtZQjm5ommUTACyosujDtB/qACIUwW16TbGiOa4gKAqfuP9AGmtVdjpEe6kMs1DANbxM6MbSE03Dh0G4MUylBBu/uLwlkazrSigLKWh4qnID9+1IKYb5FZk0NH7Ibi+MSWQKRUo3u4XOTSQjcPTnBpcAaj9AI8OvgYNYMiJBHNj6PVMqajp25AyRUAMur3cb6nAsZfXUOvBpncTr7nuAMYID+r9g3Xw3dlkUJ09CKx5i7HhlS5/cvo/fEPewyFxhyd707Q6K2h12JfXXNdMchwBtNfP8QY0RDreSIJK2/VdfOOdeCAQ22oGhSoRsPylQt/YOdcKQ6+gRFLwAwIDAQAB";
+    // 服务器[异步通知]页面路径 需 http:// 格式的完整路径，不能加 ?id=123 这类自定义参数，必须外网可以正常访问
+    // 支付宝会悄悄的给我们发送一个请求，告诉我们支付成功的信息
+    private  String notify_url;
+
+    // 页面跳转同步通知页面路径 需http://格式的完整路径，不能加?id=123这类自定义参数，必须外网可以正常访问
+    //同步通知，支付成功，一般跳转到成功页
+    private  String return_url;
+
+    // 签名方式
+    private  String sign_type = "RSA2";
+
+    // 字符编码格式
+    private  String charset = "utf-8";
+
+    // 支付宝网关； https://openapi.alipaydev.com/gateway.do
+    private  String gatewayUrl = "https://openapi-sandbox.dl.alipaydev.com/gateway.do";
+
+    public  String pay(PayVo vo) throws AlipayApiException {
+        //AlipayClient alipayClient = new DefaultAlipayClient(AlipayTemplate.gatewayUrl, AlipayTemplate.app_id, AlipayTemplate.merchant_private_key, "json", AlipayTemplate.charset, AlipayTemplate.alipay_public_key, AlipayTemplate.sign_type);
+        //1、根据支付宝的配置生成一个支付客户端
+        AlipayClient alipayClient = new DefaultAlipayClient(gatewayUrl,
+                app_id, merchant_private_key, "json",
+                charset, alipay_public_key, sign_type);
+
+        //2、创建一个支付请求 //设置请求参数
+        AlipayTradePagePayRequest alipayRequest = new AlipayTradePagePayRequest();
+        alipayRequest.setReturnUrl(return_url);
+        alipayRequest.setNotifyUrl(notify_url);
+
+        //商户订单号，商户网站订单系统中唯一订单号，必填
+        String out_trade_no = vo.getOut_trade_no();
+        //付款金额，必填
+        String total_amount = vo.getTotal_amount();
+        //订单名称，必填
+        String subject = vo.getSubject();
+        //商品描述，可空
+        String body = vo.getBody();
+
+        alipayRequest.setBizContent("{\"out_trade_no\":\""+ out_trade_no +"\","
+                + "\"total_amount\":\""+ total_amount +"\","
+                + "\"subject\":\""+ subject +"\","
+                + "\"body\":\""+ body +"\","
+                + "\"product_code\":\"FAST_INSTANT_TRADE_PAY\"}");
+
+        String result = alipayClient.pageExecute(alipayRequest).getBody();
+
+        //会收到支付宝的响应，响应的是一个页面，只要浏览器显示这个页面，就会自动来到支付宝的收银台页面
+        System.out.println("支付宝的响应："+result);
+
+        return result;
+    }
+}
+```
+
+所以需要封装一下用来传递订单信息的对象，给 SDK 用来拼接数据。
+
+```java
+@Data
+public class PayVo {
+    private String out_trade_no; // 商户订单号 必填
+    private String subject; // 订单名称 必填
+    private String total_amount;  // 付款金额 必填
+    private String body; // 商品描述 可空
+}
+```
+
+而在支付订单的页面，点击支付宝后应该调用到后端的方法，由后端将数据封装好并经由 SDK 进行发送跳转到支付宝的支付页面：
+
+```html
+<li>
+  <img src="/static/order/pay/img/zhifubao.png" style="weight:auto;height:30px;" alt="">
+  <a th:href="'http://order.gulimall.com/payOrder?orderSn=' + ${submitOrderResponseVo.order.orderSn}">支付宝</a>
+</li>
+```
+
+Controller 层：
+
+```java
+@ResponseBody
+@GetMapping(value = "/payOrder")
+public String payOrder(@RequestParam("orderSn") String orderSn, Model model) throws AlipayApiException {
+    PayVo payVo = orderService.getOrderPay(orderSn);
+    String pay = alipayTemplate.pay(payVo);
+    System.out.println(pay);
+}
+```
+
+Service 层：
+
+该层主要就是封装 PayVo 对象，根据前端传递来的订单号 OrderSn 找到对应的订单。
+
+```java
+@Override
+public PayVo getOrderPay(String orderSn) {
+    PayVo payVo = new PayVo();
+    OrderEntity orderEntity = getByOrderSn(orderSn);
+    BigDecimal bigDecimal = orderEntity.getPayAmount().setScale(2, RoundingMode.HALF_UP);
+    payVo.setTotal_amount(bigDecimal.toString());
+    payVo.setOut_trade_no(orderSn);
+    List<OrderItemEntity> orderItemEntities = orderItemService.list(new LambdaQueryWrapper<OrderItemEntity>().eq(OrderItemEntity::getOrderSn, orderSn));
+    OrderItemEntity orderItemEntity = orderItemEntities.get(0);
+    payVo.setSubject(orderItemEntity.getSkuName());
+    payVo.setBody(orderItemEntity.getSkuAttrsVals());
+    return payVo;
+}
+```
+
+成功运行后可以发现控制台打印的结果如下，调用 SDK 后直接给了一段完整的 HTML 表单代码，也就是说需要让这个表单代码渲染到浏览器上，让它完成订单的支付。
+
+```html
+<form name="punchout_form" method="post" action="https://openapi-sandbox.dl.alipaydev.com/gateway.do?charset=utf-8&method=alipay.trade.page.pay&sign=BLLuSzk4g6j8kllUWTwienvl0d2UNJffOxpjtR1b07KqUXTgomFGtDPHqiP0u4ikihPi7bS8SfSmZ2jQa2J%2B2j8oZr7chVwk8sVuFnWJfUJom%2Bi6%2FEPPpQDbNV780F86DvnrtoQ8tg1T2r%2FrkZ3LOYpQ0%2FBqIC3nxdDNc2xwB8Cc%2BciGgKDLz3K04dCMpK1XpHMXuT9AjXp%2Fi8rMycFR%2B4lg%2FWykSd8CSAKEiPzrropWkTn2Yx7iyb7oVYNJBFonAqCdSWhGO%2F393BAFMOAwCLlWGdsZPd6RJAbHaO4hFuAY5vckl0Xj%2F9Fskh4d7xd3g10EJ%2BYkfDYUxukSTuc26Q%3D%3D&version=1.0&app_id=9021000152656302&sign_type=RSA2&timestamp=2025-09-08+20%3A39%3A05&alipay_sdk=alipay-sdk-java-4.40.440.ALL&format=json">
+<input type="hidden" name="biz_content" value="{&quot;out_trade_no&quot;:&quot;20250908203858197196503210994291&quot;,&quot;total_amount&quot;:&quot;6305.00&quot;,&quot;subject&quot;:&quot;华为 A2217 黑色 8GB&quot;,&quot;body&quot;:&quot;入网型号: A2217;颜色: 黑色;内存: 8GB&quot;,&quot;product_code&quot;:&quot;FAST_INSTANT_TRADE_PAY&quot;}">
+<input type="submit" value="立即支付" style="display:none" >
+</form>
+<script>document.forms[0].submit();</script>
+<form name="punchout_form" method="post" action="https://openapi-sandbox.dl.alipaydev.com/gateway.do?charset=utf-8&method=alipay.trade.page.pay&sign=BLLuSzk4g6j8kllUWTwienvl0d2UNJffOxpjtR1b07KqUXTgomFGtDPHqiP0u4ikihPi7bS8SfSmZ2jQa2J%2B2j8oZr7chVwk8sVuFnWJfUJom%2Bi6%2FEPPpQDbNV780F86DvnrtoQ8tg1T2r%2FrkZ3LOYpQ0%2FBqIC3nxdDNc2xwB8Cc%2BciGgKDLz3K04dCMpK1XpHMXuT9AjXp%2Fi8rMycFR%2B4lg%2FWykSd8CSAKEiPzrropWkTn2Yx7iyb7oVYNJBFonAqCdSWhGO%2F393BAFMOAwCLlWGdsZPd6RJAbHaO4hFuAY5vckl0Xj%2F9Fskh4d7xd3g10EJ%2BYkfDYUxukSTuc26Q%3D%3D&version=1.0&app_id=9021000152656302&sign_type=RSA2&timestamp=2025-09-08+20%3A39%3A05&alipay_sdk=alipay-sdk-java-4.40.440.ALL&format=json">
+<input type="hidden" name="biz_content" value="{&quot;out_trade_no&quot;:&quot;20250908203858197196503210994291&quot;,&quot;total_amount&quot;:&quot;6305.00&quot;,&quot;subject&quot;:&quot;华为 A2217 黑色 8GB&quot;,&quot;body&quot;:&quot;入网型号: A2217;颜色: 黑色;内存: 8GB&quot;,&quot;product_code&quot;:&quot;FAST_INSTANT_TRADE_PAY&quot;}">
+<input type="submit" value="立即支付" style="display:none" >
+</form>
+<script>document.forms[0].submit();</script>
+```
+
+因此需要修改一下 Controller，让返回值直接自动提交跳转到支付页面：
+
+```java
+@ResponseBody
+@GetMapping(value = "/payOrder", produces = "text/html")
+public String payOrder(@RequestParam("orderSn") String orderSn, Model model) throws AlipayApiException {
+    PayVo payVo = orderService.getOrderPay(orderSn);
+    String pay = alipayTemplate.pay(payVo);
+    System.out.println(pay);
+    return pay;
+}
+```
+
+****
+## 3. 支付成功同步回调
+
+引入相关前端页面，将数据存入 nginx：
+
+```shell
+cp -r /mnt/d/docker_dataMountDirectory/gmall-static-resource/member/. /nginx/html/static/member
+```
+
+配置自定义域名：
+
+```host
+192.168.0.106 member.gulimall.com
+```
+
+配置网关：
+
+```yaml
+spring:
+  cloud:
+    gateway:
+      routs:
+        - id: nginx_member_route
+          uri: lb://gulimall-member
+          predicates:
+            - Host=member.gulimall.com
+```
+
+要想在成功支付后跳转到订单列表页面，就需要配置 SDK 中的同步回调地址：
+
+```java
+//同步通知，支付成功，一般跳转到成功页
+private  String return_url = "http://member.gulimall.com/memberOrder.html";
+```
+
+当支付成功后就会发送这个请求，所以需要在 gulimall-member 服务中新增接口来处理这个请求：
+
+```java
+@GetMapping("/memberOrder.html")
+public String memberOrderPage() {
+    return "orderList";
+}
+```
+
+****
 
 
 
