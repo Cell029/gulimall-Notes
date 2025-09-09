@@ -1,0 +1,10 @@
+spring:
+  application:
+    name: gulimall-seckill
+
+  cloud:
+    nacos:
+      config:
+        server-addr: 127.0.0.1:8848
+        file-extension: yaml # 文件后缀名
+        namespace: 5805abcb-780c-48b7-99f9-827d3762882c # seckill

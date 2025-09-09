@@ -88,4 +88,15 @@ public class OrderController {
         return R.ok().setData("orderEntity", orderEntity);
     }
 
+    /**
+     * 查询当前登录用户的所有订单信息
+     * @param params
+     * @return
+     */
+    @GetMapping("/listWithItem")
+    public R listWithItem(@RequestParam Map<String, Object> params){
+        PageUtils page = orderService.queryPageWithItem(params);
+        return R.ok().put("page", page);
+    }
+
 }

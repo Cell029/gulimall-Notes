@@ -9,6 +9,7 @@ import com.project.common.exception.NoStockException;
 import com.project.common.to.mq.OrderReleaseTo;
 import com.project.common.utils.R;
 import com.project.gulimall.order.domain.entity.OrderItemEntity;
+import com.project.gulimall.order.domain.entity.PaymentInfoEntity;
 import com.project.gulimall.order.domain.to.OrderCreateTo;
 import com.project.gulimall.order.domain.vo.*;
 import com.project.gulimall.order.enume.OrderStatusEnum;
@@ -18,6 +19,7 @@ import com.project.gulimall.order.feign.ProductFeignService;
 import com.project.gulimall.order.feign.WareFeignService;
 import com.project.gulimall.order.interceptor.LoginUserInterceptor;
 import com.project.gulimall.order.service.OrderItemService;
+import com.project.gulimall.order.service.PaymentInfoService;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.beans.BeanUtils;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -68,6 +70,10 @@ public class OrderServiceImpl extends ServiceImpl<OrderDao, OrderEntity> impleme
     private OrderItemService orderItemService;
     @Autowired
     private RabbitTemplate rabbitTemplate;
+    @Autowired
+    private PaymentInfoService paymentInfoService;
+    @Autowired
+    private OrderDao orderDao;
 
     @Override
     public PageUtils queryPage(Map<String, Object> params) {
@@ -269,6 +275,49 @@ public class OrderServiceImpl extends ServiceImpl<OrderDao, OrderEntity> impleme
         payVo.setSubject(orderItemEntity.getSkuName());
         payVo.setBody(orderItemEntity.getSkuAttrsVals());
         return payVo;
+    }
+
+    @Override
+    public PageUtils queryPageWithItem(Map<String, Object> params) {
+        MemberResponseVo memberResponseVo = LoginUserInterceptor.threadLocal.get();
+        IPage<OrderEntity> page = this.page(
+                new Query<OrderEntity>().getPage(params),
+                new LambdaQueryWrapper<OrderEntity>()
+                        .eq(OrderEntity::getMemberId, memberResponseVo.getId())
+                        .orderByDesc(OrderEntity::getId)
+        );
+        List<OrderEntity> orderEntities = page.getRecords().stream().map(orderEntity -> {
+            List<OrderItemEntity> orderItemEntities = orderItemService.list(new LambdaQueryWrapper<OrderItemEntity>().eq(OrderItemEntity::getOrderSn, orderEntity.getOrderSn()));
+            orderEntity.setOrderItems(orderItemEntities);
+            return orderEntity;
+        }).collect(Collectors.toList());
+
+        page.setRecords(orderEntities);
+        return new PageUtils(page);
+    }
+
+    /**
+     * 处理支付宝支付结果
+     * @param payAsyncVo
+     * @return
+     */
+    @Override
+    public String handlePayResult(PayAsyncVo payAsyncVo) {
+        // 1. 保存交易流水
+        PaymentInfoEntity paymentInfoEntity = new PaymentInfoEntity();
+        paymentInfoEntity.setAlipayTradeNo(payAsyncVo.getTrade_no());
+        paymentInfoEntity.setOrderSn(payAsyncVo.getOut_trade_no());
+        paymentInfoEntity.setPaymentStatus(payAsyncVo.getTrade_status());
+        paymentInfoEntity.setCallbackTime(payAsyncVo.getNotify_time());
+        paymentInfoService.save(paymentInfoEntity);
+
+        // 2. 修改订单状态信息
+        if (payAsyncVo.getTrade_status().equals("TRADE_FINISHED") || payAsyncVo.getTrade_status().equals("TRADE_SUCCESS")) {
+            // 订单支付成功
+            String outTradeNo = payAsyncVo.getOut_trade_no();
+            orderDao.updateOrderStatus(outTradeNo, OrderStatusEnum.PAYED.getCode());
+        }
+        return "success";
     }
 
     /**

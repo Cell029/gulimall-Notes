@@ -1,0 +1,37 @@
+spring:
+  application:
+    name: gulimall-seckill
+  cloud:
+    nacos:
+      discovery:
+        server-addr: 127.0.0.1:8848
+
+  thymeleaf:
+    cache: false
+
+  redis:
+    host: 127.0.0.1
+    port: 6379
+    password: 123
+  cache:
+    type: redis # 明确指定使用redis作为缓存实现
+    redis:
+      time-to-live: 600000 # 缓存 ttl，单位毫秒
+#      key-prefix: CACHE_ # 设置缓存 key 前缀
+      use-key-prefix: true # 是否开启前缀
+      cache-null-values: true # 是否缓存空值
+      null-value-ttl: 2m # null 占位 TTL
+
+  session:
+    store-type: redis
+    timeout: 30m
+
+feign:
+  client:
+    config:
+      default:
+        connectTimeout: 5000 # 连接超时时间，单位毫秒
+        readTimeout: 60000 # 读取超时时间，单位毫秒
+
+server:
+  port: 25000

@@ -17670,6 +17670,702 @@ public String memberOrderPage() {
 ```
 
 ****
+## 4. 订单列表页渲染
 
+因为订单列表 html 是写在 gulimall-member 服务中的，所以想要动态的查询出当前用户的所有订单信息，就需要在 member 服务中远程调用 order 服务查询订单的信息。
+这里使用的是分页查询，前端传递搜索的页数展示对应的订单信息，而远程调用时直接把这个 pageNum 传递过去即可。
 
+```java
+@FeignClient("gulimall-order")
+public interface OrderFeignService {
+    @GetMapping("/order/order/listWithItem")
+    R listWithItem(@RequestParam Map<String, Object> params);
+}
+```
 
+```java
+@GetMapping("/listWithItem")
+public R listWithItem(@RequestParam Map<String, Object> params){
+    PageUtils page = orderService.queryPageWithItem(params);
+    return R.ok().put("page", page);
+}
+```
+
+这里首先从 ThreadLocal 中拿出当前登录用户的信息，获取到用户 id，根据用户 id 查询该用户的所有订单，接着从获取到的订单中拿到所有的商品信息，把他们封装进 OrderEntity 对象中，
+因此该对象需要新增一个字段，用来存储每个订单的商品信息：
+
+```java
+@Data
+@TableName("oms_order")
+public class OrderEntity implements Serializable {
+    ...
+
+	@TableField(exist = false)
+	private List<OrderItemEntity> orderItems;
+
+}
+```
+
+这样做的目的就是方便前端直接拿出数据，因为前端不仅需要展示订单的信息，也需要展示该订单中包含的商品信息，因此才多封装一个字段。
+
+```java
+@Override
+public PageUtils queryPageWithItem(Map<String, Object> params) {
+    MemberResponseVo memberResponseVo = LoginUserInterceptor.threadLocal.get();
+    IPage<OrderEntity> page = this.page(
+            new Query<OrderEntity>().getPage(params),
+            new LambdaQueryWrapper<OrderEntity>()
+                    .eq(OrderEntity::getMemberId, memberResponseVo.getId())
+                    .orderByDesc(OrderEntity::getId)
+    );
+    List<OrderEntity> orderEntities = page.getRecords().stream().map(orderEntity -> {
+        List<OrderItemEntity> orderItemEntities = orderItemService.list(
+                new LambdaQueryWrapper<OrderItemEntity>().eq(OrderItemEntity::getOrderSn, orderEntity.getOrderSn())
+        );
+        orderEntity.setOrderItems(orderItemEntities);
+        return orderEntity;
+    }).collect(Collectors.toList());
+
+    page.setRecords(orderEntities);
+    return new PageUtils(page);
+}
+```
+
+接着在 member 服务的展示页面的接口处，就拿到了封装好的分页数据，该
+
+```java
+@GetMapping("/memberOrder.html")
+public String memberOrderPage(@RequestParam(value = "pageNum", defaultValue = "1") Integer pageNum, Model model) {
+    Map<String, Object> page = new HashMap<>();
+    page.put("page", pageNum.toString());
+    R r = orderFeignService.listWithItem(page);
+    model.addAttribute("orders", r);
+    return "orderList";
+}
+```
+
+通过控制台的打印可以看到大致的结构如下，当前端需要获取数据时，直接从 orders 中拿到 page 中的对应数据即可。
+
+```json
+{
+	msg = success, code = 0, page = {
+			totalCount = 0,
+			pageSize = 10,
+			totalPage = 0,
+			currPage = 1,
+			list = [{
+					id = 10,
+					memberId = 5,
+					orderSn = 20250908224650105196506428822798,
+					...
+					orderItems = [{
+							id = 10,
+							orderId = null,
+							orderSn = 20250908224650105196506428822798,
+							spuId = 16,
+							spuName = 华为,
+							spuPic = null,
+							spuBrand = 16,
+							categoryId = 225,
+							skuId = 29,
+							skuName = 华为 A2217 黑色 8 GB,
+							skuPic = https: 
+}]}]}}
+```
+
+```html
+<table class="table" th:each="order : ${orders.page.list}">
+  <tr>
+    <td colspan="7" style="background:#F7F7F7" >
+      <span style="color:#AAAAAA">2017-12-09 20:50:10</span>
+      <span><ruby style="color:#AAAAAA">订单号:</ruby> [[${order.orderSn}]]</span>
+      <span>谷粒商城<i class="table_i"></i></span>
+      <i class="table_i5 isShow"></i>
+    </td>
+  </tr>
+  <tr class="tr" th:each="item, itemStat : ${order.orderItems}">
+    <td colspan="3" style="border-right: 1px solid #ccc">
+      <img style="height: 60px;width: 60px" th:src="${item.skuPic}" alt="" class="img">
+      <div>
+        <p style="width: 242px;height: auto;overflow: auto">
+          [[${item.skuName}]]
+        </p>
+        <div><i class="table_i4"></i>找搭配</div>
+      </div>
+      <div style="margin-left:15px;">x[[${item.skuQuantity}]]</div>
+      <div style="clear:both"></div>
+    </td>
+    <td th:if="${itemStat.index==0}" th:rowspan="${itemStat.size}">[[${order.receiverName}]]<i><i class="table_i1"></i></i></tdthif>
+    <td th:if="${itemStat.index==0}" th:rowspan="${itemStat.size}" style="padding-left:10px;color:#AAAAB1;">
+      <p style="margin-bottom:5px;">总额 ￥[[${order.payAmount}]]</p>
+      <hr style="width:90%;">
+      <p>在线支付</p>
+    </td>
+    <td th:if="${itemStat.index==0}" th:rowspan="${itemStat.size}">
+      <ul>
+        <li style="color:#71B247;" th:if="${order.status==0}">待付款</li>
+        <li style="color:#71B247;" th:if="${order.status==1}">已付款</li>
+        <li style="color:#71B247;" th:if="${order.status==2}">已发货</li>
+        <li style="color:#71B247;" th:if="${order.status==3}">已完成</li>
+        <li style="color:#71B247;" th:if="${order.status==4}">已取消</li>
+        <li style="color:#71B247;" th:if="${order.status==5}">售后中</li>
+        <li style="color:#71B247;" th:if="${order.status==6}">售后完成</li>
+        <li class="tdLi">订单详情</li>
+      </ul>
+    </td>
+    <td th:if="${itemStat.index==0}" th:rowspan="${itemStat.size}">
+      <button>确认收货</button>
+      <p style="margin:4px 0; ">取消订单</p>
+      <p>催单</p>
+    </td>
+  </tr>
+</table>
+```
+
+****
+## 5. 支付宝沙箱异步通知
+
+支付宝异步通知是支付完成后，支付宝服务器主动向商户服务器发送的支付结果通知，这是一种服务器到服务器的通信方式。而这个异步通知同时需要商户提供一个可访问的 HTTP 地址，
+用于接收支付宝的回调，因此需要配置内网穿透，让本地的服务可以被公网访问。支付宝服务器回调商户 notify_url 发送的是 POST 请求并携带支付结果，
+而服务端则需要返回 "success" 字符串，否则支付宝会在一定间隔重试。
+
+配置内网穿透，这里使用的是花生壳软件，直接将本服务的地址和端口作为映射：
+
+```text
+映射类型：HTTP
+外网地址：http://1fwcz13643342.vicp.fun
+内网地址：127.0.0.1:9000
+```
+
+配置网关，让映射的外网地址可以被正确识别为 gulimall-order 服务的端口：
+
+```yaml
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: order-service
+          uri: http://localhost:9000 
+          predicates:
+            - Path=/order/**       
+          filters:
+            - StripPrefix=1          
+```
+
+配置 Controller 层，用于接收请求并返回结果：
+
+```java
+@RestController
+public class OrderPayedListener {
+    @PostMapping("/order/payed/notify")
+    public String handleAliPayed(HttpServletRequest request) {
+        Map<String, String[]> map = request.getParameterMap();
+        System.out.println("支付宝通知数据：" + map);
+        return "success";
+    }
+}
+```
+
+因为支付成功的异步回调属于远程调用，所以该请求不会携带 session 信息，不过通常也不需要用到用户相关的信息，所以这里需要做路径的放行操作：
+
+```java
+@Override
+public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) throws Exception {
+    String requestURI = request.getRequestURI();
+    AntPathMatcher antPathMatcher = new AntPathMatcher();
+    boolean match = antPathMatcher.match("/order/order/status", requestURI);
+    boolean match1 = antPathMatcher.match("/order/payed/notify", requestURI) || antPathMatcher.match("/payed/notify", requestURI);
+    System.out.println("Request URI: " + request.getRequestURI() + " Method: " + request.getMethod());
+    if (match || match1) {
+        return true;
+    }
+}
+```
+
+此时用 ApiFox 模拟异步回调，发送一个 POST 请求：http://1fwcz13643342.vicp.fun/order/payed/notify ，但是返回的结果却不是 "success"，而是登录页面，
+这就证明它没有被放行，而是被拦截去登录了，因此需要对路径做些修改。
+
+修改前的路径流程：
+
+```text
+外部请求: /order/payed/notify
+↓ 
+网关匹配 Path=/order/**
+↓ 
+StripPrefix=1 移除第一段路径 "/order"
+↓ 
+转发到 order-service: /payed/notify
+↓ 
+Controller 期望: /payed/notify 
+```
+
+理论上应该成立并正确返回 "success"，但实际请求中，控制台打印了两个请求路径：
+
+```text
+Request URI: /order/payed/notify Method: POST
+Request URI: /error Method: POST
+```
+
+就是第二个 /error 路径导致请求被拦截，跳转至登录页面，无法进入配置的 Controller 层，这个问题涉及到 Spring Cloud Gateway 的路径处理机制和 StripPrefix 过滤器的作用。
+拦截器中 antPathMatcher.match("/payed/notify", requestURI) 理论上放行，但 Spring Boot 可能在 DispatcherServlet 内部做了额外的重定向或重写（比如 /error）。
+不过更重要的是，支付宝通知是异步的，可能触发了两次请求，第二次请求可能由于 session 问题或线程上下文问题，重试时路径处理出现异常，导致 Spring 返回404，触发 /error。
+
+修改网关配置，直接使用完整的路径：
+
+```yaml
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: order-service
+          uri: http://localhost:9000
+          predicates:
+            - Path=/order/**         
+```
+
+```java
+@PostMapping("/order/payed/notify")
+```
+
+此时控制台就只打印了一个请求，并且成功返回 "success"：
+
+```text
+Request URI: /order/payed/notify Method: POST
+```
+
+修改后的路径流程：
+
+```text
+外部请求: /order/payed/notify
+↓ 
+网关匹配 Path=/order/**
+↓ 
+没有 StripPrefix，完整路径转发
+↓ 
+转发到 order-service: /order/payed/notify
+↓ 
+Controller 期望: /order/payed/notify
+```
+
+去掉 StripPrefix=1 后，路径转发是完整且一致的，避免了路径重写可能带来的上下文问题并减少了中间处理环节，降低了出错概率。
+所以最主要的还是 StripPrefix 过滤器可能在路径重写时影响了请求的某些属性。
+
+****
+## 6. 完成支付
+
+先打印一下支付宝在支付成功后的异步回调会携带哪些数据：
+
+```text
+gmt_create=2025-09-09 18:30:43
+charset=utf-8
+gmt_payment=2025-09-09 18:30:49
+notify_time=2025-09-09 18:30:51
+subject=华为 A2217 黑色 8GB
+sign=gWSbsO3JSLijfD6O6mHcntZxPuBmdpdA7iQra3Ae0+PpL4blgAfN56h9yUgRV4JJ1QRhFRawXyt2xGQtQ8GrJG3OulQQCsEamk+VtusqkrvxtAMgLPoKEwl4qq/43XkXR7YTFh9H010Bw25cdKddT1fW3GYsRsaFc2UuAxKR6BMlHGRWDQnE39WEaX/W+H3NE9jLMtlcVZ3m+4Wnckh0c53e1n4I5uBM1jCC5N2R6s9QmMrY+pfYnf3nHzGyinJZ6fWp58FKJtNHPbsKmkxfh+wC2TE9sF2wXj4NYO1KRrDJPx/7dttkfSMivlBun+n1RcaDB1V5FGosr8uYXvhkkw==
+buyer_id=2088722078741143
+body=入网型号: A2217;颜色: 黑色;内存: 8GB
+invoice_amount=12604.00
+version=1.0
+notify_id=2025090901222183050041140507162829
+fund_bill_list=[{"amount":"12604.00","fundChannel":"ALIPAYACCOUNT"}]
+notify_type=trade_status_sync
+out_trade_no=20250909183019395196536212280900
+total_amount=12604.00
+trade_status=TRADE_SUCCESS
+trade_no=2025090922001441140507131993
+auth_app_id=9021000152656302
+receipt_amount=12604.00
+point_amount=0.00
+buyer_pay_amount=12604.00
+app_id=9021000152656302
+sign_type=RSA2
+seller_id=2088721078756025
+```
+
+以上就是一些异步通知的参数，因此，需要把一些能够使用的，封装为订单信息的数据封装进一个对象，用该对象进行接收：
+
+```java
+@ToString
+@Data
+public class PayAsyncVo {
+    private String gmt_create;
+    private String charset;
+    private String gmt_payment;
+    private Date notify_time;
+    private String subject;
+    private String sign;
+    private String buyer_id;//支付者的id
+    private String body;//订单的信息
+    private String invoice_amount;//支付金额
+    private String version;
+    private String notify_id;//通知id
+    private String fund_bill_list;
+    private String notify_type;//通知类型； trade_status_sync
+    private String out_trade_no;//订单号
+    private String total_amount;//支付的总额
+    private String trade_status;//交易状态 TRADE_SUCCESS
+    private String trade_no;//流水号
+    private String auth_app_id;//
+    private String receipt_amount;//商家收到的款
+    private String point_amount;//
+    private String app_id;//应用id
+    private String buyer_pay_amount;//最终支付的金额
+    private String sign_type;//签名类型
+    private String seller_id;//商家的id
+}
+```
+
+其中较为重要的就是交易状态，因为后续要通过这个来修改订单的状态，它有四种状态，需要严格判断当前的订单属于哪一种再进行修改：
+
+- WAIT_BUYER_PAY：交易创建，等待买家付款。 
+- TRADE_CLOSED：未付款交易超时关闭，或支付完成后全额退款。 
+- TRADE_SUCCESS：交易支付成功，只有该状态会触发异步通知。
+- TRADE_FINISHED：交易结束，不可退款。
+
+需要注意的是，支付宝的日期字符串与 Spring 默认的日期解析格式不匹配，因此必须配置正确的日期格式，而这里的 private Date notify_time; 在配置日期格式的时候必须使用以前的配置方式：
+
+```yaml
+spring:
+  mvc:
+    date-format: yyyy-MM-dd HH:mm:ss
+```
+
+Spring MVC 处理请求参数绑定到对象（如这里使用的 PayAsyncVo）时，根据内容类型（Content-Type）的不同，会走两条完全不同的处理路径：
+
+1. application/json（如前端 Ajax 请求）：使用 HttpMessageConverter（通常是 MappingJackson2HttpMessageConverter）进行反序列化。
+2. application/x-www-form-urlencoded（如传统表单提交、支付宝回调）：使用 DataBinder 和 PropertyEditor 进行属性转换。
+
+路径一：HttpMessageConverter(用于 JSON)
+
+通常使用 spring.mvc.format.date 或 spring.jackson.date-format 也就是较新的日期配置进行格式化，它们的作用对象为 @RequestBody 注解的参数，由 Jackson 库处理。
+所以以上配置只会影响 Jackson 的 ObjectMapper，当反序列化 JSON 字符串时，ObjectMapper 会使用这个格式来解析日期字段。但支付宝回调使用的是第二种类型，它没用到 JSON，
+所以这个配置对支付宝的没用，也就导致了无法正常异步回调进入配置好的 Controller。
+
+路径二：DataBinder & PropertyEditor(用于表单)
+
+使用当前 Spring 已经弃用的配置 spring.mvc.date-format，它作用于所有非 @RequestBody 的对象，而支付宝的回调就属于一种表单提交，因此用来接收它携带的参数的对象可以不适用 @RequestBody，
+直接让 SpringMVC 自动注入数据，但也因此必须使用老的日期配置。
+
+Controller 层：
+
+上面有记录过，在商户端如果要完成订单的修改，就必须对支付宝传递来的数据进行验签操作，只有符合的才能算作是正确的订单，这部分的代码直接拿 SDK 中的即可。
+
+```java
+@PostMapping("/order/payed/notify")
+    public String handleAliPayed(PayAsyncVo payAsyncVo, HttpServletRequest request) throws AlipayApiException, UnsupportedEncodingException {
+        Map<String, String[]> map = request.getParameterMap();
+
+        for (String key : map.keySet()) {
+            System.out.println(key + "=" + request.getParameter(key));
+        }
+        //验签，获取支付宝POST过来反馈信息
+        Map<String,String> params = new HashMap<String,String>();
+        Map<String,String[]> requestParams = request.getParameterMap();
+        for (String name : requestParams.keySet()) {
+            String[] values = (String[]) requestParams.get(name);
+            String valueStr = "";
+            for (int i = 0; i < values.length; i++) {
+                valueStr = (i == values.length - 1) ? valueStr + values[i]
+                        : valueStr + values[i] + ",";
+            }
+            //乱码解决，这段代码在出现乱码时使用
+            // valueStr = new String(valueStr.getBytes("ISO-8859-1"), "utf-8");
+            params.put(name, valueStr);
+        }
+
+        boolean signVerified = AlipaySignature.rsaCheckV1(params, alipayTemplate.getAlipay_public_key(), alipayTemplate.getCharset(), alipayTemplate.getSign_type()); //调用SDK验证签名
+        System.out.println("签名验证结果: " + signVerified);
+        if (signVerified) {
+            System.out.println("签名验证成功！");
+            String result = orderService.handlePayResult(payAsyncVo);
+            return result;
+        } else {
+            System.out.println("签名验证失败！");
+            return "error";
+        }
+    }
+```
+
+Service 层：
+
+验签成功后就是修改订单的一些状态了，不过在此之前，还需要保存一下支付的详细信息，因此需要在表 oms_payment_info 中插入一些数据，方便后续的统计。
+而订单状态则需要根据支付宝回调的支付状态来判断是否成功下单。
+
+```java
+@Override
+public String handlePayResult(PayAsyncVo payAsyncVo) {
+    // 1. 保存交易流水
+    PaymentInfoEntity paymentInfoEntity = new PaymentInfoEntity();
+    paymentInfoEntity.setAlipayTradeNo(payAsyncVo.getTrade_no());
+    paymentInfoEntity.setOrderSn(payAsyncVo.getOut_trade_no());
+    paymentInfoEntity.setPaymentStatus(payAsyncVo.getTrade_status());
+    paymentInfoEntity.setCallbackTime(payAsyncVo.getNotify_time());
+    paymentInfoService.save(paymentInfoEntity);
+
+    // 2. 修改订单状态信息
+    if (payAsyncVo.getTrade_status().equals("TRADE_FINISHED") || payAsyncVo.getTrade_status().equals("TRADE_SUCCESS")) {
+        // 订单支付成功
+        String outTradeNo = payAsyncVo.getOut_trade_no();
+        orderDao.updateOrderStatus(outTradeNo, OrderStatusEnum.PAYED.getCode());
+    }
+    return "success";
+}
+```
+
+```xml
+<update id="updateOrderStatus">
+    update oms_order set status = #{code} where order_sn = #{outTradeNo}
+</update>
+```
+
+不过当前系统做了库存超时解锁的功能，而当前的支付宝支付界面并没有设置支付时间，如果在支付页面一直停留，等待库存解锁后，依然可以完成下单功能，这是不合理的，因此需要设置支付的时间，
+让支付时间小于库存解锁的时间，而支付宝沙箱的 SDK 中也提供了自动收单功能，只需要在传递的参数中添加过期时间即可：
+
+````java
+alipayRequest.setBizContent("{\"out_trade_no\":\""+ out_trade_no +"\","
+                + "\"total_amount\":\""+ total_amount +"\","
+                + "\"subject\":\""+ subject +"\","
+                + "\"body\":\""+ body +"\","
+                + "\"timeout_express\":\"1m\","
+                + "\"product_code\":\"FAST_INSTANT_TRADE_PAY\"}");
+````
+
+****
+# 十二、秒杀服务
+
+## 1. 后台添加秒杀商品
+
+本电商系统的秒杀商品是分场次的，也就是几点到几点有几批秒杀活动，而这段时间点内可以添加一些参与秒杀活动的商品，并给这些商品添加秒杀的价格。而添加商品的操作在后台管理页面为关联商品按钮，
+通过点击该按钮可以看到它发送的请求：http://localhost:88/api/coupon/seckillskurelation/list?t=1757420690050&page=1&limit=10&key=&promotionSessionId=1 。
+所以秒杀功能是一个新的服务，因此需要新配一个网关：
+
+```yaml
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: coupon_route
+          uri: lb://gulimall-coupon
+          predicates:
+            - Path=/api/coupon/**
+          filters:
+            - RewritePath=/api/(?<segment>.*),/$\{segment}
+```
+
+从发送的请求中可以看到，这是一个分页查询，并且携带了一个 promotionSessionId，通过查询数据库表，可以发现该字段就是表 sms_seckill_sku_relation 用来关联场次表的，
+因此在查询或新增可进行关联的商品时需要携带上该字段。
+
+Controller 层：
+
+```java
+@RequestMapping("/list")
+public R list(@RequestParam Map<String, Object> params){
+    PageUtils page = seckillSkuRelationService.queryPage(params);
+    return R.ok().put("page", page);
+}
+```
+
+Service 层：
+
+```java
+@Override
+public PageUtils queryPage(Map<String, Object> params) {
+    QueryWrapper<SeckillSkuRelationEntity> seckillSkuRelationEntityQueryWrapper = new QueryWrapper<SeckillSkuRelationEntity>();
+    String promotionSessionId = (String) params.get("promotionSessionId");
+    if (!StringUtils.isEmpty(promotionSessionId)) {
+        seckillSkuRelationEntityQueryWrapper.eq("promotion_session_id", promotionSessionId);
+    }
+    IPage<SeckillSkuRelationEntity> page = this.page(
+            new Query<SeckillSkuRelationEntity>().getPage(params),
+            seckillSkuRelationEntityQueryWrapper
+    );
+    return new PageUtils(page);
+}
+```
+
+****
+## 2. 定时任务
+
+在 Spring Boot 应用中经常需要执行定时任务，比如数据同步、报表生成、状态检查等，而 Spring Boot 通过 @Scheduled 注解提供了简单的定时任务功能，它并不是和消息队列一样，
+等待消息 TTL 过期后再执行任务，更像是一种周期性的任务。
+
+在启动类或配置类上添加 @EnableScheduling 注解来启用定时任务支持：
+
+```java
+@Slf4j
+@Component
+@EnableScheduling
+public class HelloSchedule {
+}
+```
+
+在方法上使用 @Scheduled 注解来定义定时任务：
+
+```java
+// 每5秒执行一次
+@Scheduled(fixedRate = 5000)
+public void hello() {
+    log.info("hello");
+}
+```
+
+@Scheduled 注解中有许多常用的参数：
+
+- fixedRate：固定速率执行，从上一次开始时间计算下一次执行时间
+- fixedDelay：固定延迟执行，从上一次结束时间计算下一次执行时间
+- initialDelay：初始延迟，第一次执行前等待的时间。@Scheduled(initialDelay = 1000, fixedRate = 5000) // 首次延迟1秒，之后每5秒执行
+- cron 表达式：由 6 或 7 个字段组成，格式为：秒 分 时 日 月 周 [年]，但 SpringBoot 中不支持年份字段
+
+| 字段    | 允许值           | 允许的特殊字符                     |
+| ----- | ------------- | --------------------------- |
+| 秒     | 0-59          | `,` `-` `*` `/`             |
+| 分     | 0-59          | `,` `-` `*` `/`             |
+| 时     | 0-23          | `,` `-` `*` `/`             |
+| 日     | 1-31          | `,` `-` `*` `?` `/` `L` `W` |
+| 月     | 1-12          | `,` `-` `*` `/`             |
+| 周     | 1-7 或 SUN-SAT | `,` `-` `*` `?` `/` `L` `#` |
+| 年(可选) | 1970-2099     | `,` `-` `*` `/`             |
+
+`?` 只能用在 “日(日期)” 和 “周(星期)” 两个字段中，表示不指定具体的值，一般用于 避免 “日” 和 “周” 字段冲突
+
+- 0 0 10 * * ? 每天 10 点执行 
+- 0 0/30 9-17 * * ? 工作日 9 点到 17 点每 30 分钟执行 
+- 0 0 12 ? * WED 每周三中午 12 点执行
+
+SpringBoot 定时任务默认是阻塞执行的：
+
+```java
+@Scheduled(fixedRate = 1000)
+public void task1() throws InterruptedException {
+    System.out.println("Task1开始: " + Thread.currentThread().getName());
+    Thread.sleep(3000); // 模拟耗时操作
+    System.out.println("Task1结束");
+}
+
+@Scheduled(fixedRate = 1000)
+public void task2() {
+    System.out.println("Task2执行: " + Thread.currentThread().getName());
+}
+```
+
+通过打印结果可以看到 task2 会被阻塞，直到 task1 完成任务：
+
+```text
+Task1结束
+Task2执行: pool-5-thread-1
+Task1开始: pool-5-thread-1
+Task1结束
+Task2执行: pool-5-thread-1 # Task2被阻塞，直到Task1完成
+Task1开始: pool-5-thread-1
+Task1结束
+Task2执行: pool-5-thread-1
+```
+
+但定时任务通常是不允许发生阻塞现象的，因此需要让这些任务异步进行，可以选择使用多个线程，也可以使用 @Async 注解异步执行：
+
+1、配置多线程
+
+```java
+@Configuration
+public class AsyncSchedulingConfig implements SchedulingConfigurer {
+    @Override
+    public void configureTasks(ScheduledTaskRegistrar taskRegistrar) {
+        ThreadPoolTaskScheduler taskScheduler = new ThreadPoolTaskScheduler();
+        taskScheduler.setPoolSize(5); // 设置线程池大小
+        taskScheduler.setThreadNamePrefix("scheduled-task-");
+        taskScheduler.setAwaitTerminationSeconds(60);
+        taskScheduler.setWaitForTasksToCompleteOnShutdown(true);
+        taskScheduler.initialize();
+        taskRegistrar.setTaskScheduler(taskScheduler);
+    }
+}
+```
+
+可以看到配置了多个线程后它们就不会阻塞了：
+
+```text
+Task1结束
+Task1开始: scheduled-task-1
+Task2执行: scheduled-task-5
+Task2执行: scheduled-task-5
+Task2执行: scheduled-task-5
+Task1结束
+Task2执行: scheduled-task-5
+Task1开始: scheduled-task-1
+Task2执行: scheduled-task-5
+Task2执行: scheduled-task-5
+Task2执行: scheduled-task-5
+Task1结束
+Task1开始: scheduled-task-1
+Task2执行: scheduled-task-3
+Task2执行: scheduled-task-3
+```
+
+在定时任务的配置类中，可以看到初始化的线程池的大小就是 1，也就证明了默认的定时任务只使用一条线程，因此会阻塞进行。
+
+```java
+@ConfigurationProperties("spring.task.scheduling")
+public class TaskSchedulingProperties {
+  public static class Pool {
+    private int size = 1;
+
+    public int getSize() {
+      return this.size;
+    }
+
+    public void setSize(int size) {
+      this.size = size;
+    }
+  }
+}
+```
+
+2、使用 @Async 异步执行
+
+可以在定时任务上添加 @Async 来启用异步执行，它底层就是 Spring Boot 会提供一个默认的执行器：
+
+```java
+@Bean(name = {ApplicationTaskExecutor.BEAN_NAME, "taskExecutor"})
+public ThreadPoolTaskExecutor applicationTaskExecutor(TaskExecutorBuilder builder) {
+    return builder.build();
+}
+```
+
+也就是说，默认就有一个 taskExecutor，只不过能够使用的线程数较少：
+
+- 核心线程数：8 
+- 最大线程数：Integer.MAX_VALUE 
+- 队列容量：Integer.MAX_VALUE 
+- 线程名前缀：task-
+
+所以一般会使用指定的异步执行器：
+
+```java
+@Configuration
+@EnableAsync  // 启用异步支持
+public class AsyncConfig {
+    @Bean("taskExecutor")
+    public TaskExecutor taskExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(5);
+        executor.setMaxPoolSize(10);
+        executor.setQueueCapacity(25);
+        executor.setThreadNamePrefix("async-task-");
+        executor.initialize();
+        return executor;
+    }
+}
+
+@Component
+public class AsyncScheduledTasks {
+    @Async("taskExecutor")  // 指定使用异步执行器
+    @Scheduled(fixedRate = 1000)
+    public void asyncTask() throws InterruptedException {
+        System.out.println("异步任务开始: " + Thread.currentThread().getName());
+        Thread.sleep(3000);
+        System.out.println("异步任务结束: " + Thread.currentThread().getName());
+    }
+}
+```
+
+****
