@@ -1,18 +1,21 @@
-package com.project.gulimall.coupon.entity;
+package com.project.gulimall.coupon.domain.entity;
 
+import com.baomidou.mybatisplus.annotation.TableField;
 import com.baomidou.mybatisplus.annotation.TableId;
 import com.baomidou.mybatisplus.annotation.TableName;
 
 import java.io.Serializable;
 import java.util.Date;
+import java.util.List;
+
 import lombok.Data;
 
 /**
- * 秒杀活动
+ * 秒杀活动场次
  */
 @Data
-@TableName("sms_seckill_promotion")
-public class SeckillPromotionEntity implements Serializable {
+@TableName("sms_seckill_session")
+public class SeckillSessionEntity implements Serializable {
 	private static final long serialVersionUID = 1L;
 
 	/**
@@ -21,28 +24,27 @@ public class SeckillPromotionEntity implements Serializable {
 	@TableId
 	private Long id;
 	/**
-	 * 活动标题
+	 * 场次名称
 	 */
-	private String title;
+	private String name;
 	/**
-	 * 开始日期
+	 * 每日开始时间
 	 */
 	private Date startTime;
 	/**
-	 * 结束日期
+	 * 每日结束时间
 	 */
 	private Date endTime;
 	/**
-	 * 上下线状态
+	 * 启用状态
 	 */
 	private Integer status;
 	/**
 	 * 创建时间
 	 */
 	private Date createTime;
-	/**
-	 * 创建人
-	 */
-	private Long userId;
+
+	@TableField(exist = false)
+	private List<SeckillSkuRelationEntity> relationSkus;
 
 }

@@ -1,14 +1,11 @@
 package com.project.gulimall.coupon.controller;
 
 import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.web.bind.annotation.PathVariable;
-import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RequestParam;
-import org.springframework.web.bind.annotation.RestController;
-import com.project.gulimall.coupon.entity.SeckillSessionEntity;
+import org.springframework.web.bind.annotation.*;
+import com.project.gulimall.coupon.domain.entity.SeckillSessionEntity;
 import com.project.gulimall.coupon.service.SeckillSessionService;
 import com.project.common.utils.PageUtils;
 import com.project.common.utils.R;
@@ -19,6 +16,7 @@ import com.project.common.utils.R;
 @RestController
 @RequestMapping("coupon/seckillsession")
 public class SeckillSessionController {
+
     @Autowired
     private SeckillSessionService seckillSessionService;
 
@@ -76,6 +74,12 @@ public class SeckillSessionController {
 		seckillSessionService.removeByIds(Arrays.asList(ids));
 
         return R.ok();
+    }
+
+    @GetMapping("/latest3DaySession")
+    public R getLatest3DaySession(){
+        List<SeckillSessionEntity> seckillSessionEntities = seckillSessionService.getLatest3DaySession();
+        return R.ok().setData("seckillSession", seckillSessionEntities);
     }
 
 }

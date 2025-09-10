@@ -9,7 +9,7 @@ import com.project.common.utils.PageUtils;
 import com.project.common.utils.Query;
 
 import com.project.gulimall.coupon.dao.SkuLadderDao;
-import com.project.gulimall.coupon.entity.SkuLadderEntity;
+import com.project.gulimall.coupon.domain.entity.SkuLadderEntity;
 import com.project.gulimall.coupon.service.SkuLadderService;
 
 

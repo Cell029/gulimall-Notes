@@ -9,7 +9,7 @@ import com.project.common.utils.PageUtils;
 import com.project.common.utils.Query;
 
 import com.project.gulimall.coupon.dao.HomeSubjectDao;
-import com.project.gulimall.coupon.entity.HomeSubjectEntity;
+import com.project.gulimall.coupon.domain.entity.HomeSubjectEntity;
 import com.project.gulimall.coupon.service.HomeSubjectService;
 
 

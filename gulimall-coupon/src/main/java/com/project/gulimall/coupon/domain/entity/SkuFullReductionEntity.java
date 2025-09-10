@@ -1,4 +1,4 @@
-package com.project.gulimall.coupon.entity;
+package com.project.gulimall.coupon.domain.entity;
 
 import com.baomidou.mybatisplus.annotation.TableId;
 import com.baomidou.mybatisplus.annotation.TableName;
@@ -9,11 +9,11 @@ import java.util.Date;
 import lombok.Data;
 
 /**
- * 商品会员价格
+ * 商品满减信息
  */
 @Data
-@TableName("sms_member_price")
-public class MemberPriceEntity implements Serializable {
+@TableName("sms_sku_full_reduction")
+public class SkuFullReductionEntity implements Serializable {
 	private static final long serialVersionUID = 1L;
 
 	/**
@@ -22,23 +22,19 @@ public class MemberPriceEntity implements Serializable {
 	@TableId
 	private Long id;
 	/**
-	 * sku_id
+	 * spu_id
 	 */
 	private Long skuId;
 	/**
-	 * 会员等级id
+	 * 满多少
 	 */
-	private Long memberLevelId;
+	private BigDecimal fullPrice;
 	/**
-	 * 会员等级名
+	 * 减多少
 	 */
-	private String memberLevelName;
+	private BigDecimal reducePrice;
 	/**
-	 * 会员对应价格
-	 */
-	private BigDecimal memberPrice;
-	/**
-	 * 可否叠加其他优惠[0-不可叠加优惠，1-可叠加]
+	 * 是否参与其他优惠
 	 */
 	private Integer addOther;
 

@@ -6,7 +6,7 @@ import java.util.Map;
 import com.project.common.to.SkuReductionTo;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.*;
-import com.project.gulimall.coupon.entity.SkuFullReductionEntity;
+import com.project.gulimall.coupon.domain.entity.SkuFullReductionEntity;
 import com.project.gulimall.coupon.service.SkuFullReductionService;
 import com.project.common.utils.PageUtils;
 import com.project.common.utils.R;

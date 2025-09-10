@@ -4,7 +4,7 @@ import java.util.Arrays;
 import java.util.Map;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.*;
-import com.project.gulimall.coupon.entity.SpuBoundsEntity;
+import com.project.gulimall.coupon.domain.entity.SpuBoundsEntity;
 import com.project.gulimall.coupon.service.SpuBoundsService;
 import com.project.common.utils.PageUtils;
 import com.project.common.utils.R;

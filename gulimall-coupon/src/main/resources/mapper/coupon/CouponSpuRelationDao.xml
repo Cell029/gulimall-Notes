@@ -4,7 +4,7 @@
 <mapper namespace="com.project.gulimall.coupon.dao.CouponSpuRelationDao">
 
 	<!-- 可根据自己的需求，是否要使用 -->
-    <resultMap type="com.project.gulimall.coupon.entity.CouponSpuRelationEntity" id="couponSpuRelationMap">
+    <resultMap type="com.project.gulimall.coupon.domain.entity.CouponSpuRelationEntity" id="couponSpuRelationMap">
         <result property="id" column="id"/>
         <result property="couponId" column="coupon_id"/>
         <result property="spuId" column="spu_id"/>

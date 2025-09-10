@@ -4,7 +4,7 @@
 <mapper namespace="com.project.gulimall.coupon.dao.SpuBoundsDao">
 
 	<!-- 可根据自己的需求，是否要使用 -->
-    <resultMap type="com.project.gulimall.coupon.entity.SpuBoundsEntity" id="spuBoundsMap">
+    <resultMap type="com.project.gulimall.coupon.domain.entity.SpuBoundsEntity" id="spuBoundsMap">
         <result property="id" column="id"/>
         <result property="spuId" column="spu_id"/>
         <result property="growBounds" column="grow_bounds"/>

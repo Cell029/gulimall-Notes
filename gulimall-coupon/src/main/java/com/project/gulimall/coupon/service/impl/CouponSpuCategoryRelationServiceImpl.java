@@ -9,7 +9,7 @@ import com.project.common.utils.PageUtils;
 import com.project.common.utils.Query;
 
 import com.project.gulimall.coupon.dao.CouponSpuCategoryRelationDao;
-import com.project.gulimall.coupon.entity.CouponSpuCategoryRelationEntity;
+import com.project.gulimall.coupon.domain.entity.CouponSpuCategoryRelationEntity;
 import com.project.gulimall.coupon.service.CouponSpuCategoryRelationService;
 
 

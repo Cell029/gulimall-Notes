@@ -8,7 +8,7 @@ import org.springframework.stereotype.Component;
 
 @Slf4j
 @Component
-@EnableScheduling
+// @EnableScheduling
 public class HelloSchedule {
 
     /*@Scheduled(fixedRate = 1000)
@@ -16,7 +16,7 @@ public class HelloSchedule {
         log.info("hello");
     }*/
 
-    @Scheduled(fixedRate = 1000)
+    /*@Scheduled(fixedRate = 1000)
     public void task1() throws InterruptedException {
         System.out.println("Task1开始: " + Thread.currentThread().getName());
         Thread.sleep(3000); // 模拟耗时操作
@@ -27,5 +27,5 @@ public class HelloSchedule {
     @Scheduled(fixedRate = 1000)
     public void task2() {
         System.out.println("Task2执行: " + Thread.currentThread().getName());
-    }
+    }*/
 }

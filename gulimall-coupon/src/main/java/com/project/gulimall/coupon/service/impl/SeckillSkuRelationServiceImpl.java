@@ -10,7 +10,7 @@ import com.project.common.utils.PageUtils;
 import com.project.common.utils.Query;
 
 import com.project.gulimall.coupon.dao.SeckillSkuRelationDao;
-import com.project.gulimall.coupon.entity.SeckillSkuRelationEntity;
+import com.project.gulimall.coupon.domain.entity.SeckillSkuRelationEntity;
 import com.project.gulimall.coupon.service.SeckillSkuRelationService;
 
 

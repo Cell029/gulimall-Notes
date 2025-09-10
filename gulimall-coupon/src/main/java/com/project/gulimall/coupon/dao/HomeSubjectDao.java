@@ -1,6 +1,6 @@
 package com.project.gulimall.coupon.dao;
 
-import com.project.gulimall.coupon.entity.HomeSubjectEntity;
+import com.project.gulimall.coupon.domain.entity.HomeSubjectEntity;
 import com.baomidou.mybatisplus.core.mapper.BaseMapper;
 import org.apache.ibatis.annotations.Mapper;
 

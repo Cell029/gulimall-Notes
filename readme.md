@@ -18369,3 +18369,605 @@ public class AsyncScheduledTasks {
 ```
 
 ****
+## 3. 自动上架秒杀商品
+
+自动上架秒杀商品的时间范围限定在最近三天，从今天开始算起，也就是加上明天和后天，而一天的定义以 00:00:00 - 23:59:59 为准。不过既然是自动上架秒杀商品，
+那就一定存在重复上架的问题，因为是分布式的系统，难免存在多个上架秒杀商品的服务，如果不对它们做限制，那么就可能导致一件商品同时上架多次。
+而不同的操作可能对这些相同的商品信息造成数据差异，因此需要限制上架商品时只能有一个服务在运行，也就是用到分布式锁，只有上一个服务解锁后下一个服务才能进行上架操作，
+当然上架秒杀商品的操作并需要很大的吞吐量，因此使用分布式锁不会造成阻塞的问题。
+
+
+```java
+@Slf4j
+@Service
+@EnableScheduling
+public class SeckillSkuScheduled {
+
+    @Autowired
+    private SeckillService seckillService;
+
+    @Autowired
+    private RedissonClient redissonClient;
+
+    /**
+     * 每天晚上 3:00 上架最近三天需要秒杀的商品
+     * 当天 00:00:00 - 23:59:59
+     * 明天 00:00:00 - 23:59:59
+     * 后天 00:00:00 - 23:59:59
+     */
+    @Scheduled(cron = "*/5 * * * * ?")
+    public void uploadSeckillSkuLatest3Days() {
+        // 重复上架无需处理
+        log.info("上架秒杀商品...");
+        // 添加分布式锁
+        String upload_lock = "seckill:upload:lock";
+        RLock rLock = redissonClient.getLock(upload_lock);
+        rLock.lock(10, TimeUnit.SECONDS);
+        try {
+            seckillService.uploadSeckillSkuLatest3Days();
+        } finally {
+            rLock.unlock();
+        }
+    }
+}
+```
+
+查询近三天需要参与秒杀的活动，就是查询表中的开始时间字段和结束时间字段，只要这两个字段在当前三天内的就时符合的，就可以取出这些数据。而管理员添加可以参与秒杀活动的商品时是在 coupon 服务中进行的，
+并且相关的数据都是 coupon 进行的，因此需要进行远程查询，不过查询条件和当前时间有关，所以不需要传递参数，只需要调用即可。当查询到数据后就需要把它们存入 Redis 中，
+秒杀活动的特点就是参与的人多，因此瞬时的并发量是很大的，如果直接操作数据库进行修改的话，不光速度慢，还会对其造成巨大的压力导致崩溃。存入 Redis 后进行访问的是内存，
+它的访问速度很快，后续再根据 Redis 中的数据进行数据库的修改即可。
+
+```java
+@Override
+public void uploadSeckillSkuLatest3Days() {
+    // 1. 扫描最近三天需要参与秒杀的活动
+    try {
+        R r = couponFeignService.getLatest3DaySession();
+        if (r.getCode() == 0) {
+            // 上架的商品数据
+            List<SeckillSessionWithSkus> seckillSessionList = r.getData("seckillSession", new TypeReference<List<SeckillSessionWithSkus>>() {
+            });
+            // 缓存到 Redis
+            // 1. 缓存活动信息
+            saveSessionInfos(seckillSessionList);
+            // 2. 缓存活动相关联的商品信息
+            saveSessionSkuInfos(seckillSessionList);
+        }
+    } catch (Exception e) {
+        log.error("秒杀商品上架异常", e);
+        throw new RuntimeException("秒杀商品上架失败", e);
+    }
+}
+```
+
+接着就是远程查询近三天的秒杀活动：
+
+```java
+@FeignClient(name = "gulimall-coupon", path = "/coupon/seckillsession")
+public interface CouponFeignService {
+    @GetMapping("/latest3DaySession")
+    R getLatest3DaySession();
+}
+```
+
+```java
+@GetMapping("/latest3DaySession")
+public R getLatest3DaySession(){
+    List<SeckillSessionEntity> seckillSessionEntities = seckillSessionService.getLatest3DaySession();
+    return R.ok().setData("seckillSession", seckillSessionEntities);
+}
+```
+
+获取近三天的秒杀活动信息的同时需要把数据进行封装，因为上架秒杀商品时需要知道是哪场活动，才能上架对应的商品，因此除了活动信息，还需要封装关联的秒杀商品信息，
+不过这个秒杀商品的对象中只封装了一些简单的数据，例如关联的活动、秒杀价格等信息，如果想要该商品的详细信息就得远程查询 product 服务。
+```java
+@Data
+@TableName("sms_seckill_session")
+public class SeckillSessionEntity implements Serializable {
+	private static final long serialVersionUID = 1L;
+
+	/**
+	 * id
+	 */
+	@TableId
+	private Long id;
+	/**
+	 * 场次名称
+	 */
+	private String name;
+	/**
+	 * 每日开始时间
+	 */
+	private Date startTime;
+	/**
+	 * 每日结束时间
+	 */
+	private Date endTime;
+	/**
+	 * 启用状态
+	 */
+	private Integer status;
+	/**
+	 * 创建时间
+	 */
+	private Date createTime;
+
+	@TableField(exist = false)
+	private List<SeckillSkuRelationEntity> relationSkus;
+
+}
+```
+
+```java
+@Data
+@TableName("sms_seckill_sku_relation")
+public class SeckillSkuRelationEntity implements Serializable {
+	private static final long serialVersionUID = 1L;
+
+	/**
+	 * id
+	 */
+	@TableId
+	private Long id;
+	/**
+	 * 活动id
+	 */
+	private Long promotionId;
+	/**
+	 * 活动场次id
+	 */
+	private Long promotionSessionId;
+	/**
+	 * 商品id
+	 */
+	private Long skuId;
+	/**
+	 * 秒杀价格
+	 */
+	private BigDecimal seckillPrice;
+	/**
+	 * 秒杀总量
+	 */
+	private BigDecimal seckillCount;
+	/**
+	 * 每人限购数量
+	 */
+	private BigDecimal seckillLimit;
+	/**
+	 * 排序
+	 */
+	private Integer seckillSort;
+
+}
+```
+
+既然是以近三天的时间作为条件查询数据库，那么就需要计算好近三天的开始时间和结束时间是什么，然后以这段时间为条件查询在它们之间的秒杀活动，当然该查询只能查到活动的一些数据，
+该活动关联的秒杀商品还需要另外查数据库，这里就可以利用活动的 id 作为条件查询表 sms_seckill_sku_relation，该表中有个字段 promotion_session_id 就是用来关联活动场次表的，
+因此可以先获取到近三天的所有活动场次的 id，然后以该 id 作为条件查询表 sms_seckill_sku_relation 即可。最后就是遍历赋值，因此查询出的关联商品需要封装成 Map 集合，
+用活动场次的 id 作为 key，秒杀商品对象集合作为 value，赋值时再通过活动场次 id 获取即可。
+
+```java
+@Override
+public List<SeckillSessionEntity> getLatest3DaySession() {
+    // 获取开始时间和结束时间
+    LocalDateTime startTime = LocalDate.now().atStartOfDay();
+    LocalDateTime endTime = LocalDate.now().plusDays(2).atTime(23, 59, 59);
+
+    // 获取近三天的所有秒杀活动
+    List<SeckillSessionEntity> seckillSessionEntities = list(new LambdaQueryWrapper<SeckillSessionEntity>()
+            .between(SeckillSessionEntity::getStartTime, startTime, endTime));
+    if (seckillSessionEntities.isEmpty()) {
+        return Collections.emptyList();
+    }
+
+    // 获取秒杀活动场次的 id，也就是商品关联活动表的 PromotionSessionId
+    List<Long> ids = seckillSessionEntities.stream()
+            .map(SeckillSessionEntity::getId)
+            .collect(Collectors.toList());
+
+    // 一次查询所有关联商品
+    Map<Long, List<SeckillSkuRelationEntity>> skuMap = seckillSkuRelationService
+            .list(new LambdaQueryWrapper<SeckillSkuRelationEntity>()
+                    .in(SeckillSkuRelationEntity::getPromotionSessionId, ids))
+            .stream()
+            .collect(Collectors.groupingBy(SeckillSkuRelationEntity::getPromotionSessionId));
+
+    return seckillSessionEntities.stream()
+            .map(session -> {
+                session.setRelationSkus(skuMap.getOrDefault(session.getId(), Collections.emptyList()));
+                return session;
+            }).collect(Collectors.toList());
+}
+```
+
+接着就是将活动场次和秒杀商品的数据保存进 Redis 了。缓存活动场次的信息很简单，一个场次对应一条数据，但需要用开始时间和结束时间拼接起来作为 key，场次 id 拼接商品 id 集合作为 value，
+因为一个点的秒杀活动就只有一场，为了避免重复添加进 Redis，就需要对 Redis 中的数据进行判断是否已存在，若存在则无需再次存入。
+
+```java
+private final String SESSION_CACHE_PREFIX = "seckill:sessions:";
+
+// 1. 缓存活动信息
+private void saveSessionInfos(List<SeckillSessionWithSkus> seckillSessionList) {
+    seckillSessionList.forEach(SeckillSessionWithSkus -> {
+        long startTime = SeckillSessionWithSkus.getStartTime().getTime();
+        long endTime = SeckillSessionWithSkus.getEndTime().getTime();
+        String key = SESSION_CACHE_PREFIX + startTime + "_" + endTime;
+        Boolean hasKey = stringRedisTemplate.hasKey(key);
+        if (!hasKey) {
+            List<String> skuIds = SeckillSessionWithSkus.getRelationSkus().stream()
+                    .map(skuItem -> skuItem.getPromotionSessionId() + "_" + skuItem.getSkuId().toString()).collect(Collectors.toList());
+            // 活动信息作为 key，商品 id 作为 value
+            stringRedisTemplate.opsForList().leftPushAll(key, skuIds);
+        }
+    });
+}
+```
+
+缓存关联的秒杀商品数据到 Redis 中就需要先从远程查询到的 List<SeckillSessionWithSkus> 中依次取出里面的关联商品，当然这些商品信息只封装了一些简单的数据，
+因此需要补充一下对应的每个 sku 信息的所有数据，那么就需要封装一个对象，用来接收它们：
+
+```java
+@Data
+public class SeckillSkuRedisTo {
+    /**
+     * 活动id
+     */
+    private Long promotionId;
+    /**
+     * 活动场次id
+     */
+    private Long promotionSessionId;
+    /**
+     * 商品id
+     */
+    private Long skuId;
+    /**
+     * 秒杀价格
+     */
+    private BigDecimal seckillPrice;
+    /**
+     * 秒杀总量
+     */
+    private BigDecimal seckillCount;
+    /**
+     * 每人限购数量
+     */
+    private BigDecimal seckillLimit;
+    /**
+     * 排序
+     */
+    private Integer seckillSort;
+    /**
+     * 秒杀开始结束时间
+     */
+    private Long startTime;
+    private Long endTime;
+    /**
+     * 秒杀随机码
+     */
+    private String randomCode;
+    /**
+     * sku 详细信息
+     */
+    private SkuInfoVo skuInfo;
+}
+```
+
+该对象的大部分字段都是上面的两个对象有的，只有一些额外的字段，但为了数据的方便传递，还是需要额外封装该对象的，这里面较为重要的就是新增的随机码字段，该字段是用来防止恶意下单的，
+一个商品每次上架都对应一个随机码，这样可以避免被提前知道商品的 id，然后直接使用 URL 进行该商品的下单。同样在存入数据到 Redis 前也需要判断是否已经完成过一次上架，
+但相同的商品可能参与多次不同的秒杀活动，因此存入商品的 key 应该标明属于哪个场次。sku 的秒杀信息可以通过上面查询出的数据直接进行拷贝，而 sku 详细信息则需要远程查询。
+而这里的库存设置使用到了 Redisson，传统的库存操作可能存在并发问题，使用 Redisson 的信号量就可以保证库存扣减的原子性了，这里让库存作为一个新的数据存入 Redis，
+以商品的随机码作为 key，以此对应某个具体的商品，这里 skuItem.getSeckillCount() 就是商品的秒杀库存数，比如 100，设置完成后，这个信号量就有 100 个许可。
+每次有人成功抢购时，会去 semaphore.tryAcquire(1)（占用一个许可，相当于扣减库存），当许可被耗尽，说明库存卖完了，再有人抢就会失败。
+
+```java
+private final String SKU_CACHE_PREFIX = "seckill:skus:";
+private final String SKU_STOCK_SEMAPHORE = "seckill:stock:"; // 后面拼接商品随机码
+
+// 2. 缓存活动相关联的商品信息
+private void saveSessionSkuInfos(List<SeckillSessionWithSkus> seckillSessionList) {
+    seckillSessionList.forEach(SeckillSessionWithSkus -> {
+        BoundHashOperations<String, Object, Object> ops = stringRedisTemplate.boundHashOps(SKU_CACHE_PREFIX);
+        SeckillSessionWithSkus.getRelationSkus().forEach(skuItem -> {
+            String randomCode = UUID.randomUUID().toString().replace("-", "");
+            if (Boolean.FALSE.equals(ops.hasKey(skuItem.getPromotionSessionId() + "_" + skuItem.getSkuId().toString()))) {
+                // 缓存商品
+                SeckillSkuRedisTo seckillSkuRedisTo = new SeckillSkuRedisTo();
+                // 1. sku 的秒杀信息
+                BeanUtils.copyProperties(skuItem, seckillSkuRedisTo);
+                // 2. sku 的基本数据
+                R r = productFeignService.getSkuInfo(skuItem.getSkuId());
+                if (r.getCode() == 0) {
+                    SkuInfoVo skuInfo = r.getData("skuInfo", new TypeReference<SkuInfoVo>() {
+                    });
+                    seckillSkuRedisTo.setSkuInfo(skuInfo);
+                }
+                // 3. 设置当前商品的秒杀时间信息
+                seckillSkuRedisTo.setStartTime(SeckillSessionWithSkus.getStartTime().getTime());
+                seckillSkuRedisTo.setEndTime(SeckillSessionWithSkus.getEndTime().getTime());
+                // 4. 设置商品的随机码
+                seckillSkuRedisTo.setRandomCode(randomCode);
+                // 缓存数据
+                try {
+                    String json = objectMapper.writeValueAsString(seckillSkuRedisTo);
+                    ops.put(skuItem.getPromotionSessionId() + "_" + skuItem.getSkuId().toString(), json);
+                } catch (JsonProcessingException e) {
+                    throw new RuntimeException(e);
+                }
+
+                // 5. 设置信号量
+                RSemaphore semaphore = redissonClient.getSemaphore(SKU_STOCK_SEMAPHORE + randomCode);
+                // 用商品的秒杀数量作为信号量
+                semaphore.trySetPermits(skuItem.getSeckillCount().intValue());
+            }
+        });
+    });
+}
+```
+
+****
+## 4. 查询秒杀商品
+
+Controller 层：
+
+查询秒杀商品其实就是在当前时间段中显示该时段的秒杀活动的商品信息，因此需要根据当前时间查询是否有秒杀活动。
+
+```java
+@GetMapping("/currentSeckillSkus")
+public R getCurrentSeckillSkus() {
+    List<SeckillSkuRedisTo> seckillSkuRedisTos = seckillService.getCurrentSeckillSkus();
+    return R.ok().setData("seckillSkuRedisTos", seckillSkuRedisTos);
+}
+```
+
+Service 层：
+
+首先需要查询 Redis 中是否有处于当前时间段内的秒杀活动，因此先获取到所有的 key，然后根据 key 来进行分割获取到时间字符串，这也是为什么当时存储数据时用时间作为 key 的原因。
+然后就是遍历所有的 key，用当前时间和每个 key 的开始时间和结束时间进行对比，当找到一个符合的，那就可以直接从它那获去数据了，因为一个时间段只有一场活动，
+因此找到一个符合条件的活动即可跳出循环。
+
+```java
+@Override
+public List<SeckillSkuRedisTo> getCurrentSeckillSkus() {
+    // 1. 确定当前时间属于哪个秒杀场次
+    long now = new Date().getTime();
+    // 查到 Redis 中所有场次的 key
+    Set<String> keys = stringRedisTemplate.keys(SESSION_CACHE_PREFIX + "*");
+    for (String key : keys) {
+        String replace = key.replace(SESSION_CACHE_PREFIX, "");
+        String[] timeInterval = replace.split("_");
+        long startTime = Long.parseLong(timeInterval[0]);
+        long endTime = Long.parseLong(timeInterval[1]);
+        if (now >= startTime && now <= endTime) {
+            // 2. 获取这个秒杀场次关联的所有秒杀商品信息
+            List<String> range = stringRedisTemplate.opsForList().range(key, 0, -1);
+            BoundHashOperations<String, String, String> boundHashOperations = stringRedisTemplate.boundHashOps(SKU_CACHE_PREFIX);
+            List<String> objects = boundHashOperations.multiGet(range);
+            if (objects != null && !objects.isEmpty()) {
+                List<SeckillSkuRedisTo> seckillSkuRedisTos = objects.stream().map(item -> {
+                    try {
+                        return objectMapper.readValue(item, SeckillSkuRedisTo.class);
+                    } catch (JsonProcessingException e) {
+                        throw new RuntimeException(e);
+                    }
+                }).collect(Collectors.toList());
+                return seckillSkuRedisTos;
+            }
+            break;
+        }
+    }
+    return Collections.emptyList();
+}
+```
+
+从后端获取到的数据要存入域中，便于前端动态展示。不过秒杀商品是实时变化的，前端页面一加载就写死商品列表是不现实的，因此前端可以选择通过 Ajax 请求获取最新的数据，
+这样每次刷新或用户访问页面都能拿到最新秒杀商品。
+
+```html
+<div class="swiper-slide">
+    <ul id="seckillSkuContent">
+
+    </ul>
+</div>
+```
+
+这段代码就是当页面刷新时请求接口 /currentSeckillSkus 获取秒杀商品列表，并且动态生成 `<li>` 元素，包括商品图片 skuDefaultImg、商品标题 skuTitle 等，
+不过这些数据有的在 skuInfo 中，有的就是普通字段，需要区分好，建议搭配浏览器返回的数据编写：
+
+```json
+{
+  "msg": "success",
+  "code": 0,
+  "seckillSkuRedisTos": [
+    {
+      "promotionId": null,
+      "promotionSessionId": 1,
+      "skuId": 29,
+      ...
+      "randomCode": "c1216461e2304dad8e7bb7943c0df221",
+      "skuInfo": {
+        "skuId": 29,
+        "spuId": 16,
+        ...
+      }
+    }
+  ]
+}
+```
+
+```js
+$.get("http://localhost:25000/currentSeckillSkus", function(resp) {
+    if (resp.seckillSkuRedisTos.length > 0) {
+        resp.seckillSkuRedisTos.forEach(function (item) {
+            $("#seckillSkuContent").append(
+                $("<li></li>")
+                    .append($("<img style='width: 130px; height: 130px' src='" + item.skuInfo.skuDefaultImg + "'/>"))
+                    .append($("<p>" + item.skuInfo.skuTitle + "</p>"))
+                    .append($("<span>¥" + item.seckillPrice + "</span>"))
+                    .append($("<s>¥" + item.skuInfo.price + "</s>"))
+            );
+        })
+    }
+});
+```
+
+不过需要注意的是，当前发送请求的服务是 gulimall.com，而发送的目的地是 seckill 服务，因此它属于跨服务请求，浏览器存在跨域问题，因此需要配置一下允许跨域请求：
+
+```java
+@Configuration
+public class GulimallCorsConfig {
+    @Bean
+    public WebMvcConfigurer corsConfigurer() {
+        return new WebMvcConfigurer() {
+            @Override
+            public void addCorsMappings(CorsRegistry registry) {
+                registry.addMapping("/**")
+                        .allowedOriginPatterns("*")
+                        .allowedMethods("GET", "POST", "PUT", "DELETE")
+                        .allowedHeaders("*")
+                        .allowCredentials(false)
+                        .maxAge(3600);
+            }
+        };
+    }
+}
+```
+
+不过奇怪的是，使用 localhost:25000 时这样的配置是可以用的，但是使用自定义的域名 seckill.gulimall.com 后就不行了。
+
+****
+## 5. 秒杀页面渲染
+
+秒杀页面渲染也就是在商品详情页显示当前商品的秒杀信息，如果它是秒杀商品的话，也就是在 Redis 中存储了数据，那么就要在商品详情页显示它的秒杀信息，例如什么时候开始秒杀，
+秒杀价多少...因此需要在 gulimall-product 服务中远程调用 gulimall-seckill 服务，然后把查到的秒杀商品的数据封装进商品详情中。
+
+seckill 服务 Controller 层：
+
+因为是在商品详情页展示秒杀信息，因此会传递 skuId 来查询单个商品的信息。
+
+```java
+@GetMapping("/sku/seckill/{skuId}")
+public R getSkuSeckillInfo(@PathVariable Long skuId) {
+    SeckillSkuRedisTo seckillSkuRedisTo = seckillService.getSkuSeckillInfo(skuId);
+    return R.ok().setData("seckillSkuRedisTo", seckillSkuRedisTo);
+}
+```
+
+Service 层：
+
+这里就是要找到所有参与了秒杀活动的商品，其实就是从 Redis 中找，因为参与了秒杀活动的商品在上架时就是保存到 Redis 的，如果 Redis 有，那证明就是要参加的。
+在 Redis 中存储的秒杀商品信息的 key 为 promotionSessionId_skuId 的形式，所以如果要根据 skuId 查找出是否在 Redis 中，就需要先手动拼接一下 _skuId，
+这样就可以用 key 中是否包含 _skuId 来作为依据，毕竟存入 Redis 中的 key 都是 String 类型的。后面就是获取到该 sku 并进行返回，不过如果此时并没有到达秒杀活动的时间，
+那么就不应该把商品的随机码一起返回给 product 服务，不然还没开始就可以获取到了，这是不合理的，因此需要判断当前时间是否为该商品的秒杀时间，如果不是，那就把查出的随机码置空。
+当然现在查出的数据只是封装给 product 服务，并不会影响到 Redis。
+
+```java
+@Override
+public SeckillSkuRedisTo getSkuSeckillInfo(Long skuId) {
+    // 找到所有需要参与秒杀商品的 key
+    BoundHashOperations<String, String, String> boundHashOperations = stringRedisTemplate.boundHashOps(SKU_CACHE_PREFIX);
+    Set<String> keys = boundHashOperations.keys();
+    if (keys != null && !keys.isEmpty()) {
+        String target = "_" + skuId;
+        for (String key : keys) {
+            if (key.contains(target)) {
+                String json = boundHashOperations.get(key);
+                SeckillSkuRedisTo seckillSkuRedisTo = null;
+                try {
+                    seckillSkuRedisTo = objectMapper.readValue(json, SeckillSkuRedisTo.class);
+                } catch (JsonProcessingException e) {
+                    log.error("获取秒杀商品失败：", e);
+                }
+                // 处理随机码
+                if (seckillSkuRedisTo != null) {
+                    long now = new Date().getTime();
+                    Long startTime = seckillSkuRedisTo.getStartTime();
+                    Long endTime = seckillSkuRedisTo.getEndTime();
+                    if (now < startTime || now > endTime) {
+                        seckillSkuRedisTo.setRandomCode(null);
+                    }
+                    return seckillSkuRedisTo;
+                }
+            }
+        }
+    }
+    return null;
+}
+```
+
+在签名封装商品详情页时写了下面的这个方法，当时封装的是 sku 的详细信息，现在需要在商品详情页额外展示秒杀商品的信息，因此需要远程调用查询，也就是调用的上面的方法，
+然后把查到的数据封装进原先的 SkuItemVo 中，因此该对象也需要新增一个字段用来存储这些数据。
+
+```java
+@Override
+public SkuItemVo item(Long skuId) {
+    SkuItemVo skuItemVo = new SkuItemVo();
+        // 1. sku 基本信息获取
+        // 3. 获取 spu 销售属性组合
+        // 4. 获取 spu 描述属性
+        // 5. 获取 spu 规格参数
+        // 2. sku 图片信息
+    CompletableFuture<Void> seckillSkuFuture = CompletableFuture.runAsync(() -> {
+        // 3. 查询当前 sku 是否参与秒杀优惠
+        R r = seckillFeignService.getSkuSeckillInfo(skuId);
+        if (r.getCode() == 0) {
+            SeckillInfoVo seckillSkuRedisTo = r.getData("seckillSkuRedisTo", new TypeReference<SeckillInfoVo>() {
+            });
+            skuItemVo.setSeckillInfoVo(seckillSkuRedisTo);
+        }
+    }, threadPoolExecutor);
+
+    // 等待所有任务都完成
+    try {
+        CompletableFuture.allOf(saleAttrFuture, spuDescribeFuture, baseAttrFuture, imageFuture, seckillSkuFuture).get();
+    } catch (InterruptedException | ExecutionException e) {
+        throw new RuntimeException(e);
+    }
+    return skuItemVo;
+}
+```
+
+最后就是在前端动态的展示这些信息了，根据当前时间与秒杀活动的时间进行比较，还未开始就显示开始信息，如果开始了就显示价格，当然，这些数据能展示的前提是它存在于 Redis 中。
+
+```html
+<li style="color: red" th:if="${item.seckillInfoVo != null}"
+    th:with="now=${#dates.createNow().time}">
+    <!-- 秒杀未开始 -->
+    <span th:if="${now < item.seckillInfoVo.startTime}">
+        商品将会在 [[${#dates.format(new java.util.Date(item.seckillInfoVo.startTime), 'yyyy-MM-dd HH:mm:ss')}]] 开始秒杀
+    </span>
+    <!-- 秒杀进行中 -->
+    <span th:if="${now >= item.seckillInfoVo.startTime and now < item.seckillInfoVo.endTime}">
+        秒杀价：[[${#numbers.formatDecimal(item.seckillInfoVo.seckillPrice, 1, 2)}]]
+    </span>
+    <!-- 秒杀结束 -->
+    <span th:if="${now >= item.seckillInfoVo.endTime}">
+        秒杀已结束
+    </span>
+</li>
+```
+
+在首页展示秒杀商品时，应该让它能够被点击并跳转到该商品的详情页，也就是在动态展示秒杀商品的 js 代码中增加一个点击跳转的链接地址即可。
+
+```js
+function to_href (skuId) {
+    location.href="http://item.gulimall.com/" + skuId + ".html";
+}
+
+$.get("http://localhost:25000/currentSeckillSkus", function(resp) {
+    if (resp.seckillSkuRedisTos.length > 0) {
+        resp.seckillSkuRedisTos.forEach(function (item) {
+            $("#seckillSkuContent").append(
+                $("<li onclick='to_href(" + item.skuId +")'></li>")
+                    .append($("<img style='width: 130px; height: 130px' src='" + item.skuInfo.skuDefaultImg + "'/>"))
+                    .append($("<p>" + item.skuInfo.skuTitle + "</p>"))
+                    .append($("<span>¥" + item.seckillPrice + "</span>"))
+                    .append($("<s>¥" + item.skuInfo.price + "</s>"))
+            );
+        })
+    }
+});
+```
+
+****
+

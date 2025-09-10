@@ -1,6 +1,6 @@
 package com.project.gulimall.coupon.dao;
 
-import com.project.gulimall.coupon.entity.SeckillSessionEntity;
+import com.project.gulimall.coupon.domain.entity.SeckillSessionEntity;
 import com.baomidou.mybatisplus.core.mapper.BaseMapper;
 import org.apache.ibatis.annotations.Mapper;
 

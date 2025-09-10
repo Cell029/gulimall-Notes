@@ -1,4 +1,4 @@
-package com.project.gulimall.coupon.entity;
+package com.project.gulimall.coupon.domain.entity;
 
 import com.baomidou.mybatisplus.annotation.TableId;
 import com.baomidou.mybatisplus.annotation.TableName;
@@ -9,11 +9,11 @@ import java.util.Date;
 import lombok.Data;
 
 /**
- * 商品满减信息
+ * 商品阶梯价格
  */
 @Data
-@TableName("sms_sku_full_reduction")
-public class SkuFullReductionEntity implements Serializable {
+@TableName("sms_sku_ladder")
+public class SkuLadderEntity implements Serializable {
 	private static final long serialVersionUID = 1L;
 
 	/**
@@ -26,15 +26,19 @@ public class SkuFullReductionEntity implements Serializable {
 	 */
 	private Long skuId;
 	/**
-	 * 满多少
+	 * 满几件
 	 */
-	private BigDecimal fullPrice;
+	private Integer fullCount;
 	/**
-	 * 减多少
+	 * 打几折
 	 */
-	private BigDecimal reducePrice;
+	private BigDecimal discount;
 	/**
-	 * 是否参与其他优惠
+	 * 折后价
+	 */
+	private BigDecimal price;
+	/**
+	 * 是否叠加其他优惠[0-不可叠加，1-可叠加]
 	 */
 	private Integer addOther;
 

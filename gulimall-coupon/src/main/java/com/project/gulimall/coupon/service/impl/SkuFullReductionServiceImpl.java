@@ -2,11 +2,10 @@ package com.project.gulimall.coupon.service.impl;
 
 import com.project.common.to.MemberPrice;
 import com.project.common.to.SkuReductionTo;
-import com.project.gulimall.coupon.entity.MemberPriceEntity;
-import com.project.gulimall.coupon.entity.SkuLadderEntity;
+import com.project.gulimall.coupon.domain.entity.MemberPriceEntity;
+import com.project.gulimall.coupon.domain.entity.SkuLadderEntity;
 import com.project.gulimall.coupon.service.MemberPriceService;
 import com.project.gulimall.coupon.service.SkuLadderService;
-import com.project.gulimall.coupon.service.SpuBoundsService;
 import org.springframework.beans.BeanUtils;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
@@ -23,7 +22,7 @@ import com.project.common.utils.PageUtils;
 import com.project.common.utils.Query;
 
 import com.project.gulimall.coupon.dao.SkuFullReductionDao;
-import com.project.gulimall.coupon.entity.SkuFullReductionEntity;
+import com.project.gulimall.coupon.domain.entity.SkuFullReductionEntity;
 import com.project.gulimall.coupon.service.SkuFullReductionService;
 
 

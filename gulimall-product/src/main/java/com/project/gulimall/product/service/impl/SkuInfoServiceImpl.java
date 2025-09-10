@@ -1,12 +1,16 @@
 package com.project.gulimall.product.service.impl;
 
 import com.alibaba.cloud.commons.lang.StringUtils;
+import com.alibaba.fastjson.TypeReference;
+import com.project.common.utils.R;
 import com.project.gulimall.product.config.MyThreadConfig;
 import com.project.gulimall.product.domain.entity.SkuImagesEntity;
 import com.project.gulimall.product.domain.entity.SpuInfoDescEntity;
+import com.project.gulimall.product.domain.vo.SeckillInfoVo;
 import com.project.gulimall.product.domain.vo.SkuItemSaleAttrVo;
 import com.project.gulimall.product.domain.vo.SkuItemVo;
 import com.project.gulimall.product.domain.vo.SpuItemAttrGroupVo;
+import com.project.gulimall.product.feign.SeckillFeignService;
 import com.project.gulimall.product.service.*;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
@@ -43,6 +47,9 @@ public class SkuInfoServiceImpl extends ServiceImpl<SkuInfoDao, SkuInfoEntity> i
     private SkuSaleAttrValueService skuSaleAttrValueService;
     @Autowired
     private ThreadPoolExecutor threadPoolExecutor;
+
+    @Autowired
+    private SeckillFeignService seckillFeignService;
 
     @Override
     public PageUtils queryPage(Map<String, Object> params) {
@@ -152,9 +159,19 @@ public class SkuInfoServiceImpl extends ServiceImpl<SkuInfoDao, SkuInfoEntity> i
             }
         }, threadPoolExecutor);
 
+        CompletableFuture<Void> seckillSkuFuture = CompletableFuture.runAsync(() -> {
+            // 3. 查询当前 sku 是否参与秒杀优惠
+            R r = seckillFeignService.getSkuSeckillInfo(skuId);
+            if (r.getCode() == 0) {
+                SeckillInfoVo seckillSkuRedisTo = r.getData("seckillSkuRedisTo", new TypeReference<SeckillInfoVo>() {
+                });
+                skuItemVo.setSeckillInfoVo(seckillSkuRedisTo);
+            }
+        }, threadPoolExecutor);
+
         // 等待所有任务都完成
         try {
-            CompletableFuture.allOf(saleAttrFuture, spuDescribeFuture, baseAttrFuture, imageFuture).get();
+            CompletableFuture.allOf(saleAttrFuture, spuDescribeFuture, baseAttrFuture, imageFuture, seckillSkuFuture).get();
         } catch (InterruptedException | ExecutionException e) {
             throw new RuntimeException(e);
         }

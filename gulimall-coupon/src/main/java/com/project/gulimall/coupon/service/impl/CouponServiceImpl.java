@@ -9,7 +9,7 @@ import com.project.common.utils.PageUtils;
 import com.project.common.utils.Query;
 
 import com.project.gulimall.coupon.dao.CouponDao;
-import com.project.gulimall.coupon.entity.CouponEntity;
+import com.project.gulimall.coupon.domain.entity.CouponEntity;
 import com.project.gulimall.coupon.service.CouponService;
 
 

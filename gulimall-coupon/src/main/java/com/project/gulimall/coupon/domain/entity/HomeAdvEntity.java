@@ -1,4 +1,4 @@
-package com.project.gulimall.coupon.entity;
+package com.project.gulimall.coupon.domain.entity;
 
 import com.baomidou.mybatisplus.annotation.TableId;
 import com.baomidou.mybatisplus.annotation.TableName;

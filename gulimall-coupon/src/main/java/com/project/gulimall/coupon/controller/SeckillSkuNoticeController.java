@@ -8,7 +8,7 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
-import com.project.gulimall.coupon.entity.SeckillSkuNoticeEntity;
+import com.project.gulimall.coupon.domain.entity.SeckillSkuNoticeEntity;
 import com.project.gulimall.coupon.service.SeckillSkuNoticeService;
 import com.project.common.utils.PageUtils;
 import com.project.common.utils.R;
