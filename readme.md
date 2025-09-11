@@ -18376,6 +18376,10 @@ public class AsyncScheduledTasks {
 而不同的操作可能对这些相同的商品信息造成数据差异，因此需要限制上架商品时只能有一个服务在运行，也就是用到分布式锁，只有上一个服务解锁后下一个服务才能进行上架操作，
 当然上架秒杀商品的操作并需要很大的吞吐量，因此使用分布式锁不会造成阻塞的问题。
 
+在秒杀系统里，场次一般用 List 存储，商品用 Hash 存储。因为场次一般是时间段信息，比如：10:00-12:00 场、12:00-14:00 场...这些数据有时间顺序，
+所以非常适合用 Redis 的 List 来存，List 可以保证元素有序，直接按照 push 的顺序保存场次，前端要展示所有即将开始的场次时，可以 LRANGE key 0 -1 一次性取出所有。
+而场次数量有限（一天也就几个场次），不用考虑大规模数据检索问题。但每个场次下面有很多商品，商品的信息（价格、库存、限制条件等）通常需要按 skuId 快速定位和查询，
+所以 Hash 特别适合存放 结构化且需要通过 ID 快速定位的商品信息。
 
 ```java
 @Slf4j
@@ -18460,6 +18464,7 @@ public R getLatest3DaySession(){
 
 获取近三天的秒杀活动信息的同时需要把数据进行封装，因为上架秒杀商品时需要知道是哪场活动，才能上架对应的商品，因此除了活动信息，还需要封装关联的秒杀商品信息，
 不过这个秒杀商品的对象中只封装了一些简单的数据，例如关联的活动、秒杀价格等信息，如果想要该商品的详细信息就得远程查询 product 服务。
+
 ```java
 @Data
 @TableName("sms_seckill_session")
@@ -18724,7 +18729,8 @@ Service 层：
 
 首先需要查询 Redis 中是否有处于当前时间段内的秒杀活动，因此先获取到所有的 key，然后根据 key 来进行分割获取到时间字符串，这也是为什么当时存储数据时用时间作为 key 的原因。
 然后就是遍历所有的 key，用当前时间和每个 key 的开始时间和结束时间进行对比，当找到一个符合的，那就可以直接从它那获去数据了，因为一个时间段只有一场活动，
-因此找到一个符合条件的活动即可跳出循环。
+因此找到一个符合条件的活动即可跳出循环。不过当时存储秒杀活动场次相关信息到 Redis 时使用的是 List 结构，而 .range() 方法就是从某个下标到另一个下标处取出数据，
+这里需要取出所有的数据，因此从下标 0 开始，到 -1 结束（-1 表示最后一个元素，-2 表示倒数第二个，以此类推）。
 
 ```java
 @Override
@@ -18970,4 +18976,628 @@ $.get("http://localhost:25000/currentSeckillSkus", function(resp) {
 ```
 
 ****
+## 6. 秒杀下单
+
+秒杀某个商品和下单流程其实是类似的，因此也需要在登录的情况下才能进行对商品的秒杀，也就是该服务也需要进行登录校验，不过目前只有点击秒杀按钮对某个商品下单时才需要对身份的校验，
+所以这里只对一个请求路径进行了身份的校验，该路径也是前端点击秒杀按钮时所触发的。
+
+```java
+@Component
+public class LoginUserInterceptor implements HandlerInterceptor {
+
+    public static ThreadLocal<MemberResponseVo> threadLocal = new ThreadLocal<>();
+
+    @Override
+    public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) throws Exception {
+
+        String requestURI = request.getRequestURI();
+        AntPathMatcher antPathMatcher = new AntPathMatcher();
+        boolean match = antPathMatcher.match("/kill", requestURI);
+        System.out.println("Request URI: " + request.getRequestURI() + " Method: " + request.getMethod());
+        if (match) {
+            MemberResponseVo loginUser = (MemberResponseVo) request.getSession().getAttribute("loginUser");
+            if (loginUser != null) {
+                threadLocal.set(loginUser);
+                return true;
+            } else {
+                // 没登录就去登录
+                request.getSession().setAttribute("noLoginMsg", "请先进行登录!");
+                response.sendRedirect("http://auth.gulimall.com/login.html");
+                return false;
+            }
+        }
+        return true;
+    }
+}
+
+@Configuration
+public class SeckillWebConfig implements WebMvcConfigurer {
+    @Autowired
+    private LoginUserInterceptor loginUserInterceptor;
+    @Override
+    public void addInterceptors(InterceptorRegistry registry) {
+        registry.addInterceptor(loginUserInterceptor).addPathPatterns("/**");
+    }
+}
+```
+
+秒杀商品的按钮是在商品详情页的，上面记录过在不同的时间段会显示该秒杀商品的相关信息，因此是否参与秒杀也需要对时间进行判断（也就是不同的按钮触发不同的请求）。
+
+```html
+<div class="box-btns-two" th:if="${item.seckillInfoVo != null && (#dates.createNow().time >= item.seckillInfoVo.startTime and #dates.createNow().time < item.seckillInfoVo.endTime)}">
+    <a href="#" id="seckillA" th:attr="skuId=${item.skuInfo.skuId}, sessionId=${item.seckillInfoVo.promotionSessionId}, code=${item.seckillInfoVo.randomCode}">
+        立即抢购
+    </a>
+</div>
+<div class="box-btns-two" th:if="${item.seckillInfoVo == null || (#dates.createNow().time < item.seckillInfoVo.startTime or #dates.createNow().time > item.seckillInfoVo.endTime)}">
+    <a href="#" id="addToCartA" th:attr="skuId=${item.skuInfo.skuId}">
+        加入购物车
+    </a>
+</div>
+```
+
+这里也是点击按钮后发送请求给后端，由后端进行数据的校验并生成订单，请求路径携带的参数为 killId（活动场次 Id + skuId）、商品的随机码和下单数量，这些参数在后端都需要进行校验的，
+只有校验通过才会生成对应的订单。
+
+```js
+$("#seckillA").click(function () {
+    var isLogin = [[${session.loginUser != null}]];
+    if (isLogin) {
+        var killId = $(this).attr("sessionId") + "_" + $(this).attr("skuId");
+        var key = $(this).attr("code");
+        var num = $("#numInput").val();
+        location.href = "http://seckill.gulimall.com/kill?killId=" + killId + "&key=" + key + "&num=" + num;
+    } else {
+        alert("请先登录！");
+    }
+    return false;
+});
+```
+
+秒杀系统下单有两种设计模式：1. 经过购物车模式。2. 不经过购物车，直接生成订单号，通过 MQ 发送消息给订单服务。
+
+1、经过购物车的秒杀流程
+
+用户点击秒杀后先把商品加入购物车（秒杀价），然后等用户确认订单并提交订单后再执行扣库存/锁定库存的操作，最后生成订单。这个流程其实和原本的下单操作一致，只是价格不同而已，
+虽然这种操作流程和普通流程一致并且可以一次购买多个秒杀商品，但这整个过程涉及多个服务之间的远程调用，对于秒杀场景来说容易造成延迟，
+并且高并发的场景可能会对购物车的数据场景造成巨大的压力。
+
+2、不经过购物车，直接返回订单号
+
+用户点击秒杀后由系统快速校验资格/扣减信号量，然后直接生成一个订单号返回前端，此时再异步发送消息给 MQ，后台慢慢生成订单并扣减库存。这种方案前端几乎可以瞬间拿到订单号，
+用户一般不会觉得卡顿，并且让各个服务之间的压力降低了，因为 MQ 会把各个消息分散发送，就不会因为数据库写压力过大而崩溃，并且订单生成失败还可以通过补偿机制（重试、死信队列）修复。
+不过用户拿到的订单号可能还没真正生成，具有一定的延迟，因此需要保证最终一致性。
+
+Controller 层：
+
+本系统的秒杀下单选择的就是第二种方案，这里接收完参数后传递给 Service 层，由 Service 层进行数据的校验和封装，但最后只返回一个订单号，
+具体订单的生成由订单服务接收到 MQ 消息后再执行。
+
+```java
+@GetMapping("/kill")
+public String seckill(@RequestParam("killId") String killId,
+                      @RequestParam("key") String key,
+                      @RequestParam("num") Integer num,
+                      Model model) {
+    // 判断是否登录
+    String orderSn = seckillService.kill(killId, key, num);
+    model.addAttribute("orderSn", orderSn);
+    return "success";
+}
+```
+
+Service 层：
+
+这里主要就是对各个数据的合法性校验，也就是对比前端传递的数据和存在 Redis 中的数据是否一致或者符合条件。首先要判断的就是时间，只有在秒杀活动的时间范围内才可以进行下单，
+否则不应该生成订单号；接着就是校验商品的随机码，当时在给商品详情页的数据进行封装时添加了一个秒杀商品的数据，因此在该页面是可以获取到秒杀商品的所有相关信息的；
+然后就是校验该用户的购买数量是否合法，因为每个秒杀商品都设置了对应的购买数量，当选购的数量超过了这个限制的化也不应该生成订单；最后就是验证秒杀商品是否被当前用户购买过，
+虽然秒杀商品限制了购买的数量，但如果一个用户可以购买多次的话，那这个购买数量就没什么用了，因此需要限制一个用户只能购买一次，而这种只要存在就不能再使用的特性刚好可以存入 Redis，
+也就是 Redis 的锁机制，把 userId_SessionId_skuId 作为 key 存入 Redis 中，当该用户下次再下单时就会再次往 Redis 中存入一样的 key，但因为已经存在了，
+所以它是没法再次存入的，也就是没法获取到锁，只有获取到后，才可以进行订单的生成，不过肯定需要给这个锁添加 TTL，设置的时间也就是当前时间到活动结束的时间差，
+活动结束就释放锁；以上都满足后，就可以进行库存的模拟扣减，也就是信号量的获取，在秒杀商品自动上架的时候设置了信号量来模拟库存，这里的扣减库存也就是获取信号量，
+数量则是选购的秒杀商品数量，同样的，只有成功获取到信号量（库存充足）时才生成订单后。以上数据的校验通过后就可以返回一个订单号，然后发送一个 MQ 的消息，
+等待订单服务生成真实的订单，当然，发送的消息内容肯定得包含一些秒杀商品的相关数据，否则什么都不传订单服务也不好生成订单，这样也可以避免一些查询数据库的操作。
+
+```java
+@Override
+public String kill(String killId, String key, Integer num) {
+    MemberResponseVo memberResponseVo = LoginUserInterceptor.threadLocal.get();
+
+    // 获取当前秒杀商品的详细信息
+    BoundHashOperations<String, String, String> boundHashOperations = stringRedisTemplate.boundHashOps(SKU_CACHE_PREFIX);
+    String json = boundHashOperations.get(killId);
+    if (!StringUtils.isEmpty(json)) {
+        SeckillSkuRedisTo seckillSkuRedisTo = null;
+        try {
+            seckillSkuRedisTo = objectMapper.readValue(json, SeckillSkuRedisTo.class);
+        } catch (JsonProcessingException e) {
+            log.error("获取秒杀商品信息出错", e);
+        }
+        // 校验合法性
+        if (seckillSkuRedisTo != null) {
+            Long startTime = seckillSkuRedisTo.getStartTime();
+            Long endTime = seckillSkuRedisTo.getEndTime();
+            long now = new Date().getTime();
+            long ttl = endTime - now;
+            // 1. 校验时间是否在秒杀活动时间范围内
+            if (now >= startTime && now <= endTime) {
+                // 2. 校验随机码是否正确
+                String randomCode = seckillSkuRedisTo.getRandomCode();
+                String sessionIdAndSkuId = seckillSkuRedisTo.getPromotionSessionId() + "_" + seckillSkuRedisTo.getSkuId();
+                if (randomCode.equals(key) && sessionIdAndSkuId.equals(killId)) {
+                    // 3. 验证购物数量是否合理
+                    if (num <= seckillSkuRedisTo.getSeckillLimit().intValue()) {
+                        // 4. 验证该用户是否已经购买过，买过就在 Redis 中存储 userId_SessionId_skuId
+                        String hasBoughtKey = memberResponseVo.getId() + "_" + seckillSkuRedisTo.getPromotionSessionId() + "_" + seckillSkuRedisTo.getSkuId();
+                        // 设置自动过期时间，TTL 为当前时间和活动过期时间的时间差
+                        Boolean b = stringRedisTemplate.opsForValue().setIfAbsent(hasBoughtKey, num.toString(), ttl, TimeUnit.MILLISECONDS);
+                        if (b != null && b) {
+                            // 占位成功，说明没购买过该秒杀商品
+                            RSemaphore semaphore = redissonClient.getSemaphore(SKU_STOCK_SEMAPHORE + randomCode);
+                            boolean tryAcquire = semaphore.tryAcquire(num);
+                            if (tryAcquire) {
+                                // 获取到信号量，证明秒杀成功
+                                // 发送 MQ 消息，让订单服务完成下单操作
+                                String orderSn = IdWorker.getTimeId().substring(0, 32);
+                                SeckillOrderTo seckillOrderTo = new SeckillOrderTo();
+                                seckillOrderTo.setOrderSn(orderSn);
+                                seckillOrderTo.setPromotionSessionId(seckillSkuRedisTo.getPromotionSessionId());
+                                seckillOrderTo.setMemberId(memberResponseVo.getId());
+                                seckillOrderTo.setNum(num);
+                                seckillOrderTo.setSkuId(seckillSkuRedisTo.getSkuId());
+                                seckillOrderTo.setSeckillPrice(seckillSkuRedisTo.getSeckillPrice());
+                                rabbitTemplate.convertAndSend("order-event-exchange", "order.seckill", seckillOrderTo);
+                                return orderSn;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return null;
+}
+```
+
+```java
+@Data
+public class SeckillOrderTo {
+    private String orderSn; // 订单号
+    private Long promotionSessionId; // 活动场次 id
+    private Long skuId; // 商品 id
+    private BigDecimal seckillPrice; // 秒杀价格
+    private Integer num; // 购买数量
+    private Long memberId; // 会员 id
+}
+```
+
+既然是发送消息给 MQ，那就得在订单服务创建对应的队列和绑定关系，并开启监听进行数据的处理：
+
+```java
+@Bean
+public Queue orderSeckillQueue() {
+    return new Queue("order.seckill.queue", true, false, false);
+}
+
+@Bean
+public Binding orderSeckillBinding() {
+    return new Binding("order.seckill.queue", Binding.DestinationType.QUEUE, "order-event-exchange", "order.seckill", null);
+}
+```
+
+当监听到 MQ 发送的消息后就会调用创建秒杀订单的方法：
+
+```java
+@Slf4j
+@Service
+@RabbitListener(queues = "order.seckill.queue")
+public class OrderSeckillListener {
+
+    @Autowired
+    private OrderService orderService;
+
+    @RabbitHandler
+    public void listener(SeckillOrderTo seckillOrderTo, Channel channel, Message message) throws IOException {
+        log.info("收到秒杀订单消息，订单号：{}", seckillOrderTo.getOrderSn());
+        try {
+            orderService.createSeckillOrder(seckillOrderTo);
+            channel.basicAck(message.getMessageProperties().getDeliveryTag(), false);
+        } catch (Exception e) {
+            log.error("接收消息失败：{}", seckillOrderTo.getOrderSn());
+            channel.basicReject(message.getMessageProperties().getDeliveryTag(), true);
+        }
+    }
+}
+```
+
+这里只是简单地创建了订单信息和订单项的信息，并没有像之前的下单操作那样保存一大堆的数据，也就是简单模拟一下操作。
+
+```java
+@Override
+public void createSeckillOrder(SeckillOrderTo seckillOrderTo) {
+    // 1. 保存订单信息
+    OrderEntity orderEntity = new OrderEntity();
+    orderEntity.setOrderSn(seckillOrderTo.getOrderSn());
+    orderEntity.setMemberId(seckillOrderTo.getMemberId());
+    orderEntity.setStatus(OrderStatusEnum.CREATE_NEW.getCode());
+    BigDecimal payPrice = seckillOrderTo.getSeckillPrice().multiply(new BigDecimal(seckillOrderTo.getNum().toString()));
+    orderEntity.setPayAmount(payPrice);
+    save(orderEntity);
+    // 2. 保存订单项信息
+    OrderItemEntity orderItemEntity = new OrderItemEntity();
+    orderItemEntity.setOrderSn(seckillOrderTo.getOrderSn());
+    orderItemEntity.setSkuId(seckillOrderTo.getSkuId());
+    orderItemEntity.setRealAmount(payPrice);
+    orderItemEntity.setSkuQuantity(seckillOrderTo.getNum());
+    orderItemService.save(orderItemEntity);
+}
+```
+
+在成功返回订单号后，前端页面就需要跳转到成功下单的界面并提供支付按钮，当然只有在订单号存在时才提供支付按钮，点击后跳转到订单服务的接口即可。
+
+```html
+<div class="success-wrap">
+    <div class="w" id="result">
+        <div class="m succeed-box">
+            <div th:if="${orderSn != null}" class="mc success-cont">
+                <h1>秒杀成功，订单号：[[${orderSn}]]</h1>
+                <h2>正在准备订单数据，10s 后自动跳转支付页面。<a th:href="${'http://order.gulimall.com/payOrder?orderSn=' + orderSn}">去支付</a></h2>
+            </div>
+            <div th:if="${orderSn == null}">
+                <h1>秒杀商品已抢购为空！</h1>
+            </div>
+        </div>
+    </div>
+</div>
+```
+
+对于秒杀系统来说，它是极短时间、大并发、强一致性与最终一致性混合的场景，关键在于排队（削峰）、尽量在内存层（Redis）完成绝大部分校验与扣减、
+把耗时操作异步化（MQ）并做好补偿与监控。
+
+1、接口与鉴权
+
+秒杀活动必须强鉴权（登录），否则不允许进行下单操作，并且只开放秒杀抢购的最小接口（比如 /seckill/kill），要求传参最少且不可篡改。
+
+2、请求校验与参数安全
+
+前端页面不要把真实库存和随机码直接暴露，需要在后端生成有效的 randomCode，下单时需要校验这个随机码的有效性，防止提前恶意下单。当然服务端也需要校验其它的数据，
+例如活动时间、购买数量等。
+
+3、队列削峰
+
+因为是秒杀活动，瞬时流量可能是平常的数十甚至数百倍，为了避免大量请求同时冲击后端，应该进行流量削峰，也就是使用消息队列缓冲瞬时流量，异步处理请求。
+
+4、独立服务
+
+因为秒杀活动的高并发性，如果把这部分的业务代码融入其它服务中，那就会导致该服务在原有功能的基础上还要处理这些高并发的请求，这就会导致原有的功能无法使用或阻塞，
+因此需要把它单独抽离成一个服务，独自处理秒杀请求。
+
+5、缓存策略
+
+大量的读写操作直接打到数据库会对其造成巨大的压力，导致宕机甚至数据的丢失，因此可以用 Redis 缓存热点数据，减少数据库的访问，只有在真实订单完成后再进行数据库的修改。
+
+6、限流、熔断、降级
+
+以上操作都是为了保证系统能够快速完成秒杀下单功能，而这一步则是为了保证请求最终能够正常稳定的发送并执行。
+
+****
+## 7. Sentinel
+
+### 7.1 熔断、降级、限流
+
+熔断、降级、限流，这三个是微服务与高并发系统设计中的重要角色，常常一起出现。
+
+1、熔断
+
+当某个下游服务出现故障时，比如超时、错误率高，为了避免继续请求导致资源被拖垮、雪崩效应，下游服务器会自动切断调用，相当于发现异常，就不再请求下游，而是快速失败。
+例如订单服务调用库存服务，结果库存服务宕机，如果还不停地发请求，线程会一直等待超时，导致订单服务自己也被拖垮，这时熔断能保护调用方，直接返回 “服务不可用”，
+不给下游继续压力。
+
+2、降级
+
+降级指的是：在系统压力大、依赖的服务不可用或被熔断时，不是直接失败，而是提供一个备选方案，也属于一种兜底逻辑。它的目标是保证核心功能可用，哪怕牺牲一些非核心功能。
+例如支付场景中，如果优惠券服务超时，可以直接跳过优惠券，照常下单；或者秒杀系统中，商品展示功能挂了，可以直接返回“系统繁忙”或“热门商品推荐数据缓存”等信息。
+总之就是在调用失败时返回默认值，比如“请稍后重试”；又或者返回缓存中的数据（不一定最新），但要确保系统可用。
+
+3、限流
+
+限流是限制进入系统的请求数量，保证系统在高并发下不被压垮，相当于大门口放一个保安，即使来 10 万人，也只允许每秒进入 1 千人。例如秒杀活动，在同一时间肯定有很多用户点击下单，
+此时就必须进行限流，比如只让 1000 人的请求真正进入后端的处理逻辑；或者让网关限制每个用户每秒最多调用 10 次接口。无论如何，都是为了保证系统可用正常运行不被突发的大量请求压垮。
+
+| 特性       | 熔断机制               | 服务降级             | 流量限制              |
+| -------- | -------------------- | ------------------ | ----------------- |
+| **主要目的** | 防止故障扩散，快速失败，保护调用方    | 保证核心功能可用性，牺牲非核心服务  | 控制请求速率，防止系统过载     |
+| **触发条件** | 调用错误率超阈值、请求超时        | 系统资源不足、下游服务慢或熔断触发  | 请求量超过设定阈值（QPS/并发数） |
+| **实现方式** | 熔断器状态机（关闭 → 打开 → 半开） | 功能开关、兜底逻辑、返回默认值或缓存 | 固定窗口、滑动窗口、漏桶、令牌桶算法 |
+| **恢复方式** | 自动尝试恢复（半开状态试探性调用）    | 可手动或自动恢复（视场景）      | 自动恢复（时间窗口过后流量重置）  |
+| **应用场景** | 依赖服务不稳定或不可用（如库存服务宕机） | 系统压力过大时关闭非核心功能     | 秒杀、热点接口防止突发流量冲垮系统 |
+
+****
+### 7.2 sentinel 概述
+
+Sentinel 是阿里开源的一套面向流量的服务保护框架，它能够在高并发场景下为应用提供 限流、熔断降级、系统自适应保护、热点参数限流 等能力，并支持 网关流控、调用来源控制，
+还可以通过 Dashboard 动态配置规则、实时监控流量，帮助系统在流量洪峰或异常情况下依然保持核心功能可用性和整体稳定性。使用 Sentinel 来进行资源保护，
+主要分为几个步骤:
+
+1. 定义资源
+2. 定义规则
+3. 检验规则是否生效
+
+先把可能需要保护的资源定义好，之后再配置规则，也可以理解为，只要有了资源，就可以在任何时候灵活地定义各种流量控制规则。在编码的时候，只需要考虑这个代码是否需要保护，
+如果需要保护，就将之定义为一个资源。
+
+1、主流框架的默认适配
+
+为了减少开发的复杂程度，sentinel 对大部分的主流框架，例如 Web Servlet、Dubbo、Spring Cloud、gRPC、Spring WebFlux、Reactor 等都做了适配。
+只需要引入对应的依赖即可方便地整合 Sentinel。
+
+2、抛出异常的方式定义资源
+
+SphU 包含了 try-catch 风格的 API，用这种方式，当资源发生了限流之后会抛出 BlockException，这个时候可以捕捉异常，进行限流之后的逻辑处理。
+
+```java
+// 1.5.0 版本开始可以利用 try-with-resources 特性，不用手动调用 entry.exit()
+// 资源名可使用任意有业务语义的字符串，比如方法名、接口名或其它可唯一标识的字符串。
+try (Entry entry = SphU.entry("resourceName")) {
+  // 被保护的业务逻辑
+  // do something here...
+} catch (BlockException ex) {
+  // 资源访问阻止，被限流或被降级
+  // 在此处进行相应的处理操作
+}
+```
+
+3、返回布尔值方式定义资源
+
+SphO 提供 if-else 风格的 API，用这种方式，当资源发生了限流之后会返回 false，这个时候可以根据返回值，进行限流之后的逻辑处理。
+
+```java
+if (SphO.entry("自定义资源名")) {
+  // 务必保证 finally 会被执行
+  try {
+    // 被保护的业务逻辑
+  } finally {
+    SphO.exit();
+  }
+} else {
+  // 资源访问阻止，被限流或被降级
+  // 进行相应的处理操作
+}
+```
+
+4、注解方式定义资源
+
+Sentinel 支持通过 @SentinelResource 注解定义资源并配置 blockHandler 和 fallback 函数来进行限流之后的处理。blockHandler 函数会在原方法被限流/降级/系统保护的时候调用，
+而 fallback 函数会针对所有类型的异常。
+
+```java
+// 原本的业务方法.
+@SentinelResource(blockHandler = "blockHandlerForGetUser")
+public User getUserById(String id) {
+    throw new RuntimeException("getUserById command failed");
+}
+
+// blockHandler 函数，原方法调用被限流/降级/系统保护的时候调用
+public User blockHandlerForGetUser(String id, BlockException ex) {
+    return new User("admin");
+}
+```
+
+Sentinel 的所有规则都可以在内存态中动态地查询及修改，修改之后立即生效，同时 Sentinel 也提供相关 API来定制规则策略。Sentinel 支持以下几种规则：
+流量控制规则、熔断降级规则、系统保护规则、来源访问控制规则和热点参数规则。
+
+重要属性：
+
+1、流量空值规则字段
+
+| 字段名 | 说明 | 默认值 |
+| :--- | :--- | :--- |
+| **resource** | 资源名，规则的作用对象 | 无 |
+| **count** | 限流阈值 | 无 |
+| **grade** | 限流阈值类型（QPS 模式或线程数模式） | QPS 模式 |
+| **limitApp** | 流控针对的调用来源 | `default`（代表不区分调用来源） |
+| **strategy** | 调用关系限流策略（直接、链路、关联） | 根据资源本身（直接） |
+| **controlBehavior** | 流控效果（直接拒绝 / 排队等待 / 慢启动模式） | 直接拒绝 |
+
+除了在控制台配置规则，还可以通过调用 FlowRuleManager.loadRules() 方法来用硬编码的方式定义流量控制规则：
+
+```java
+private static void initFlowQpsRule() {
+    List<FlowRule> rules = new ArrayList<>();
+    FlowRule rule1 = new FlowRule();
+    rule1.setResource(resource);
+    // Set max qps to 20
+    rule1.setCount(20);
+    rule1.setGrade(RuleConstant.FLOW_GRADE_QPS);
+    rule1.setLimitApp("default");
+    rules.add(rule1);
+    FlowRuleManager.loadRules(rules);
+}
+```
+
+2、熔断降级规则
+
+| 字段名 | 说明 | 默认值 |
+| :--- | :--- | :--- |
+| **resource** | 资源名，即规则的作用对象 | - |
+| **grade** | 熔断策略，支持慢调用比例/异常比例/异常数策略 | 慢调用比例 |
+| **count** | 慢调用比例模式下为慢调用临界 RT（超出该值计为慢调用）；异常比例/异常数模式下为对应的阈值 | - |
+| **timeWindow** | 熔断时长，单位为 s | - |
+| **minRequestAmount** | 熔断触发的最小请求数，请求数小于该值时即使异常比率超出阈值也不会熔断（1.7.0 引入） | 5 |
+| **statIntervalMs** | 统计时长（单位为 ms），如 60*1000 代表分钟级（1.8.0 引入） | 1000 ms |
+| **slowRatioThreshold** | 慢调用比例阈值，仅慢调用比例模式有效（1.8.0 引入） | - |
+
+
+****
+### 7.3 SpringBoot 整合 sentinel
+
+因为本项目是 Springboot 结合 alibaba-cloud，因此可用直接整合 sentinel。
+
+```xml
+<dependency>
+    <groupId>com.alibaba.cloud</groupId>
+    <artifactId>spring-cloud-starter-alibaba-sentinel</artifactId>
+</dependency>
+```
+
+查看导入 sentinel-core 版本，下载对应版本的 jar 包，我这里引入的是 1.8.6 版本的，因此需要下载 1.8.6 版本的 jar 包。在 jar 包的目录启动控制台，输入启动命令：
+
+```shell
+java -jar sentinel-dashboard-1.8.6.jar --server.port=8333
+```
+
+然后访问 localhost:8333，输入账号密码，默认都是 sentinel。登录成功后发现控制台什么都没有，因为 sentinel 控制台默认是懒加载的，只有定义的资源访问时才会加载，
+并且在 Dashboard 中的配置是保存在内存中，重启后失效。控制台中有一些相关字段：
+
+- QPS 图表：每秒请求次数
+- 线程数图表：并发请求数
+- 异常比例图：异常次数 / 总请求数
+- 慢调用比例图：慢调用占比
+
+当然除了以上配置，还需要定义相关的配置文件：
+
+```yaml
+spring:
+  cloud:
+    sentinel:
+      transport:
+        dashboard: localhost:8333 # 指定 Sentinel 控制台的地址和端口
+        port: 8719 # 客户端用于与控制台通信的端口，默认为 8719。如果该端口被占用，会自动从 8719 开始依次 +1 扫描，直到找到未被占用的端口。
+#      eager: true # (可选) 如果希望应用启动时就建立连接，可以开启此配置。对于某些 Web 框架（如Spring WebFlux）可能需要。
+```
+
+如果想要看到健康状态，就可以导入如下依赖：
+
+```xml
+<!--springboot 收集健康状况信息，提供给sentinel使用-->
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-actuator</artifactId>
+</dependency>
+```
+
+然后在 application.yml 里配置需要暴露的端点：
+
+```yaml
+management:
+  endpoints:
+    web:
+      exposure:
+        include: "*"
+```
+
+检查健康状况的路径：
+
+- 健康检查：http://localhost:25000/actuator/health
+- 查看所有端点：http://localhost:25000/actuator
+- 查看环境变量：http://localhost:25000/actuator/env
+查看度量指标：http://localhost:25000/actuator/metrics
+
+1、流量控制
+
+大致流控流程为：
+
+用户请求秒杀接口：/seckill/kill，Sentinel 判断当前请求是否超过流控规则，如果超过则抛 BlockException；未超过就正常执行业务逻辑，
+秒杀逻辑调用 Redis 时监控数据会被送到 Sentinel 控制台，在控制台可实时查看 QPS、Blocked Count、RT 等指标。
+
+不过发生超过流控规则的时候往往没有提示语，只是会配出异常，sentinel 提供了一种配置类的方式，来集中管理全局拦截 HTTP 请求级别的 Sentinel 流控触发时的返回信息，
+而不是在每个方法里写死文字。
+
+```xml
+<dependency>
+    <groupId>com.alibaba.csp</groupId>
+    <artifactId>sentinel-web-servlet</artifactId>
+    <version>1.8.6</version>
+</dependency>
+```
+
+```java
+@Configuration
+public class SeckillSentinelConfig {
+    public SeckillSentinelConfig() {
+        WebCallbackManager.setUrlBlockHandler(new UrlBlockHandler() {
+            @Override
+            public void blocked(HttpServletRequest request, HttpServletResponse response, BlockException e) throws IOException {
+                response.setContentType("application/json;charset=UTF-8");
+                R error = R.error(BizCodeEnum.TOO_MANY_REQUEST.getCode(),
+                        BizCodeEnum.TOO_MANY_REQUEST.getMsg());
+                response.getWriter().write(JSON.toJSONString(error));
+            }
+        });
+    }
+}
+```
+
+当请求超过流控规则时会返回对应的错误信息：
+
+```json
+{
+  "msg": "请求量过大，请稍后再试",
+  "code": 10003
+}
+```
+
+2、熔断降级
+
+开启 sentinel 监控并熔断 feign 调用：
+
+```yaml
+feign:
+  sentinel:
+    enabled: true
+```
+
+```java
+@FeignClient(name = "gulimall-coupon", path = "/coupon/seckillsession", fallback = SeckillFeignServiceFallBack.class)
+public interface CouponFeignService {
+    @GetMapping("/latest3DaySession")
+    R getLatest3DaySession();
+}
+```
+
+```java
+@Slf4j
+@Component
+public class SeckillFeignServiceFallBack implements CouponFeignService {
+    @Override
+    public R getLatest3DaySession() {
+        log.info("熔断方法调用...getLatest3DaySession");
+        return R.error(BizCodeEnum.TOO_MANY_REQUEST.getCode(),BizCodeEnum.TOO_MANY_REQUEST.getMsg());
+    }
+}
+```
+
+如果 Feign 调用远程服务时出现 网络异常、超时、服务宕机 等，Sentinel 会触发熔断，此时就会调用 fallback 方法返回自定义的内容，
+而远程调用这个方法的那块代码也会因为异常信息而停止往下走，转而执行处理 fallback 的内容。
+
+****
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 

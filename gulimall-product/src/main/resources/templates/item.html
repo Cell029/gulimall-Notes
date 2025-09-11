@@ -670,7 +670,12 @@
                             </div>
                         </div>
                     </div>
-                    <div class="box-btns-two">
+                    <div class="box-btns-two" th:if="${item.seckillInfoVo != null && (#dates.createNow().time >= item.seckillInfoVo.startTime and #dates.createNow().time < item.seckillInfoVo.endTime)}">
+                        <a href="#" id="seckillA" th:attr="skuId=${item.skuInfo.skuId}, sessionId=${item.seckillInfoVo.promotionSessionId}, code=${item.seckillInfoVo.randomCode}">
+                            立即抢购
+                        </a>
+                    </div>
+                    <div class="box-btns-two" th:if="${item.seckillInfoVo == null || (#dates.createNow().time < item.seckillInfoVo.startTime or #dates.createNow().time > item.seckillInfoVo.endTime)}">
                         <a href="#" id="addToCartA" th:attr="skuId=${item.skuInfo.skuId}">
                             加入购物车
                         </a>
@@ -1406,6 +1411,18 @@
         return false;
     })
 
+    $("#seckillA").click(function () {
+        var isLogin = [[${session.loginUser != null}]];
+        if (isLogin) {
+            var killId = $(this).attr("sessionId") + "_" + $(this).attr("skuId");
+            var key = $(this).attr("code");
+            var num = $("#numInput").val();
+            location.href = "http://seckill.gulimall.com/kill?killId=" + killId + "&key=" + key + "&num=" + num;
+        } else {
+            alert("请先登录！");
+        }
+        return false;
+    });
 
 </script>
 

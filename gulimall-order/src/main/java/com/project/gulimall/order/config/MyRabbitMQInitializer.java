@@ -41,6 +41,11 @@ public class MyRabbitMQInitializer {
     }
 
     @Bean
+    public Queue orderSeckillQueue() {
+        return new Queue("order.seckill.queue", true, false, false);
+    }
+
+    @Bean
     public Exchange orderEventExchange() {
         /**
          * public TopicExchange(String name, boolean durable, boolean autoDelete, Map<String, Object> arguments);
@@ -67,6 +72,11 @@ public class MyRabbitMQInitializer {
     @Bean
     public Binding orderReleaseOtherBinding() {
         return new Binding("stock.release.queue", Binding.DestinationType.QUEUE, "order-event-exchange", "order.release.other", null);
+    }
+
+    @Bean
+    public Binding orderSeckillBinding() {
+        return new Binding("order.seckill.queue", Binding.DestinationType.QUEUE, "order-event-exchange", "order.seckill", null);
     }
 
 }

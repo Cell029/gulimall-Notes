@@ -7,6 +7,7 @@ import com.project.common.constant.OrderConstant;
 import com.project.common.domain.vo.MemberResponseVo;
 import com.project.common.exception.NoStockException;
 import com.project.common.to.mq.OrderReleaseTo;
+import com.project.common.to.mq.SeckillOrderTo;
 import com.project.common.utils.R;
 import com.project.gulimall.order.domain.entity.OrderItemEntity;
 import com.project.gulimall.order.domain.entity.PaymentInfoEntity;
@@ -318,6 +319,33 @@ public class OrderServiceImpl extends ServiceImpl<OrderDao, OrderEntity> impleme
             orderDao.updateOrderStatus(outTradeNo, OrderStatusEnum.PAYED.getCode());
         }
         return "success";
+    }
+
+    @Override
+    public void createSeckillOrder(SeckillOrderTo seckillOrderTo) {
+        // 1. 保存订单信息
+        OrderEntity orderEntity = new OrderEntity();
+        orderEntity.setOrderSn(seckillOrderTo.getOrderSn());
+        orderEntity.setMemberId(seckillOrderTo.getMemberId());
+        orderEntity.setStatus(OrderStatusEnum.CREATE_NEW.getCode());
+        BigDecimal payPrice = seckillOrderTo.getSeckillPrice().multiply(new BigDecimal(seckillOrderTo.getNum().toString()));
+        orderEntity.setPayAmount(payPrice);
+        /*// 获取收获地址信息
+        OrderSubmitVo orderSubmitVo = threadLocal.get();
+        R fare = wareFeignService.getFare(orderSubmitVo.getAddrId());
+        FareVo fareVo = fare.getData(new TypeReference<FareVo>() {
+        });
+        // 设置运费
+        orderEntity.setFreightAmount(fareVo.getFare());*/
+
+        save(orderEntity);
+        // 保存订单项信息
+        OrderItemEntity orderItemEntity = new OrderItemEntity();
+        orderItemEntity.setOrderSn(seckillOrderTo.getOrderSn());
+        orderItemEntity.setSkuId(seckillOrderTo.getSkuId());
+        orderItemEntity.setRealAmount(payPrice);
+        orderItemEntity.setSkuQuantity(seckillOrderTo.getNum());
+        orderItemService.save(orderItemEntity);
     }
 
     /**

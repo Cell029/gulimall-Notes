@@ -6,6 +6,11 @@ spring:
       discovery:
         server-addr: 127.0.0.1:8848
 
+    sentinel:
+      transport:
+        dashboard: localhost:8333
+        port: 8719
+
   thymeleaf:
     cache: false
 
@@ -26,6 +31,21 @@ spring:
     store-type: redis
     timeout: 30m
 
+  rabbitmq:
+    host: 127.0.0.1 # 虚拟机IP
+    port: 5672 # 端口
+    virtual-host: / # 虚拟主机
+    username: admin # 用户名
+    password: admin # 密码
+    publisher-confirm-type: correlated
+    publisher-returns: true
+    template:
+      mandatory: true # 只要抵达队列，以异步发送优先回调抵达确认
+    listener:
+      simple:
+        acknowledge-mode: manual # 手动 ack 消息
+
+
 feign:
   client:
     config:
@@ -33,5 +53,14 @@ feign:
         connectTimeout: 5000 # 连接超时时间，单位毫秒
         readTimeout: 60000 # 读取超时时间，单位毫秒
 
+  sentinel:
+    enabled: true
+
 server:
   port: 25000
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: "*"
