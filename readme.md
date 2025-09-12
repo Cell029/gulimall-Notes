@@ -19571,33 +19571,560 @@ public class SeckillFeignServiceFallBack implements CouponFeignService {
 而远程调用这个方法的那块代码也会因为异常信息而停止往下走，转而执行处理 fallback 的内容。
 
 ****
+## 8. sleuth
 
+### 8.1 概述
 
+Spring Cloud Sleuth 是 Spring Cloud 生态系统中的一个组件，它专门为微服务架构提供分布式链路追踪的能力。在微服务架构中，一个用户请求（例如下订单）可能会跨越多个微服务，
+例如：订单服务 -> 支付服务 -> 库存服务 -> 通知服务，当这个请求出现延迟或错误时，传统的日志记录方式会变得非常低效，每个服务都在自己的日志文件中记录信息，难以串联；
+并且无法直观看出时间消耗在哪个服务或哪个网络调用上。而 Sleuth 通过为请求自动创建唯一的追踪 ID，并在服务间传递它来解决这个问题。
+它可以将一个请求的完整调用链路的日志串联起来，让开发者能够清晰地看到请求的完整路径、每个服务的处理时间以及依赖关系。
 
+Sleuth 的三个核心概念：
 
+1、Trace
 
+Trace 代表一条完整的请求链路，从请求进入微服务集群的第一个服务开始，到最终返回响应为止，整个过程称为一个 Trace。每个 Trace 都有一个全局唯一的 Trace ID，
+整个链路中的所有日志都共享同一个 Trace ID。
 
+2、Span
 
+Span 代表一个请求链路中的一个工作单元或一个节点，通常一个服务的一次处理过程就是一个 Span，例如一个 HTTP 请求的处理。一个 Trace 是由多个 Span 组成的树状结构，
+并且每个 Span 都有自己的唯一 Span ID，而 Span 之间还有父子关系，例如服务 A 调用服务 B，那么服务 B 的 Span 就是服务 A 的 Span 的子 Span。
 
+3、Annotation
 
+它用于记录一个事件发生的时间点，用于定位延迟发生在哪个环节。常用的有：
 
+- cs (Client Sent)：客户端（调用者）发起请求的时间。 
+- sr (Server Received)：服务端（被调用者）接收到请求的时间。 
+- ss (Server Sent)：服务端处理完成，发送响应的时间。 
+- cr (Client Received)：客户端接收到响应的时间。
 
+Trace 就像一次完整的旅行（从北京到上海再到杭州），Span 就是旅行中的每一段行程（北京 -> 上海， 上海 -> 杭州），Trace ID 就是这次旅行的唯一行程单号，
+Span ID 就是每一段行程的唯一标识，例如航班号或火车车次。通过行程单号（Trace ID）可以轻松查询到这次旅行的所有细节（各个 Span）。
 
+Sleuth 的工作是自动且透明的，对开发者几乎无感知，它的主要流程为：
 
+当一个请求到达微服务集群的入口（如网关 Gateway 或第一个被调用的服务）时，如果请求头中没有携带 Trace ID，Sleuth 会自动生成一个。
+当服务 A 需要调用服务 B 时，Sleuth 会自动将当前的 Trace ID 和 Span ID 等信息注入到这次调用的 HTTP 请求头中（例如 X-B3-TraceId, X-B3-SpanId）。
+服务 B 接收到请求后，Sleuth 会从请求头中解析出这些信息，并基于它们创建新的子 Span。这样，服务 B 的 Span 就和服务 A 的 Span 关联起来了。
+在整个请求处理过程中，Sleuth 会在关键节点（如收到请求、开始处理、发送响应等）记录 Annotation 时间点。但 Sleuth 本身只负责生成和传播链路数据，
+如果需要可视化的界面查看调用链，它通常需要与 Zipkin 或 Jaeger 这样的分布式追踪系统配合使用，Sleuth 会将收集到的链路数据（Trace、Span 信息）上报给这些系统进行存储、分析和展示。
 
+****
+### 8.2 与 Zipkin 的集成
 
+1、搭建 Zipkin Server
 
+最快的方式是使用 Docker：docker run -d -p 9411:9411 openzipkin/zipkin，或者下载 Jar 包运行：java -jar zipkin-server-*.jar。启动后，
+访问 http://localhost:9411 即可看到 Zipkin 的界面。
 
+2、添加依赖
 
+通常只需要添加 spring-cloud-starter-zipkin，它已经包含了 spring-cloud-starter-sleuth（老版本），新版本则需要分别引入 sleuth 和  zipkin：
 
+```xml
+<!--sleuth-->
+<dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-starter-sleuth</artifactId>
+</dependency>
 
+<dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-sleuth-zipkin</artifactId>
+</dependency>
+```
 
+3、配置应用配置文件
 
+```yaml
+spring:
+  zipkin:
+    base-url: http://localhost:9411 # Zipkin 服务器的地址
+    discovery-client-enabled: false # 关闭服务发现，否则 springCloud 会把 zipkin 的 url 当作服务名称注册到配置的 nacos 中
+    sender:
+      type: web # 数据发送的方式：ACTIVEMQ RABBIT KAFKA WEB
+  sleuth:
+    sampler:
+      probability: 1.0 # 采样率，1.0代表100%采样，生产环境可调低（如0.1）以减少性能开销
+```
 
+4、查看结果
 
+发起几个微服务调用，然后打开 Zipkin 的 UI (http://localhost:9411)，然后就可以按服务、时间等条件搜索追踪链路。
 
+****
+# 十三、高可用集群
 
+## 1. k8s
 
+### 1.1 概述
 
+k8s 全称 Kubernetes，是一个开源的容器编排系统，用于自动化容器化应用程序的部署、扩展和管理。可以把它理解为一个数据中心的操作系统，
+它抽象了底层的基础设施，例如服务器、网络、存储，让开发者和运维人员可以以一种声明式的、高效的方式管理和运行分布式系统。在容器技术，如 Docker 普及之后，
+如何管理大量的容器实例成为了新的问题，而 k8s 解决了以下问题：
 
+1. 服务发现与负载均衡：容器动态创建和销毁，如何让前端找到后端？如何将流量均匀分发？ 
+2. 自愈能力：当容器崩溃或节点故障时，如何自动重启或替换容器，保证应用高可用？ 
+3. 弹性伸缩：如何根据 CPU 内存使用率或自定义指标，自动增加或减少容器实例的数量？ 
+4. 自动部署与回滚：如何实现蓝绿部署、金丝雀发布，并在出错时快速回滚到上一个版本？ 
+5. 密钥与配置管理：如何安全地管理数据库密码、API密钥等敏感信息，并动态注入到容器中？ 
+6. 存储编排：如何自动挂载所需的存储系统（本地存储、云存储等）？
+
+****
+### 1.2 核心架构与组件
+
+K8s 集群由一组节点（Node）组成，分为控制平面和工作节点：
+
+1、控制平面（Master Node）
+
+该节点负责管理整个集群，做出全局决策。主要组件包括：
+
+- kube-apiserver：集群的网关和前端，所有与集群的交互（UI, CLI, 其他组件）都必须通过 API Server，它是唯一直接与 etcd 通信的组件。 
+- etcd：集群的持久化存储，一个高可用的键值数据库，用于存储所有集群数据（如节点、Pod、配置、状态等）。 
+- kube-scheduler：调度员，负责监视新创建的、未分配节点的 Pod，并根据资源需求、策略等因素，选择一个合适的 Worker Node 来运行它。 
+- kube-controller-manager：运行控制器的大脑，包含多个控制器逻辑的合集： 
+- Node Controller：负责节点宕机等通知和响应。 
+- Replication Controller：确保 Pod 的副本数符合预期。 
+- Endpoint Controller：将 Service 和 Pod 关联起来。 
+- Service Account & Token Controllers：为命名空间创建默认账户和 API 访问令牌。 
+- cloud-controller-manager：与云平台交互的桥梁，允许将集群连接到云服务商的 API 上，从而使用其负载均衡器、磁盘、路由等功能。
+
+2、工作节点 (Worker Node)
+
+负责运行容器化应用，每个节点上必须包含：
+
+- kubelet：节点代理，它与控制平面通信，确保 Pod 中描述的容器处于运行且健康的状态。它不管理不是由 K8s 创建的容器。 
+- kube-proxy：网络代理，在节点上维护网络规则，实现 Service 的概念（如负载均衡、服务发现）。 
+- 容器运行时 (Container Runtime)：负责运行容器的软件，如 Docker, containerd, CRI-O 等。
+
+****
+### 1.3 核心概念
+
+1、Pod
+
+Pod 是 K8s 中最小的可部署和管理的计算单元，一个 Pod 包含一个或多个共享网络和存储的容器，通常是一个主容器和几个辅助容器 Sidecar，并且它是短暂的，
+‘会被频繁地创建和销毁。
+
+2、Deployment：
+
+这是最常用的管理 Pod 的对象，它为 Pod 和 ReplicaSet 提供声明式的更新。如果要描述一个期望状态，例如如需要运行 3 个副本的 Nginx Pod，
+Deployment 控制器就会以受控速率将实际状态改为期望状态。而且它还实现了滚动更新和回滚，是部署无状态应用的首选。
+
+3、Service：
+
+定义一个稳定的网络端点，用来暴露一组功能相同的 Pod。因为 Pod 是动态的（IP 会变），因此 Service 提供了一个固定的 IP 地址、DNS 名称和端口，
+前端应用通过访问 Service 来连接到后端 Pod，并且它还可以自动实现负载均衡。
+
+4、ConfigMap & Secret：
+
+- ConfigMap：用于将非机密的配置数据例如如配置文件、环境变量与容器镜像解耦，实现配置的灵活注入。 
+- Secret：类似于 ConfigMap，但专门用于存储敏感信息（如密码、令牌、密钥），并以某种方式加密存储。
+
+5、Namespace：
+
+在物理集群内提供的虚拟隔离，用于将资源划分为不同的项目或团队，实现资源配额和权限控制。例如 kube-system, default, kube-public 是默认的命名空间。
+
+6、Volume：
+
+抽象了存储，允许数据在容器重启后依然存在，支持本地存储、云存储（如 AWS EBS, GCE PD）、网络文件系统（如 NFS）等。
+
+7、StatefulSet：
+
+用于管理有状态应用的工作负载对象，例如数据库、缓存。它为每个 Pod 提供稳定的、唯一的标识符和稳定的持久化存储，即使重新调度，Pod 的主机名和存储也会保持不变。
+
+8、Ingress：
+
+管理集群外部访问内部服务的规则（通常是 HTTP/HTTPS），它还提供了负载均衡、SSL 终止和基于名称的虚拟主机等功能，通常需要配合 Ingress Controller 使用，
+例如 Nginx, Traefik。
+
+****
+### 1.4 WSL2 + Docker Desktop 启用单节点 k8s 集群
+
+1、启动 Docker Desktop 中的 Kubernetes
+
+打开 Docker Desktop 并点击 setting 按钮，里面有一个 Kubernetes，点击后勾选复选框 Enable Kubernetes，同时勾选 Show system containers (advanced)，
+这样以后就可以用 docker ps 看到所有 K8s 的系统组件。然后点击右下角的 Apply & Restart 按钮，Docker Desktop 会提示此操作需要重新启动并会消耗大量内存和 CPU，
+点击 "Install" 继续。当 Docker Desktop 界面左下角的鲸鱼图标变成绿色并显示 "Kubernetes is running" 时，表示集群已就绪。打开 WSL2 终端进行验证：
+
+```shell
+# 查看集群节点
+kubectl get nodes
+
+# 输出
+NAME             STATUS   ROLES           AGE    VERSION
+docker-desktop   Ready    control-plane   7m4s   v1.32.2
+
+# 查看所有系统 Pods（在 kube-system 命名空间），它们都应该处于 Running 状态
+kubectl get pods -n kube-system
+
+# 输出
+NAME                                     READY   STATUS    RESTARTS   AGE
+coredns-668d6bf9bc-648m8                 1/1     Running   0          7m14s
+coredns-668d6bf9bc-hjznl                 1/1     Running   0          7m16s
+etcd-docker-desktop                      1/1     Running   0          7m25s
+kube-apiserver-docker-desktop            1/1     Running   0          7m27s
+kube-controller-manager-docker-desktop   1/1     Running   0          7m23s
+kube-proxy-kqj6f                         1/1     Running   0          7m18s
+kube-scheduler-docker-desktop            1/1     Running   0          7m23s
+storage-provisioner                      1/1     Running   0          7m3s
+vpnkit-controller                        1/1     Running   0          7m2s
+
+# 查看集群信息
+kubectl cluster-info
+
+# 输出
+Kubernetes control plane is running at https://127.0.0.1:6443
+CoreDNS is running at https://127.0.0.1:6443/api/v1/namespaces/kube-system/services/kube-dns:dns/proxy
+```
+
+2、配置命令行上下文
+
+Docker Desktop 会自动为配置好 kubectl 的上下文，指向它自己创建的集群，通常情况下不需要做任何更改，kubectl 命令会直接操作 Docker Desktop 的 K8s 集群，
+验证一下：
+
+```shell
+# 查看当前使用的上下文
+kubectl config current-context
+
+# 输出
+docker-desktop
+
+# 查看所有可用的上下文
+kubectl config get-contexts
+
+# 输出
+CURRENT   NAME             CLUSTER          AUTHINFO         NAMESPACE
+*         docker-desktop   docker-desktop   docker-desktop
+```
+
+3、部署应用
+
+1) 创建一个 Deployment
+
+```shell
+# 这个命令会创建一个名为 nginx-deployment 的部署，使用 nginx 镜像，并运行 1 个副本
+kubectl create deployment nginx-deployment --image=nginx:alpine --replicas=1
+```
+
+2) 查看部署和 Pod
+
+```shell
+# 查看 Deployment 状态
+kubectl get deployments
+
+# 输出
+NAME               READY   UP-TO-DATE   AVAILABLE   AGE
+nginx-deployment   1/1     1            1           3m9s
+
+# 查看由 Deployment 创建的 Pod
+kubectl get pods
+
+# 输出
+NAME                               READY   STATUS    RESTARTS   AGE
+nginx-deployment-66f9bc8f8-jwd4j   1/1     Running   0          3m36s
+```
+
+3) 将服务暴露给外部访问
+
+默认情况下，Pod 只能在集群内部访问，因此需要创建一个 Service 来暴露它。
+
+```shell
+# 创建一个 Service，类型为 LoadBalancer，将容器的 80 端口(nginx 默认端口)映射出去
+kubectl expose deployment nginx-deployment --name=nginx-service --type=LoadBalancer --port=80 --target-port=80
+```
+
+4) 访问应用
+
+查看服务详情，获取访问地址：
+
+```shell
+kubectl get services
+
+# 输出
+NAME            TYPE           CLUSTER-IP     EXTERNAL-IP   PORT(S)        AGE
+kubernetes      ClusterIP      10.96.0.1      <none>        443/TCP        26m
+nginx-service   LoadBalancer   10.98.33.122   localhost     80:31841/TCP   41s
+```
+
+EXTERNAL-IP 列显示为 localhost，这是因为 Docker Desktop 很贴心地将 LoadBalancer 类型的服务映射到了本地的 localhost，
+此时可以直接在 Windows 宿主机的浏览器中访问 http://localhost，或者在 WSL2 终端里使用 curl http://localhost，就能看到 Nginx 的欢迎页面了。
+
+通过以上配置，看上去像是在 Docker 上又套了一个管理容器的工具，但两者的定位和能力差别很大。Docker 单独使用的话就只能运行单个或少量容器，
+直接 docker run 启动容器，或者用 docker-compose 管理一组容器，但多个容器之间的管理只能手动进行，例如负载均衡、扩缩容、服务发现要自己实现。
+Docker + Kubernetes 可以解决大规模容器管理的问题，Kubernetes 不会自己运行容器，它还是依赖 Docker 来跑容器，它只是在 Docker 之上加了一层“操作系统级的管理”。
+具体体现为：
+
+- 自动恢复：Pod 挂掉了，K8s 会自动拉起一个新的。 
+- 扩缩容：kubectl scale deployment nginx --replicas=10 一条命令就能跑 10 个副本。 
+- 负载均衡 + 服务发现：K8s Service 会自动在多个 Pod 之间做流量分发。 
+- 声明式配置：可以写个 YAML 描述“我要多少副本、用哪个镜像”，K8s 保证集群状态符合这个目标。 
+- 滚动更新/回滚：更新镜像的时候，K8s 可以逐个 Pod 替换，失败了还能一键回滚。 
+- 跨机器集群：不仅仅在 Docker Desktop 本机，也能在几十上百台服务器上统一调度容器。
+
+因此，Pod 里面跑的就是容器，这些副本就是容器的多个实例，如果 Docker 中没有这些容器，那就会去远程仓库拉取，如果还没有，那 Pod 就会创建失败。而 Pod 是 Kubernetes 的最小调度单位，
+一个 Pod 可以包含 1 个或多个容器，Kubernetes 调度的是 Pod，而不是单独的容器，所以你在 K8s 里部署一个应用，底层会创建 Pod，Pod 内启动对应的容器。大多数情况下，
+使用的都是单容器 Pod，每个 Pod 只包含一个容器（比如 nginx、redis），也就是说每个副本就是一个 Pod，Pod 内的容器都是多个相同的镜像：
+
+```text
+Deployment: nginx-deployment
+└── Pod-1 → nginx:1.21
+└── Pod-2 → nginx:1.21
+└── Pod-3 → nginx:1.21
+```
+
+而多容器 Pod，一个 Pod 内可以启动多个容器，它们共享网络命名空间和存储卷。
+
+****
+### 1.5 Docker Desktop 搭建一个多节点的 Kubernetes 集群
+
+Docker Desktop 本身不提供直接配置多节点集群的图形化功能，它的设计初衷是提供一个开箱即用的单节点开发环境。但可以使用 Kind（Kubernetes in Docker）利用已有的 Docker Desktop 环境，
+在容器内创建多个节点。
+
+1、在 WSL2 中安装 Kind
+
+```shell
+curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
+sudo install ./kind /usr/local/bin/kind
+rm ./kind
+```
+
+2、创建一个名为 kind-multinode.yaml 的文件，这个配置会创建一个包含 1 个控制平面节点和 2 个工作节点的集群。
+
+```shell
+# 在 WSL2 中自定义一个文件夹，然后创建文件
+nano kind-multinode.yaml
+
+# kind-multinode.yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+- role: control-plane # 第一个节点作为控制平面（master node）
+- role: worker        # 第二个节点作为工作节点
+- role: worker        # 第三个节点作为工作节点
+```
+
+3、使用配置文件创建集群
+
+```shell
+# 显式指定路径执行配置文件
+kind create cluster --name my-multi-node-cluster --config ~/kind-multinode.yaml
+
+# 输出
+Creating cluster "my-multi-node-cluster" ...
+ ✓ Ensuring node image (kindest/node:v1.27.3) 🖼
+ ✓ Preparing nodes 📦 📦 📦
+ ✓ Writing configuration 📜
+ ✓ Starting control-plane 🕹️
+ ✓ Installing CNI 🔌
+ ✓ Installing StorageClass 💾
+ ✓ Joining worker nodes 🚜
+Set kubectl context to "kind-my-multi-node-cluster"
+You can now use your cluster with:
+
+kubectl cluster-info --context kind-my-multi-node-cluster
+
+Have a nice day! 👋
+```
+
+4、验证集群
+
+```shell
+# 查看集群节点，现在你应该看到3个节点！
+kubectl get nodes
+
+# 输出示例：
+NAME                                  STATUS   ROLES           AGE    VERSION
+my-multi-node-cluster-control-plane   Ready    control-plane   2m3s   v1.27.3
+my-multi-node-cluster-worker          Ready    <none>          102s   v1.27.3
+my-multi-node-cluster-worker2         Ready    <none>          100s   v1.27.3
+
+# 查看这些节点对应的 Docker 容器
+docker ps --filter "name=my-multi-node-cluster" --format "table {{.Names}}\t{{.Status}}"
+
+# 输出
+NAMES                                 STATUS
+my-multi-node-cluster-worker          Up 5 minutes
+my-multi-node-cluster-control-plane   Up 5 minutes
+my-multi-node-cluster-worker2         Up 5 minutes
+```
+
+5、在集群间切换
+
+Kind 会自动配置 kubectl 的上下文
+
+```shell
+# 查看所有上下文（你会看到 docker-desktop 和新的 kind-my-multi-node-cluster）
+kubectl config get-contexts
+
+# 输出
+root@LAPTOP-SVEUFK1D:~# kubectl config get-contexts
+CURRENT   NAME                         CLUSTER                      AUTHINFO                     NAMESPACE
+*         docker-desktop               docker-desktop               docker-desktop
+          kind-my-multi-node-cluster   kind-my-multi-node-cluster   kind-my-multi-node-cluster
+
+# 切换到新的多节点集群
+kubectl config use-context kind-my-multi-node-cluster
+
+# 切回 Docker Desktop 自带的单节点集群
+kubectl config use-context docker-desktop
+```
+
+1、查看节点及角色
+
+```shell
+# 为防止使用错误的上下文环境，直接指定 kubectl 正确读到期望的 kubeconfig
+kubectl --kubeconfig=/root/.kube/config get nodes
+
+# 输出
+NAME                                  STATUS   ROLES           AGE   VERSION
+my-multi-node-cluster-control-plane   Ready    control-plane   26m   v1.27.3
+my-multi-node-cluster-worker          Ready    <none>          26m   v1.27.3
+my-multi-node-cluster-worker2         Ready    <none>          26m   v1.27.3
+
+kubectl --kubeconfig=/root/.kube/config get nodes -o wide
+NAME                                  STATUS   ROLES           AGE   VERSION   INTERNAL-IP   EXTERNAL-IP   OS-IMAGE                         KERNEL-VERSION                     CONTAINER-RUNTIME
+my-multi-node-cluster-control-plane   Ready    control-plane   31m   v1.27.3   172.19.0.4    <none>        Debian GNU/Linux 11 (bullseye)   6.6.87.2-microsoft-standard-WSL2   containerd://1.7.1
+my-multi-node-cluster-worker          Ready    <none>          30m   v1.27.3   172.19.0.2    <none>        Debian GNU/Linux 11 (bullseye)   6.6.87.2-microsoft-standard-WSL2   containerd://1.7.1
+my-multi-node-cluster-worker2         Ready    <none>          30m   v1.27.3   172.19.0.3    <none>        Debian GNU/Linux 11 (bullseye)   6.6.87.2-microsoft-standard-WSL2   containerd://1.7.1
+```
+
+2、部署一个多副本应用并观察调度
+
+```shell
+kubectl create deployment nginx-app --image=nginx:alpine --replicas=3
+
+kubectl get pods -o wide
+NAME                         READY   STATUS    RESTARTS   AGE   IP           NODE                            NOMINATED NODE   READINESS GATES
+nginx-app-64bc8bcfb8-l8nk5   1/1     Running   0          13m   10.244.2.3   my-multi-node-cluster-worker2   <none>           <none>
+nginx-app-64bc8bcfb8-mfc85   1/1     Running   0          13m   10.244.2.2   my-multi-node-cluster-worker2   <none>           <none>
+nginx-app-64bc8bcfb8-rnftr   1/1     Running   0          13m   10.244.1.2   my-multi-node-cluster-worker    <none>           <none>
+```
+
+3、暴露服务并访问
+
+```shell
+# 1. 将部署暴露为一个 Service（使用 NodePort 类型，方便访问）
+kubectl expose deployment nginx-app --name=nginx-service --type=NodePort --port=80
+
+# 2. 查看创建的服务
+kubectl get svc nginx-service
+
+# 输出示例：
+NAME            TYPE       CLUSTER-IP      EXTERNAL-IP   PORT(S)        AGE
+nginx-service   NodePort   10.96.149.109   <none>        80:32223/TCP   4s
+```
+
+由于是 Kind 多节点集群，访问方式与 Docker Desktop 单节点略有不同。NodePort 在 Kind 集群里只能在节点容器内部访问，
+宿主机无法直接访问（因为 Kind 节点是 Docker 容器，IP 在 Docker 网络里）。而 Ingress 是 Kubernetes 的 HTTP/HTTPS 路由器，
+可以把外部请求转发到集群内部的 Service。这个 Ingress Controller 本身就是一个 Pod，通常通过 NodePort 或 LoadBalancer 类型的 Service 暴露出去，
+通过 Ingress，就可以用宿主机 IP 或 localhost 直接访问集群服务，而不管 Pod 在哪个节点。
+
+1) 创建带有额外端口映射的 Kind 配置文件
+
+extraPortMappings 将宿主机的端口直接映射到控制平面节点容器的端口，将常用的 HTTP（80）和 HTTPS（443）端口映射进去，这样 Ingress Controller 就可以通过这些端口被宿主机访问。
+
+```shell
+# kind-config.yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    # 将宿主机的 80 端口映射到控制平面节点的 80 端口
+    # 将宿主机的 443 端口映射到控制平面节点的 443 端口
+    extraPortMappings:
+      - containerPort: 80
+        hostPort: 80
+        protocol: TCP
+      - containerPort: 443
+        hostPort: 443
+        protocol: TCP
+  - role: worker
+  - role: worker
+```
+
+hostPort 指宿主机的端口，containerPort 指 Kind 的 control-plane 容器内部的端口，这样映射后，宿主机访问 http://localhost 就能打到 control-plane 容器内的 80 端口，
+Ingress Controller 部署在 control-plane 节点后，它的 Service 默认监听 80 或 443，就能直接被宿主机访问。
+
+2) 使用配置文件创建集群
+
+```shell
+kind create cluster --name my-cluster --config kind-config.yaml
+```
+
+3) 安装 Ingress-Nginx Controller
+
+因为这个东西是从外网拉取的，所以需要配置一下代理：
+
+```shell
+export https_proxy=http://127.0.0.1:7897
+export http_proxy=http://127.0.0.1:7897
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
+```
+
+等待所有 Pod 变为 Running 状态：
+
+```shell
+kubectl wait --namespace ingress-nginx \
+  --for=condition=ready pod \
+  --selector=app.kubernetes.io/component=controller \
+  --timeout=90s
+```
+
+默认情况下安装 Ingress Controller 时，内部 Service 是 NodePort 类型（Kubernetes 会在每个节点（control-plane + worker）上随机开放一个端口（30000~32767）），
+如果用 extraPortMappings 映射了 80 或 443，这里就不需要额外修改 Service 类型，宿主机直接访问即可；如果没有映射，
+NodePort 会随机分配一个高端口（30000~32767），宿主机访问需要使用这个端口
+
+```shell
+# 检查 Ingress Controller Pod 是否启动完成
+kubectl get pods -n ingress-nginx -o wide
+
+# 输出
+NAME                                        READY   STATUS    RESTARTS   AGE     IP           NODE                            NOMINATED NODE   READINESS GATES
+ingress-nginx-controller-795bd64984-cnsr5   1/1     Running   0          2m23s   10.244.2.4   my-multi-node-cluster-worker2   <none>           <none>
+```
+
+4) 部署应用和 Service
+
+```shell
+kubectl create deployment nginx-app --image=nginx:alpine --replicas=3
+kubectl expose deployment nginx-app --name=test-app-service --port=80 --target-port=80
+```
+
+Service 类型使用默认的 ClusterIP，因为 Ingress 会访问 ClusterIP，并且 Service 名称必须和 Ingress backend.name 对应。
+
+5) 创建 Ingress 规则
+
+host: localhost 代表访问宿主机的 localhost 时，Ingress 会把请求转发到 test-app-service。service.name 和 port.number 必须和前面创建的 Service 一致。
+
+```shell
+# ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: example-ingress
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: localhost
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: test-app-service
+            port:
+              number: 80
+```
+
+6) 应用 Ingress
+
+```shell
+kubectl apply -f ingress.yaml
+```
+
+****
 

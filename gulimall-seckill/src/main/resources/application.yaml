@@ -45,6 +45,15 @@ spring:
       simple:
         acknowledge-mode: manual # 手动 ack 消息
 
+  zipkin:
+    base-url: http://localhost:9411 # Zipkin 服务器的地址
+    discovery-client-enabled: false # 关闭服务发现，否则 springCloud 会把 zipkin 的 url 当作服务名称注册到配置的 nacos 中
+    sender:
+      type: web # 数据发送的方式：ACTIVEMQ RABBIT KAFKA WEB
+  sleuth:
+    sampler:
+      probability: 1.0 # 采样率，1.0代表100%采样，生产环境可调低（如0.1）以减少性能开销
+
 
 feign:
   client:
