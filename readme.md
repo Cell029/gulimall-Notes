@@ -20127,4 +20127,413 @@ kubectl apply -f ingress.yaml
 ```
 
 ****
+## 2. 集群
+
+### 2.1 概述
+
+例如一个任务：如果当前有一台非常强大的服务器，所有的应用程序、数据库、网站都运行在这一台机器上，那对于该任务的管理相对就较为简单，易于管理。但如果这台机器断电、
+硬件损坏或网络故障，整个服务就完全瘫痪了；并且无论这台机器多强大，其 CPU、内存、磁盘 IO 都是有上限的，当用户访问量巨大时，它最终会崩溃；如果想要提升性能，
+那就只能对这台机器进行升级，例如换成更强的 CPU、加更多内存，不过这种方式成本高而且存在物理极限。
+
+而集群（Cluster）指的是由多台计算机或服务器组成的一个整体系统，这些计算机相互协作，共同完成某个任务。在用户看来，一个集群就像是一台超级计算机，
+但实际上它是由多台机器通过网络组成的，系统会把任务合理分配到不同的节点上去处理。而集群的核心目标是：(1)性能增强（并行处理）、(2)可靠性提升（冗余备份）、(3)可扩展性（按需扩容）。
+
+如果使用集群的话，这个任务不再依赖一台服务器，而是使用多台（可以是普通的服务器，无需超级服务器），通过网络将它们连接起来，让它们协同工作，
+对外像一个整体一样来提供服务。即使集群中有个别几台、甚至一部分服务器宕机，整个服务仍然可以通过其他健康的服务器继续对外提供，保证服务不中断；当用户访问量增加时，
+通过简单地向集群中添加更多的服务器就能提升整体处理能力，这种方式成本相对较低且灵活；而多台服务器可以并行处理任务，共同完成一个复杂的计算，从而获得远超单机的性能。
+
+根据集群要解决的主要问题，可以分为以下几种主要类型：
+
+1、高可用集群：最大限度地减少服务中断时间，确保服务永远在线
+
+通常由一个主动节点和一个或多个备用节点组成，主动节点处理所有请求，备用节点持续监控主动节点的健康状况（通过心跳信号），一旦主动节点故障，
+备用节点会立即自动接管其工作，这个过程称为故障转移。
+
+2、负载均衡集群：将涌入的大量工作负载（如用户请求）合理地分发到集群中的多个节点上，防止任何单一节点过载
+
+通常有一个专门的负载均衡器作为流量入，它根据预设的算法（轮询、最少连接数、IP 哈希等）将收到的请求转发到后端工作节点中的某一个。例如 Nginx、网关，都是使用了负载均衡。
+
+3、高性能计算集群：将一个大计算任务拆分成无数个小任务，分发给集群中的各个节点并行计算，最后汇总结果，从而极大地缩短计算时间
+
+使用专门的并行计算库来协调多个节点同时处理一个问题的不同部分。
+
+****
+### 2.2 MySQL 集群
+
+MySQL 集群指的是通过将多个 MySQL 服务器实例组织在一起，形成一个逻辑上的单一数据库系统，共同提供服务，它的核心目标和上面的集群记录的一，常见的集群方案就是主从复制。
+一个节点作为主节点（Master），负责处理所有写操作（INSERT, UPDATE, DELETE）；一个或多个节点作为从节点（Slave），通过读取主节点的二进制日志来异步地复制数据变更，
+保持与主节点的数据一致。而应用程序通常将所有写请求直接发送给主节点，读请求则可以分发到各个从节点。
+
+复制方式主要有三种：
+
+- 异步复制（默认）：主节点提交事务后立即响应客户端，不等待从节点确认，这是性能最好的，但有可能丢失数据，例如主节点宕机且未同步的 binlog 会丢失。 
+- 半同步复制：主节点提交事务后，至少等待一个从节点接收并确认收到 binlog 事件后，再响应客户端，这是一种在性能和数据一致性之间取得平衡的方案。 
+- 全同步复制：主库必须等所有从库都执行成功，才返回，不过性能非常差，几乎不用在生产环境。
+
+优点：
+
+- 简单易部署，技术成熟稳定。 
+- 扩展读性能的能力非常强。 
+- 从节点可用于备份、报表查询等，不影响主库性能。
+
+缺点：
+
+- 写操作无法扩展，所有写都在主节点，存在单点瓶颈。 
+- 数据同步是异步的，从节点有延迟，可能读到旧数据，需要确保最终一致性。 
+- 主节点宕机后，需要手动或借助工具进行故障切换，可能涉及数据丢失和较长的停机时间。
+
+启用 MySQL 主从复制：
+
+1、创建专用 Docker 网络，让他们互相通信
+
+```shell
+docker network create mysql-net
+```
+
+2、创建并配置主服务器（Master）
+
+```shell
+docker run -d --name mysql-master \
+  --network mysql-net \
+  -p 3307:3306 \
+  -v /test-mysql/mysql-master/conf:/etc/mysql/conf.d \
+  -v /test-mysql/mysql-master/data:/var/lib/mysql \
+  -e MYSQL_ROOT_PASSWORD=123 \
+  mysql:8.0.33
+```
+
+配置 Master 的 my.cnf，在挂载的配置目录 /test-mysql/mysql-master/conf 下创建一个 my.cnf 文件：
+
+```shell
+[mysqld]
+server-id = 1
+log-bin = mysql-bin
+binlog_format = ROW
+expire_logs_days = 10
+max_binlog_size = 100M
+# 可选：指定要复制的数据库
+binlog-do-db = gulimall_admin,gulimall_oms,gulimall_pms,gulimall_sms,gulimall_ums,gulimall_wms
+# 可选：指定忽略的数据库（mysql 系统库通常不同步）
+binlog-ignore-db = mysql,information_schema,performance_schema
+```
+
+- server-id：每个 MySQL 实例都必须有唯一的 server-id，否则复制无法正常工作
+- log-bin：开启二进制日志（binlog），主从复制的前提条件，mysql-bin 是 binlog 文件名前缀，实际会生成 mysql-bin.000001、mysql-bin.000002 等文件。
+- binlog_format：有三种模式，STATEMENT 记录执行的 SQL（可能因上下文不同而导致不一致）；ROW 记录实际修改的行，最安全，也最推荐；MIXED 混合模式，根据情况选择 STATEMENT 或 ROW。
+- expire_logs_days：指定 binlog 文件的过期时间，单位天
+- max_binlog_size：指定单个 binlog 文件的最大大小，默认 1G
+- binlog-do-db：指定需要复制的数据库，且只会同步这些数据库的写操作
+- binlog-ignore-db：指定不需要复制的数据库
+
+3、在Master上创建复制用户
+
+进入 Master 容器的 MySQL 命令行：
+
+```shell
+docker exec -it mysql-master mysql -u root -p
+```
+
+输入 root 密码后，执行以下 SQL 语句创建复制账号：
+
+```shell
+CREATE USER 'repl'@'%' IDENTIFIED WITH mysql_native_password BY '123';
+GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';
+FLUSH PRIVILEGES;
+```
+
+在 Master 的 MySQL 查看 Master 状态并记录：
+
+```shell
+SHOW MASTER STATUS;
+
+# 输出
+--------------------------------------+-------------------+
+| File             | Position | Binlog_Do_DB                                                                    | Binlog_Ignore_DB                            | Executed_Gtid_Set |
++------------------+----------+---------------------------------------------------------------------------------+---------------------------------------------+-------------------+
+| mysql-bin.000001 |      157 | gulimall_admin,gulimall_oms,gulimall_pms,gulimall_sms,gulimall_ums,gulimall_wms | mysql,information_schema,performance_schema |                   |
++------------------+----------+---------------------------------------------------------------------------------+---------------------------------------------+-------------------+
+```
+
+4、创建并配置从服务器（Slave）
+
+```shell
+docker run -d --name mysql-slave \
+  --network mysql-net \
+  -p 3317:3306 \
+  -v /test-mysql/mysql-slave/conf:/etc/mysql/conf.d \
+  -v /test-mysql/mysql-slave/data:/var/lib/mysql \
+  -e MYSQL_ROOT_PASSWORD=123 \
+  mysql:8.0.33
+```
+
+在 Slave 的配置目录 /test-mysql/mysql-slave/conf 下创建 my.cnf 文件：
+
+```shell
+[mysqld]
+server-id = 2
+relay-log = mysql-relay-log
+read_only = ON
+# 可选：指定要复制的数据库
+replicate-do-db = gulimall_admin,gulimall_oms,gulimall_pms,gulimall_sms,gulimall_ums,gulimall_wms
+```
+
+5、配置主从复制链路
+
+进入 Slave 容器的 MySQL 命令行：
+
+```shell
+docker exec -it mysql-slave mysql -u root -p
+```
+
+配置 Slave 指向 Master：
+
+```shell
+CHANGE MASTER TO
+  MASTER_HOST='mysql-master', # 使用容器名，因为它们在同一个网络
+  MASTER_USER='repl', # 刚刚创建的账户
+  MASTER_PASSWORD='123',
+  MASTER_LOG_FILE='mysql-bin.000001', # 刚刚记录的 File
+  MASTER_LOG_POS=157; # 刚刚记录的 Position
+```
+
+启动 Slave 进程：
+
+```shell
+START SLAVE;
+```
+
+6、检查复制状态
+
+在 Slave 的 MySQL 命令行中执行以下命令检查复制状态：
+
+```shell
+SHOW SLAVE STATUS\G
+
+# 输出
+Slave_IO_Running: Yes
+Slave_SQL_Running: Yes
+Seconds_Behind_Master: 0
+```
+
+****
+## 3. ShardingSphere
+
+上面的 MySQL 主从分离虽然能解决数据的问题，但不能解决单表的性能问题，而 ShardingSphere 是一套分布式数据库中间件，旨在实现数据库分片（Sharding）、
+读写分离、分布式事务、弹性扩展等功能，解决单库性能瓶颈和分布式数据管理问题。
+
+官方定位：
+
+- ShardingSphere-JDBC：轻量级 Java 库（直接在应用侧集成，无额外服务）。
+- ShardingSphere-Proxy：独立的数据库代理，应用不需要改动 SQL。
+- ShardingSphere-Sidecar：云原生环境下的微服务代理模式（类似 Proxy，但作为 Sidecar 部署）。
+
+ShardingSphere 的核心功能：
+
+1、分库分表
+
+按业务规则或字段将数据分布到多个数据库或表，它支持多种分片策略：(1)标准分片策略（hash、取模）、(2)复合分片策略（组合多个字段）、
+(3)范围分片策略（按时间或数值范围）、(4)可以按库、按表、按库 + 表组合分片。
+
+2、读写分离
+
+主从架构下，可以将写操作路由到主库，读操作路由到从库，并且支持负载均衡策略（轮询 、随机、权重分配）
+
+3、分布式事务
+
+它提供了两种事务支持：XA / BASE：全局事务保证跨库一致性；柔性事务（柔性最终一致性事务）：通过 TCC 或 SAGA 实现分布式事务。
+
+4、数据脱敏
+
+在 SQL 执行前对敏感字段进行脱敏处理（如手机号、身份证号），并且支持自定义脱敏规则。
+
+ShardingSphere 的测试：
+
+1、下载 ShardingSphere-Proxy 二进制包
+
+下载解压后可以打开 conf 文件夹，里面有各种配置文件：
+
+| 文件名 | 核心功能                                 | 使用场景举例 |
+| ---- |--------------------------------------| ---- |
+| global.yaml | 全局配置，替代了旧版的 server.yaml，用于定义全局生效的配置。 | 配置连接Proxy的用户名密码、事务管理器、日志、SQL显示规则等。 |
+| database-sharding.yaml | 数据分片，定义逻辑库、数据源以及分库分表的规则。             | 将一张t_order表水平拆分到不同数据库的t_order_0, t_order_1表中。 |
+| database-readwrite-splitting.yaml | 读写分离，定义逻辑库、数据源以及读写分离的规则。             | 配置一个主库（写操作）和多个从库（读操作），Proxy自动将写路由到主库，读路由到从库。 |
+| database-encrypt.yaml | 数据加密，定义逻辑库、数据源以及数据加解密的规则。            | 对user表的phone字段进行加密存储，应用程序无感知。查询时自动解密，写入时自动加密。 |
+| database-mask.yaml | 数据脱敏，定义逻辑库、数据源以及数据脱敏的规则。             | 在查询结果中，将user表的email字段的中间部分替换为*（如 ab**@xx.com），保护隐私信息。注意：此功能通常用于数据展示，原始数据不变。 |
+| database-shadow.yaml | 影子库，定义逻辑库、数据源以及影子库的规则。               | - |
+
+1、引入数据库驱动
+
+由于目录中没有 ext-lib/ 文件夹，所以需要手动创建它，然后将数据库驱动的 jar 包放入刚创建的 ext-lib/ 目录中，没有这一步，Proxy 无法连接后端数据库，会启动失败。
+
+2、配置全局设置 (global.yaml)
+
+打开 global.yaml 文件，选择需要的配置信息或进行对应的修改。
+
+```yaml
+# 1. 配置连接Proxy的认证信息
+mode:
+  type: Cluster
+  repository:
+    type: File
+  overwrite: false
+  
+# 2. 权限配置：设置登录Proxy的用户名和密码
+authority:
+  users:
+    - user: root@% # 用户名格式：username@hostname（%代表任意主机）
+      password: root
+      admin: true
+    - user: sharding
+      password: sharding
+  privilege: 
+    type: ALL_PERMITTED # 权限控制类型
+
+# 3. 事务配置（可选）
+transaction:
+  defaultType: XA
+  providerType: Atomikos
+  
+# 4. 属性配置
+props:
+  system-log-level: INFO
+  sql-show: true
+```
+
+3、启用所需功能
+
+不需要同时启用所有 database-*.yaml 文件，根据业务需求选择其中一个或多个进行配置。例如：
+
+1) 只想做分库分表：编辑 database-sharding.yaml 文件，配置数据源和分片规则。
+2) 只想做读写分离：编辑 database-readwrite-splitting.yaml 文件，配置主库和从库数据源
+
+```yaml
+databaseName: sharding_db
+dataSources:
+  ds_0: # 定义了两个物理数据源（两个 MySQL 数据库连接）
+    url: jdbc:mysql://127.0.0.1:3307/demo_ds_0?useSSL=false
+    username: root
+    password: 123
+    connectionTimeoutMilliseconds: 30000
+    idleTimeoutMilliseconds: 60000
+    maxLifetimeMilliseconds: 1800000
+    maxPoolSize: 50
+    minPoolSize: 1
+  ds_1:
+    url: jdbc:mysql://127.0.0.1:3307/demo_ds_1?useSSL=false
+    username: root
+    password: 123
+    connectionTimeoutMilliseconds: 30000
+    idleTimeoutMilliseconds: 60000
+    maxLifetimeMilliseconds: 1800000
+    maxPoolSize: 50
+    minPoolSize: 1
+
+rules:
+- !SHARDING
+  tables:
+    t_order:
+      actualDataNodes: ds_${0..1}.t_order_${0..1}
+      tableStrategy:
+        standard:
+          shardingColumn: order_id
+          shardingAlgorithmName: t_order_inline
+      keyGenerateStrategy:
+        column: order_id
+        keyGeneratorName: snowflake
+    t_order_item:
+      actualDataNodes: ds_${0..1}.t_order_item_${0..1}
+      tableStrategy:
+        standard:
+          shardingColumn: order_id
+          shardingAlgorithmName: t_order_item_inline
+      keyGenerateStrategy:
+        column: order_item_id
+        keyGeneratorName: snowflake
+  bindingTables: # 告诉 ShardingSphere 这两个表在同一个分片键（order_id）上绑定
+    - t_order,t_order_item
+  defaultDatabaseStrategy:
+    standard:
+      shardingColumn: user_id
+      shardingAlgorithmName: database_inline
+  defaultTableStrategy:
+    none:
+  shardingAlgorithms: # 分片算法，数据库根据 user_id % 2 选择 ds_0 或 ds_1，数据表根据 order_id % 2 选择物理表后缀 _0 或 _1
+    database_inline: # 分库策略
+      type: INLINE
+      props:
+        algorithm-expression: ds_${user_id % 2}
+    t_order_inline: # 分表算法，用 order_id % 2 决定数据落到哪张表
+      type: INLINE
+      props:
+        algorithm-expression: t_order_${order_id % 2}
+    t_order_item_inline:
+      type: INLINE
+      props:
+        algorithm-expression: t_order_item_${order_id % 2}
+
+  keyGenerators:
+    snowflake:
+      type: SNOWFLAKE
+```
+
+```yaml
+databaseName: sharding_db
+dataSources:
+  write_0_ds: # 主库 Master，指向主库的 demo_ds_0，ShardingSphere-Proxy 会根据 SQL 类型自动选择数据源，Master 就是写，Slave 就是读
+    url: jdbc:mysql://127.0.0.1:3307/demo_ds_0?useSSL=false
+    username: root
+    password: 123
+    connectionTimeoutMilliseconds: 30000
+    idleTimeoutMilliseconds: 60000
+    maxLifetimeMilliseconds: 1800000
+    maxPoolSize: 50
+    minPoolSize: 1
+  read_ds_0: # 从库 Slave
+    url: jdbc:mysql://127.0.0.1:3317/demo_ds_0?useSSL=false
+    username: root
+    password:
+    connectionTimeoutMilliseconds: 30000
+    idleTimeoutMilliseconds: 60000
+    maxLifetimeMilliseconds: 1800000
+    maxPoolSize: 50
+    minPoolSize: 1
+
+  write_1_ds: # 主库 Master
+    url: jdbc:mysql://127.0.0.1:3307/demo_ds_1?useSSL=false
+    username: root
+    password: 123
+    connectionTimeoutMilliseconds: 30000
+    idleTimeoutMilliseconds: 60000
+    maxLifetimeMilliseconds: 1800000
+    maxPoolSize: 50
+    minPoolSize: 1
+  read_ds_1: # 从库 Slave
+    url: jdbc:mysql://127.0.0.1:3317/demo_ds_1?useSSL=false
+    username: root
+    password:
+    connectionTimeoutMilliseconds: 30000
+    idleTimeoutMilliseconds: 60000
+    maxLifetimeMilliseconds: 1800000
+    maxPoolSize: 50
+    minPoolSize: 1
+rules:
+- !READWRITE_SPLITTING # 读写分离规则
+  dataSourceGroups: # 定义一个读写分离组，名字可以自定义，如 'group_main'
+    readwrite_ds:
+      writeDataSourceName: write_0_ds # 指定写数据源名，必须与上面定义的 dataSources 中的一个一致
+      readDataSourceNames: # 指定读数据源名列表，必须与上面定义的 dataSources 中的名称一致
+        - read_ds_0
+        - read_ds_1
+      loadBalancerName: random # 定义从读数据源中选择一个的策略
+  loadBalancers:
+    random:
+      type: RANDOM # 随机负载均衡算法。其他可选类型：ROUND_ROBIN(轮询), WEIGHT(权重)
+```
+
+****
+
+
+
+
+
 
